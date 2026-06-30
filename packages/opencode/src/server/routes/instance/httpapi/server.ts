@@ -70,6 +70,7 @@ import { lazy } from "@/util/lazy"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@opencode-ai/server/cors"
 import { serveUIEffect } from "@/server/shared/ui"
 import { ServerAuth } from "@/server/auth"
+import { anthropicRoute } from "@/server/routes/anthropic"
 import { InstanceHttpApi, RootHttpApi } from "./api"
 import { Api } from "@opencode-ai/server/api"
 import { PublicApi } from "./public"
@@ -270,8 +271,11 @@ const app = LayerNode.group([
 
 export function createRoutes(
   corsOptions?: CorsOptions,
+  anthropicDirectory?: string,
 ): Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements> {
   const locationServiceMapV2 = buildLocationServiceMap()
+
+  const anthropicRoutes = anthropicDirectory ? anthropicRoute(anthropicDirectory) : Layer.empty
 
   return Layer.mergeAll(
     rootApiRoutes,
@@ -281,6 +285,7 @@ export function createRoutes(
     serverRoutes,
     docRoute,
     uiRoute,
+    anthropicRoutes,
   ).pipe(
     Layer.provide([
       errorLayer,
