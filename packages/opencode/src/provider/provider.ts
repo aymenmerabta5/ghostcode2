@@ -31,6 +31,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
+import * as KeyRotator from "./key-rotator"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 10_000
 
@@ -1130,7 +1131,18 @@ export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
-  readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
+  readonly getLanguage: (
+    model: Model,
+    onKeyIndex?: (index: number) => void,
+  ) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
+  readonly getRotation: (
+    providerID: ProviderV2.ID,
+  ) => Effect.Effect<{ hasPool: boolean; total: number; available: number; waitMs: number }>
+  readonly markRateLimited: (
+    providerID: ProviderV2.ID,
+    index: number | undefined,
+    opts?: { retryAfterMs?: number; exhausted?: boolean },
+  ) => Effect.Effect<void>
   readonly closest: (
     providerID: ProviderV2.ID,
     query: string[],
@@ -1146,6 +1158,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  rotator: KeyRotator.Interface
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1309,6 +1322,7 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
+    const rotator = yield* KeyRotator.Service
 
     const state = yield* InstanceState.make<State>(() =>
       Effect.gen(function* () {
@@ -1630,16 +1644,37 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          rotator,
         }
       }),
     )
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
 
-    async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
+    async function resolveSDK(
+      model: Model,
+      s: State,
+      envs: Record<string, string | undefined>,
+      keyOverride?: { entry: KeyRotator.KeyEntry },
+    ) {
       try {
         const provider = s.providers[model.providerID]
         const options = { ...provider.options }
+
+        if (keyOverride) {
+          if (typeof keyOverride.entry === "string") {
+            options["apiKey"] = keyOverride.entry
+          } else if ("accountId" in keyOverride.entry) {
+            options["apiKey"] = keyOverride.entry.apiKey
+            options["_rotatedAccountId"] = keyOverride.entry.accountId
+          } else if ("apiUrl" in keyOverride.entry) {
+            options["apiKey"] = keyOverride.entry.apiKey
+            options["_rotatedApiUrl"] = keyOverride.entry.apiUrl
+            options["credentials"] = { apiKey: keyOverride.entry.apiKey, apiUrl: keyOverride.entry.apiUrl }
+          }
+          delete options["apiKeys"]
+          delete options["cooldownMs"]
+        }
 
         if (
           model.providerID === "google-vertex" &&
@@ -1798,36 +1833,59 @@ const layer = Layer.effect(
       return info
     })
 
-    const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model) {
-      const s = yield* InstanceState.get(state)
-      const envs = yield* env.all()
-      const key = `${model.providerID}/${model.id}`
-      if (s.models.has(key)) return s.models.get(key)!
+    const getLanguage = Effect.fn("Provider.getLanguage")(
+      function* (model: Model, onKeyIndex?: (index: number) => void) {
+        const s = yield* InstanceState.get(state)
+        const envs = yield* env.all()
+        const key = `${model.providerID}/${model.id}`
 
-      const provider = s.providers[model.providerID]
-      return yield* EffectPromise.refineRejection(
-        async () => {
-          const sdk = await resolveSDK(model, s, envs)
-          const language = s.modelLoaders[model.providerID]
-            ? await s.modelLoaders[model.providerID](
-                sdk,
-                model.api.id,
-                {
-                  ...provider.options,
-                  ...model.options,
-                },
-                model,
-              )
-            : sdk.languageModel(model.api.id)
-          s.models.set(key, language)
-          return language
-        },
-        (cause) =>
-          cause instanceof NoSuchModelError
-            ? new ModelNotFoundError({ modelID: model.id, providerID: model.providerID, cause })
-            : undefined,
-      )
-    })
+        // Lazy-init a key-rotation pool from the provider's `apiKeys` config option.
+        if (!s.rotator.hasPool(model.providerID)) {
+          const providerCfg = s.providers[model.providerID]
+          const apiKeys = providerCfg?.options?.["apiKeys"]
+          if (Array.isArray(apiKeys) && apiKeys.length > 0) {
+            s.rotator.init(
+              model.providerID,
+              apiKeys as KeyRotator.KeyEntry[],
+              providerCfg?.options?.["cooldownMs"],
+            )
+          }
+        }
+
+        const hasPool = s.rotator.hasPool(model.providerID)
+        if (!hasPool && s.models.has(key)) return s.models.get(key)!
+
+        const provider = s.providers[model.providerID]
+        return yield* EffectPromise.refineRejection(
+          async () => {
+            let keyOverride: { entry: KeyRotator.KeyEntry; index: number } | undefined
+            if (hasPool) {
+              const result = await Effect.runPromise(s.rotator.getNext(model.providerID))
+              keyOverride = { entry: result.entry, index: result.index }
+              onKeyIndex?.(result.index)
+            }
+            const sdk = await resolveSDK(model, s, envs, keyOverride)
+            const language = s.modelLoaders[model.providerID]
+              ? await s.modelLoaders[model.providerID](
+                  sdk,
+                  model.api.id,
+                  {
+                    ...provider.options,
+                    ...model.options,
+                  },
+                  model,
+                )
+              : sdk.languageModel(model.api.id)
+            if (!hasPool) s.models.set(key, language)
+            return language
+          },
+          (cause) =>
+            cause instanceof NoSuchModelError
+              ? new ModelNotFoundError({ modelID: model.id, providerID: model.providerID, cause })
+              : undefined,
+        )
+      },
+    )
 
     const closest = Effect.fn("Provider.closest")(function* (providerID: ProviderV2.ID, query: string[]) {
       const s = yield* InstanceState.get(state)
@@ -1945,7 +2003,41 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ list, getProvider, getModel, getLanguage, closest, getSmallModel, defaultModel })
+    const getRotation = Effect.fn("Provider.getRotation")(function* (providerID: ProviderV2.ID) {
+      const s = yield* InstanceState.get(state)
+      if (!s.rotator.hasPool(providerID)) {
+        return { hasPool: false as const, total: 0, available: 0, waitMs: 0 }
+      }
+      const total = s.rotator.getPoolSize(providerID)
+      const available = yield* s.rotator.getAvailableCount(providerID)
+      const waitMs = yield* s.rotator.getWaitTime(providerID)
+      return { hasPool: true as const, total, available, waitMs }
+    })
+
+    const markRateLimited = Effect.fn("Provider.markRateLimited")(
+      function* (
+        providerID: ProviderV2.ID,
+        index: number | undefined,
+        opts?: { retryAfterMs?: number; exhausted?: boolean },
+      ) {
+        const s = yield* InstanceState.get(state)
+        if (!s.rotator.hasPool(providerID)) return
+        if (index === undefined) return
+        yield* s.rotator.markRateLimited(providerID, index, opts)
+      },
+    )
+
+    return Service.of({
+      list,
+      getProvider,
+      getModel,
+      getLanguage,
+      getRotation,
+      markRateLimited,
+      closest,
+      getSmallModel,
+      defaultModel,
+    })
   }),
 )
 
@@ -1970,7 +2062,7 @@ export function parseModel(model: string) {
 
 export const node = LayerNode.make({
   service: Service,
-  layer: layer,
+  layer: Layer.provide(layer, KeyRotator.layer),
   deps: [FSUtil.node, Config.node, Auth.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node],
 })
 

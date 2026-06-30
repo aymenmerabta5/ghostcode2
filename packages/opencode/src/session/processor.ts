@@ -18,7 +18,7 @@ import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
-import type { Provider } from "@/provider/provider"
+import { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
@@ -86,6 +86,7 @@ const layer = Layer.effect(
     const snapshot = yield* Snapshot.Service
     const agents = yield* Agent.Service
     const llm = yield* LLM.Service
+    const provider = yield* Provider.Service
     const permission = yield* Permission.Service
     const plugin = yield* Plugin.Service
     const summary = yield* SessionSummary.Service
@@ -630,12 +631,17 @@ const layer = Layer.effect(
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
+        const keyIndex = { current: undefined as number | undefined }
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
+            keyIndex.current = undefined
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream({
+              ...streamInput,
+              onKeyIndex: (i) => (keyIndex.current = i),
+            })
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
@@ -659,15 +665,20 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
+                set: (info) =>
+                  Effect.gen(function* () {
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    })
+                    if (keyIndex.current !== undefined) {
+                      const retryAfterMs = Math.max(0, info.next - Date.now())
+                      yield* provider.markRateLimited(input.model.providerID, keyIndex.current, { retryAfterMs })
+                    }
+                  }),
               }),
             ),
             Effect.catch(halt),
@@ -703,6 +714,7 @@ export const node = LayerNode.make({
     Snapshot.node,
     Agent.node,
     LLM.node,
+    Provider.node,
     Permission.node,
     Plugin.node,
     SessionSummary.node,
