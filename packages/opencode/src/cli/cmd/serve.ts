@@ -18,7 +18,7 @@ export const ServeCommand = effectCmd({
     const { Server } = yield* Effect.promise(() => import("../../server/server"))
     const { warmupAnthropicProvider } = yield* Effect.promise(() => import("../../server/routes/anthropic"))
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
-      console.log("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
+      console.log("Warning: GHOSTCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }
     const opts = yield* resolveNetworkOptions(args)
     const anthropicDirectory = process.env.GHOSTCODE_ANTHROPIC_DIRECTORY ?? os.homedir()

@@ -30,7 +30,8 @@ export function ide() {
 }
 
 export function alreadyInstalled() {
-  return process.env["OPENCODE_CALLER"] === "vscode" || process.env["OPENCODE_CALLER"] === "vscode-insiders"
+  const caller = process.env["GHOSTCODE_CALLER"] ?? process.env["OPENCODE_CALLER"]
+  return caller === "vscode" || caller === "vscode-insiders"
 }
 
 export async function install(ide: (typeof SUPPORTED_IDES)[number]["name"]) {
