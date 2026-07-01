@@ -56,8 +56,8 @@ const v2ApiLayer = HttpRouter.serve(
   { disableListenLog: true, disableLogger: true },
 ).pipe(Layer.provideMerge(NodeHttpServer.layerTest))
 
-const noAuthLayer = ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })
-const secretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "opencode" })
+const noAuthLayer = ServerAuth.Config.configLayer({ password: Option.none(), username: "ghostcode" })
+const secretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "ghostcode" })
 const kitSecretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "kit" })
 
 const it = testEffect(apiLayer.pipe(Layer.provide(noAuthLayer)))

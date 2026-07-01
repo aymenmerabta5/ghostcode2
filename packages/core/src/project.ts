@@ -63,7 +63,7 @@ const layer = Layer.effect(
     })
 
     const cached = Effect.fnUntraced(function* (dir: string) {
-      return yield* fs.readFileString(path.join(dir, "opencode")).pipe(
+      return yield* fs.readFileString(path.join(dir, "ghostcode")).pipe(
         Effect.map((value) => value.trim()),
         Effect.map((value) => (value ? ID.make(value) : undefined)),
         Effect.catch(() => Effect.succeed(undefined)),
