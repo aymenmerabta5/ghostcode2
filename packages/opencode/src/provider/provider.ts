@@ -446,7 +446,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://ghostcode.ai/",
+            "HTTP-Referer": "https://opencode.ai/",
             "X-Title": "ghostcode",
             "X-Source": "ghostcode",
           },
@@ -457,7 +457,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://ghostcode.ai/",
+            "HTTP-Referer": "https://opencode.ai/",
             "X-Title": "ghostcode",
           },
         },
@@ -467,7 +467,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: provider.source === "config",
         options: {
           headers: {
-            "HTTP-Referer": "https://ghostcode.ai/",
+            "HTTP-Referer": "https://opencode.ai/",
             "X-Title": "ghostcode",
             "X-BILLING-INVOKE-ORIGIN": "OpenCode",
           },
@@ -478,7 +478,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "http-referer": "https://ghostcode.ai/",
+            "http-referer": "https://opencode.ai/",
             "x-title": "ghostcode",
           },
         },
@@ -584,7 +584,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://ghostcode.ai/",
+            "HTTP-Referer": "https://opencode.ai/",
             "X-Title": "ghostcode",
           },
         },
@@ -842,7 +842,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://ghostcode.ai/",
+            "HTTP-Referer": "https://opencode.ai/",
             "X-Title": "ghostcode",
           },
         },
