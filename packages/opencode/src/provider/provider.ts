@@ -715,9 +715,47 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
       }
     }),
     "cloudflare-workers-ai": Effect.fnUntraced(function* (input: Info) {
-      // When baseURL is already configured (e.g. corporate config routing through a proxy/gateway),
-      // skip the account ID check because the URL is already fully specified.
       if (input.options?.baseURL) return { autoload: false }
+
+      let apiKeys = input.options?.apiKeys
+      if (!Array.isArray(apiKeys) || apiKeys.length === 0) {
+        const apiKeysFile = path.join(Global.Path.data, "providers", input.id, "apiKeys.json")
+        const loaded = yield* Effect.promise(async () => {
+          try {
+            const data = JSON.parse(await Bun.file(apiKeysFile).text())
+            if (Array.isArray(data) && data.length > 0) return data
+            return undefined
+          } catch {
+            return undefined
+          }
+        })
+        if (loaded) apiKeys = loaded
+      }
+
+      if (Array.isArray(apiKeys) && apiKeys.length > 0) {
+        const firstKey = apiKeys[0]
+        const accountId = typeof firstKey === "string" ? undefined : firstKey.accountId
+        return {
+          autoload: true,
+          options: {
+            apiKeys,
+            chunkTimeout: 120_000,
+            timeout: 1_800_000,
+            headers: {
+              "User-Agent": `ghostcode/${InstallationVersion} cloudflare-workers-ai (${os.platform()} ${os.release()}; ${os.arch()})`,
+            },
+          },
+          async getModel(sdk: any, modelID: string) {
+            return sdk.languageModel(modelID)
+          },
+          vars(options) {
+            const rotated = options?.["_rotatedAccountId"]
+            return {
+              CLOUDFLARE_ACCOUNT_ID: rotated ?? accountId ?? "",
+            }
+          },
+        }
+      }
 
       const auth = yield* dep.auth(input.id)
       const env = yield* dep.env()
@@ -738,6 +776,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: !!apiKey,
         options: {
           apiKey,
+          chunkTimeout: 45_000,
+          timeout: 1_800_000,
           headers: {
             "User-Agent": `ghostcode/${InstallationVersion} cloudflare-workers-ai (${os.platform()} ${os.release()}; ${os.arch()})`,
           },
