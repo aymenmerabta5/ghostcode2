@@ -21,6 +21,7 @@ const patterns = [
   /prompt too long; exceeded (?:max )?context length/i,
   /too large for model with \d+ maximum context length/i,
   /model_context_window_exceeded/i,
+  /token count exceeds.*context length/i,
 ]
 
 export const isContextOverflow = (message: string) =>

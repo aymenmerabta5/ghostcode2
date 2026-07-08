@@ -1,15 +1,17 @@
-import { createMemo, Match, onCleanup, onMount, Show, Switch } from "solid-js"
+import { createEffect, createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { useTheme } from "../../context/theme"
 import { useSync } from "../../context/sync"
 import { useDirectory } from "../../context/directory"
 import { useConnected } from "../../component/use-connected"
 import { createStore } from "solid-js/store"
 import { useRoute } from "../../context/route"
+import { useEvent } from "../../context/event"
 
 export function Footer() {
   const { theme } = useTheme()
   const sync = useSync()
   const route = useRoute()
+  const event = useEvent()
   const mcp = createMemo(() => Object.values(sync.data.mcp).filter((x) => x.status === "connected").length)
   const mcpError = createMemo(() => Object.values(sync.data.mcp).some((x) => x.status === "failed"))
   const lsp = createMemo(() => Object.keys(sync.data.lsp))
@@ -24,10 +26,19 @@ export function Footer() {
     welcome: false,
   })
 
-  onMount(() => {
-    // Track all timeouts to ensure proper cleanup
-    const timeouts: ReturnType<typeof setTimeout>[] = []
+  const [goalText, setGoalText] = createSignal<string | undefined>(undefined)
+  const [goalStatus, setGoalStatus] = createSignal<string | undefined>(undefined)
 
+  onMount(() => {
+    const offGoal = event.on("goal.updated", (evt) => {
+      if (route.data.type !== "session") return
+      if (evt.properties.sessionID !== route.data.sessionID) return
+      setGoalText(evt.properties.goal?.text)
+      setGoalStatus(evt.properties.goal?.status)
+    })
+    onCleanup(() => offGoal())
+
+    const timeouts: ReturnType<typeof setTimeout>[] = []
     function tick() {
       if (connected()) return
       if (!store.welcome) {
@@ -35,7 +46,6 @@ export function Footer() {
         timeouts.push(setTimeout(() => tick(), 5000))
         return
       }
-
       if (store.welcome) {
         setStore("welcome", false)
         timeouts.push(setTimeout(() => tick(), 10_000))
@@ -43,15 +53,29 @@ export function Footer() {
       }
     }
     timeouts.push(setTimeout(() => tick(), 10_000))
+    onCleanup(() => timeouts.forEach(clearTimeout))
+  })
 
-    onCleanup(() => {
-      timeouts.forEach(clearTimeout)
-    })
+  createEffect(() => {
+    if (route.data.type !== "session") {
+      setGoalText(undefined)
+      setGoalStatus(undefined)
+      return
+    }
+    setGoalText(undefined)
+    setGoalStatus(undefined)
   })
 
   return (
     <box flexDirection="row" justifyContent="space-between" gap={1} flexShrink={0}>
-      <text fg={theme.textMuted}>{directory()}</text>
+      <box gap={1} flexDirection="row" flexShrink={1}>
+        <text fg={theme.textMuted}>{directory()}</text>
+        <Show when={goalText()}>
+          <text fg={goalStatus() === "completed" ? theme.success : theme.accent}>
+            {"\u25CB "}{goalText()?.slice(0, 40)}{goalText()!.length > 40 ? "\u2026" : ""}
+          </text>
+        </Show>
+      </box>
       <box gap={2} flexDirection="row" flexShrink={0}>
         <Switch>
           <Match when={store.welcome}>

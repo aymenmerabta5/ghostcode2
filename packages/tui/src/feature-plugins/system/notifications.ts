@@ -84,6 +84,21 @@ const tui: TuiPlugin = async (api) => {
     errored.add(sessionID)
     notify(api, sessionID, sessionErrorMessage(event.properties.error), "error")
   })
+
+  const finishedRuns = new Set<string>()
+
+  api.event.on("workflow.run.finished", (event) => {
+    const run = event.properties
+    if (finishedRuns.has(run.id)) return
+    finishedRuns.add(run.id)
+    const done = run.status === "completed"
+    void api.attention.notify({
+      title: undefined,
+      message: `Workflow ${run.workflow} ${done ? "done" : run.status}`,
+      notification: { when: "blurred" },
+      sound: { name: done ? "done" : "error", when: "always" },
+    })
+  })
 }
 
 const plugin: BuiltinTuiPlugin = {

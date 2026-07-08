@@ -359,11 +359,27 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
 
             if (permission === "doom_loop") {
               return {
-                icon: "⟳",
+                icon: "\u21BB",
                 title: "Continue after repeated failures",
                 body: (
                   <box paddingLeft={1}>
                     <text fg={theme.textMuted}>This keeps the session running despite repeated failures.</text>
+                  </box>
+                ),
+              }
+            }
+
+            if (permission === "workflow") {
+              const wfName = typeof data.name === "string" ? data.name : "workflow"
+              return {
+                icon: "\u25CB",
+                title: `Run workflow ${wfName}`,
+                body: (
+                  <box paddingLeft={1} gap={1}>
+                    <text fg={theme.textMuted}>{"Workflow: " + wfName}</text>
+                    <Show when={typeof data.args === "object" && data.args}>
+                      <text fg={theme.textMuted}>{"Args: " + JSON.stringify(data.args)}</text>
+                    </Show>
                   </box>
                 ),
               }

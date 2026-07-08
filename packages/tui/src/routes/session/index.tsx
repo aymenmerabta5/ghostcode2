@@ -78,6 +78,8 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
+import { DialogWorkflow } from "../../component/dialog-workflow"
+import { workflowPermissionDisplay } from "../../component/dialog-workflow-helpers"
 import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
@@ -141,6 +143,7 @@ const sessionBindingCommands = [
   "session.parent",
   "session.child.next",
   "session.child.previous",
+  "session.workflow.open",
 ] as const
 
 const sessionGlobalBindingCommands = [
@@ -1078,6 +1081,15 @@ export function Session() {
         moveChild(-1)
       }),
     },
+    {
+      title: "Open workflow details",
+      value: "session.workflow.open",
+      category: "Session",
+      hidden: true,
+      run: () => {
+        dialog.replace(() => <DialogWorkflow />)
+      },
+    },
   ])
 
   const sessionCommands = createMemo(() =>
@@ -1770,11 +1782,64 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={display() === "skill"}>
           <Skill {...toolprops} />
         </Match>
+        <Match when={display() === "workflow"}>
+          <WorkflowCall {...toolprops} />
+        </Match>
         <Match when={true}>
           <GenericTool {...toolprops} />
         </Match>
       </Switch>
     </Show>
+  )
+}
+
+function workflowMetadata(metadata: Record<string, unknown>): { runId?: string; workflow?: string; status?: string } {
+  const runId = typeof metadata.runId === "string" ? metadata.runId : typeof metadata.runID === "string" ? metadata.runID : undefined
+  const workflow = typeof metadata.workflow === "string" ? metadata.workflow : undefined
+  const status = typeof metadata.status === "string" ? metadata.status : undefined
+  return { runId, workflow, status }
+}
+
+function WorkflowCall(props: ToolProps) {
+  const { theme } = useTheme()
+  const ctx = use()
+  const dialog = useDialog()
+  const meta = createMemo(() => workflowMetadata(props.metadata))
+  const status = createMemo(() => {
+    if (props.part.state.status === "pending") return "running"
+    return meta().status ?? props.part.state.status
+  })
+  const icon = createMemo(() => {
+    const s = status()
+    if (s === "running") return "\u25CB"
+    if (s === "completed") return "\u2713"
+    if (s === "failed" || s === "cancelled") return "\u2717"
+    return "\u25CB"
+  })
+  const iconColor = createMemo(() => {
+    const s = status()
+    if (s === "completed") return theme.success
+    if (s === "failed" || s === "cancelled") return theme.error
+    return theme.warning
+  })
+  const label = createMemo(() => meta().workflow ?? "workflow")
+  const openDashboard = () => {
+    const runId = meta().runId
+    if (!runId) return
+    dialog.replace(() => <DialogWorkflow openRunID={runId} />)
+  }
+
+  return (
+    <InlineTool
+      icon={icon()}
+      iconColor={iconColor()}
+      pending={`Running ${label()}...`}
+      complete={status() !== "running"}
+      part={props.part}
+      onClick={meta().runId ? openDashboard : undefined}
+    >
+      {`${label()}${meta().runId ? ` ${meta().runId!.slice(0, 12)}` : ""}`}
+    </InlineTool>
   )
 }
 
@@ -2578,6 +2643,7 @@ const toolDisplays = new Set([
   "todowrite",
   "question",
   "skill",
+  "workflow",
 ])
 
 export function toolDisplay(tool: string) {

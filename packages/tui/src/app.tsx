@@ -79,6 +79,7 @@ import {
 
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
+import { DialogWorkflow } from "./component/dialog-workflow"
 import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
@@ -97,6 +98,7 @@ const appGlobalBindingCommands = [
   "session.quick_switch.7",
   "session.quick_switch.8",
   "session.quick_switch.9",
+  "workflow.list",
 ] as const
 
 const appBindingCommands = [
@@ -936,6 +938,37 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         category: "System",
         run: () => {
           local.permission.toggle()
+          dialog.clear()
+        },
+      },
+      {
+        name: "workflow.list",
+        title: "Open workflows",
+        category: "Workflow",
+        slashName: "workflows",
+        run: () => {
+          dialog.replace(() => <DialogWorkflow />)
+        },
+      },
+      {
+        name: "goal.set",
+        title: "Set session goal",
+        category: "Session",
+        run: () => {
+          const p = promptRef.current
+          if (!p) return
+          p.current.input = "/goal "
+          dialog.clear()
+        },
+      },
+      {
+        name: "loop.start",
+        title: "Start a loop",
+        category: "Session",
+        run: () => {
+          const p = promptRef.current
+          if (!p) return
+          p.current.input = "/loop "
           dialog.clear()
         },
       },

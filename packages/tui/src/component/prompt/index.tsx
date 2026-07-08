@@ -10,7 +10,8 @@ import {
 } from "@opentui/core"
 import type { CommandContext } from "@opentui/keymap"
 import { createEffect, createMemo, onMount, createSignal, onCleanup, on, Show, Switch, Match } from "solid-js"
-import "opentui-spinner/solid"
+import { registerSpinner } from "opentui-spinner/solid"
+registerSpinner()
 import path from "path"
 import { fileURLToPath } from "url"
 import { useLocal } from "../../context/local"
@@ -51,7 +52,8 @@ import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
 import { useArgs } from "../../context/args"
-import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
+import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useCommandSlashes, useLeaderActive, useOpencodeKeymap } from "../../keymap"
+import { DialogWorkflow } from "../dialog-workflow"
 import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
@@ -160,6 +162,7 @@ export function Prompt(props: PromptProps) {
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
+  const tuiSlashes = useCommandSlashes()
   const agentShortcut = useCommandShortcut("agent.cycle")
   const paletteShortcut = useCommandShortcut("command.palette.show")
   const renderer = useRenderer()
@@ -1063,6 +1066,50 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
+    } else if (inputText.startsWith("/workflow ") || inputText === "/workflow") {
+      move.startSubmit()
+      const parts = inputText.slice(1).split(/\s+/)
+      const wfName = parts[1]
+      if (!wfName) {
+        toast.show({ message: "Usage: /workflow <name> [args]", variant: "error" })
+      } else {
+        const argParts = parts.slice(2)
+        const args: Record<string, unknown> = {}
+        for (const arg of argParts) {
+          const eq = arg.indexOf("=")
+          if (eq > 0) {
+            const key = arg.slice(0, eq).replace(/^--?/, "")
+            const val = arg.slice(eq + 1)
+            args[key] = val
+          } else {
+            args[arg.replace(/^--?/, "")] = true
+          }
+        }
+        try {
+          const result = await sdk.client.workflow.start({
+            name: wfName,
+            workflowStartPayload: Object.keys(args).length > 0 ? { args } : undefined,
+          })
+          if (result.data) {
+            dialog.replace(() => <DialogWorkflow openRunID={result.data!.id} />)
+          }
+        } catch (err) {
+          toast.show({
+            message: err instanceof Error ? err.message : "Failed to start workflow",
+            variant: "error",
+          })
+        }
+      }
+    } else if (
+      inputText.startsWith("/") &&
+      tuiSlashes().some((s) => s.display === inputText.split("\n")[0].split(" ")[0])
+    ) {
+      move.startSubmit()
+      const cmdName = inputText.split("\n")[0].split(" ")[0]
+      const entry = tuiSlashes().find((s) => s.display === cmdName)
+      if (entry) {
+        entry.onSelect()
+      }
     } else if (
       inputText.startsWith("/") &&
       sync.data.command.some((x) => x.name === inputText.split("\n")[0].split(" ")[0].slice(1))

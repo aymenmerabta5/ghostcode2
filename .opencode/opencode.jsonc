@@ -12,7 +12,35 @@
       "description": "Contains opencode logs and data",
     },
   },
-  "mcp": {},
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": ["npx", "@playwright/mcp@latest"],
+      "enabled": true,
+    },
+    "context7": {
+      "type": "local",
+      "command": ["npx", "-y", "@upstash/context7-mcp@latest"],
+      "environment": {
+        "CONTEXT7_API_KEY": "ctx7sk-d1a5646c-d8a2-49d0-932d-2587aaf1414d",
+      },
+      "enabled": true,
+    },
+    "ultron": {
+      "type": "local",
+      "command": ["uv", "run", "ultron-mcp"],
+      "cwd": "D:/MyWork/AI/Ultron",
+      "enabled": true,
+      "timeout": 60000,
+    },
+    "ghostbullet": {
+      "type": "remote",
+      "url": "http://localhost:7331/mcp",
+      "headers": {
+        "Authorization": "Bearer 0b3f863834ac94648cd8fc57d1033b9bb3b0e20e9a83cf8d",
+      },
+    },
+  },
   "tools": {
     "github-triage": false,
     "github-pr-search": false,
