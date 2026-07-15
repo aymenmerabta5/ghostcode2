@@ -1,4 +1,4 @@
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+﻿import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
@@ -12,7 +12,8 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Option } from "effect"
+import { Goal } from "./goal"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -164,6 +165,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const goals = yield* Goal.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -345,7 +347,11 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
+      const goalResult = yield* goals.get(input.sessionID).pipe(Effect.option)
+      const goal = Option.isSome(goalResult) ? goalResult.value : undefined
+      const goalContext = goal ? [`Active session goal (preserve in summary): ${goal.text}`] : []
+      const nextPrompt =
+        compacting.prompt ?? buildPrompt({ previousSummary, context: [...compacting.context, ...goalContext] })
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
@@ -556,6 +562,7 @@ export const node = LayerNode.make({
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    Goal.node,
   ],
 })
 

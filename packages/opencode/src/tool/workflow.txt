@@ -1,0 +1,98 @@
+﻿Discover, run, and manage long-running workflow programs. Workflows are multi-step scripts that orchestrate subagents with parallel execution, budget caps, and phase tracking.
+
+## What are workflows?
+
+Workflows are TypeScript files that export a `meta` object and a `run` function. They orchestrate multiple subagent calls across named phases, with support for parallel execution, structured outputs, budget caps, and phase tracking. Workflows persist their state to disk ÔÇö a run survives a crash and can be inspected, paused, resumed, or cancelled.
+
+## When to use workflows vs the Task tool
+
+- Use the **Task tool** for a single subagent that does one thing and returns.
+- Use **Workflows** when you need multi-step orchestration: multiple agents across phases, parallel fan-out, structured schemas, or a durable run that the user can monitor in the dashboard.
+
+## Actions
+
+- **list**: List all available workflows (built-in + project + global). Always call this first to see what exists.
+- **read**: Get a workflow's source code by name. Call this before creating a similar workflow or to understand an existing one.
+- **start**: Run a workflow by name with optional args and budget. Returns the run ID. The workflow runs in the background ÔÇö use **inspect** or **wait** to check progress.
+- **wait**: Block until a run finishes or timeout. Use sparingly ÔÇö prefer **inspect** for non-blocking checks.
+- **inspect**: Get a run's current status, phases, agents, and logs.
+- **cancel**: Cancel a running workflow.
+- **create**: Save a new workflow source to disk. Files are saved to `.opencode/workflows/<name>.ts` (project) or the global workflows dir.
+
+## How to create a workflow
+
+A workflow is a TypeScript file that default-exports an object with `meta` and `run`:
+
+```ts
+export default {
+  meta: {
+    name: "my-workflow",
+    description: "What this workflow does",
+    phases: ["plan", "execute", "review"],
+    arguments: {
+      topic: { type: "string", description: "The topic to process" }
+    }
+  },
+  async run(args, ctx) {
+    ctx.setPhase("plan")
+    const plan = await ctx.agent({
+      prompt: `Plan the work for: ${args.topic}`,
+      schema: { type: "object", properties: { steps: { type: "array", items: { type: "string" } } }, required: ["steps"] }
+    })
+
+    ctx.setPhase("execute")
+    const results = await ctx.parallel(
+      plan.data.steps.map((step) => () => ctx.agent({ prompt: `Execute: ${step}` }))
+    )
+
+    ctx.setPhase("review")
+    const review = await ctx.agent({ prompt: `Review these results: ${JSON.stringify(results)}` })
+
+    return { review: review.text }
+  }
+}
+```
+
+### Meta fields
+- `name` (required): The workflow name. Must match the filename.
+- `description`: Short summary shown in listings and the dashboard.
+- `phases`: Array of phase names (strings or `{ title, detail?, model? }`). Used for progress tracking.
+- `arguments`: Declared arguments with type, default, and description. Validated at start.
+- `whenToUse`: When this workflow should be used (shown in autocomplete).
+
+### Context API (ctx)
+- `ctx.setPhase(name)`: Advance to a named phase. Drives the dashboard progress.
+- `ctx.agent({ prompt, schema?, model?, tools? })`: Run a subagent. Returns `{ text, data }` (data is parsed from schema if provided).
+- `ctx.parallel(tasks, { concurrencyLimit? })`: Run tasks in parallel. Returns array of results (null for failures).
+- `ctx.log(message)`: Log a message visible in the dashboard.
+- `ctx.workflow(name, args?)`: Start a child workflow and wait for its result.
+- `ctx.question(question, options?)`: Ask the user a question (pauses the run until answered).
+
+### Creating a workflow with the tool
+
+Use `action: "create"` with `name` and `source`:
+
+```json
+{
+  "action": "create",
+  "name": "code-review",
+  "source": "export default {\n  meta: { name: \"code-review\", ... },\n  async run(args, ctx) { ... }\n}",
+  "scope": "project"
+}
+```
+
+After creating, use `action: "start"` with the same name to run it.
+
+## Workflow file location
+
+Project workflows: `.opencode/workflows/<name>.ts`
+Global workflows: `<global-config>/workflows/<name>.ts`
+
+## Tips
+
+- Always call `action: "list"` first to see what workflows already exist.
+- Use `action: "read"` to inspect an existing workflow before creating a similar one.
+- Phases in `meta.phases` should match the `ctx.setPhase()` calls in `run()`.
+- Structured schemas on `ctx.agent()` give you typed responses ÔÇö use them for parsing.
+- `ctx.parallel()` is the key to fan-out: pass an array of thunks that each call `ctx.agent()`.
+- Budget caps (`budget` param on start) prevent runaway costs. Use USD or token limits.

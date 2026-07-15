@@ -45,6 +45,7 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  onKeyIndex?: (index: number | undefined) => void
 }
 
 export type StreamRequest = StreamInput & {
@@ -94,7 +95,7 @@ const live: Layer.Layer<
 
       const [language, cfg, item, info] = yield* Effect.all(
         [
-          provider.getLanguage(input.model),
+          provider.getLanguage(input.model, input.onKeyIndex),
           config.get(),
           provider.getProvider(input.model.providerID),
           auth.get(input.model.providerID),

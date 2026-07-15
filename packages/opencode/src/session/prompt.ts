@@ -1,4 +1,4 @@
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+﻿import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Goal } from "./goal"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -78,6 +79,19 @@ IMPORTANT:
 - The input must be valid JSON matching the required schema
 - Complete all necessary research and tool calls BEFORE calling this tool
 - This tool provides your final answer - no further actions are taken after calling it`
+
+const GOAL_DEFAULT_BUDGET_TOKENS = 200_000
+const GOAL_MAX_STEPS = 50
+
+const LOOP_CONTINUE_MARKER = "<loop:continue>"
+const LOOP_STOP_MARKER = "<loop:stop>"
+const LOOP_SELF_PACED_DELAY_MS = 1000
+
+type LoopCommandParsed =
+  | { action: "stop" }
+  | { action: "start"; intervalMs?: number; prompt: string }
+
+type LoopState = { stop: () => void }
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
@@ -102,6 +116,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly pursue: (input: { sessionID: SessionID }) => Effect.Effect<void>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -136,6 +151,15 @@ const layer = Layer.effect(
     const revert = yield* SessionRevert.Service
     const summary = yield* SessionSummary.Service
     const sys = yield* SystemPrompt.Service
+    const goals = yield* Goal.Service
+    const pursuing = new Set<SessionID>()
+    const activeLoops = new Map<SessionID, LoopState>()
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const loop of activeLoops.values()) loop.stop()
+        activeLoops.clear()
+      }),
+    )
     const llm = yield* LLM.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
@@ -151,6 +175,7 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      stopLoop(sessionID)
       yield* state.cancel(sessionID)
     })
 
@@ -1076,9 +1101,9 @@ const layer = Layer.effect(
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
       throw new Error("Impossible")
-    })
+    }) as unknown as (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts, never, any>
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts, never, any> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
@@ -1108,9 +1133,19 @@ const layer = Layer.effect(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
 
+          yield* Effect.logInfo("loop check", {
+            "session.id": sessionID,
+            step,
+            finish: lastAssistant?.finish ?? "null",
+            hasToolCalls,
+            lastAssistantID: lastAssistant?.id ?? "null",
+            lastUserID: lastUser.id,
+            parts: lastAssistantMsg?.parts.map((p) => p.type).join(",") ?? "none",
+          })
+
           if (
             lastAssistant?.finish &&
-            !["tool-calls"].includes(lastAssistant.finish) &&
+            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
             lastUser.id < lastAssistant.id
           ) {
@@ -1125,7 +1160,12 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
-            yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            yield* Effect.logInfo("exiting loop", {
+              "session.id": sessionID,
+              finish: lastAssistant.finish,
+              hasToolCalls,
+              hasText: lastAssistantMsg?.parts.some((p) => p.type === "text") ?? false,
+            })
             break
           }
 
@@ -1237,7 +1277,6 @@ const layer = Layer.effect(
               Effect.provideService(ToolRegistry.Service, registry),
               Effect.provideService(MCP.Service, mcp),
               Effect.provideService(Truncate.Service, truncate),
-              Effect.provideService(RuntimeFlags.Service, flags),
             )
 
             if (lastUser.format?.type === "json_schema") {
@@ -1261,7 +1300,13 @@ const layer = Layer.effect(
               sys.mcp(agent, session.permission),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
+            const goalResult = yield* goals.get(sessionID).pipe(Effect.option)
+            const goal = Option.isSome(goalResult) ? goalResult.value : undefined
+            const goalBlock = goal
+              ? `<session-goal>\ntext: ${goal.text}\nstatus: ${goal.status}\n${goal.budgetTokens ? `budgetTokens: ${goal.budgetTokens}\n` : ""}${goal.verification ? `verification: ${goal.verification}\n` : ""}</session-goal>`
+              : undefined
             const system = [
+              ...(goalBlock ? [goalBlock] : []),
               ...env,
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
@@ -1296,7 +1341,7 @@ const layer = Layer.effect(
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
-              // output at all — previously the session went idle silently — or
+              // output at all ÔÇö previously the session went idle silently ÔÇö or
               // partial text that was cut off by the provider's filter.
               if (handle.message.finish === "content-filter") {
                 handle.message.error = new SessionV1.ContentFilterError({
@@ -1343,14 +1388,383 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts>,
+        runLoop(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts>,
+      )
     })
+
+    const pursue: (input: { sessionID: SessionID }) => Effect.Effect<void> = Effect.fn("SessionPrompt.pursue")(
+      function* (input) {
+        if (pursuing.has(input.sessionID)) return
+        pursuing.add(input.sessionID)
+        yield* Effect.ensuring(
+          Effect.gen(function* () {
+            let step = 0
+            while (step < GOAL_MAX_STEPS) {
+              const goal = yield* goals.get(input.sessionID)
+              if (!goal || goal.status !== "active") break
+              const budget = goal.budgetTokens ?? GOAL_DEFAULT_BUDGET_TOKENS
+              if (goal.tokensUsed >= budget) {
+                yield* goals.pause(input.sessionID)
+                break
+              }
+
+              const text =
+                step === 0
+                  ? `You are now autonomously pursuing this session's goal:\n\n${goal.text}\n\nWork toward it using the available tools. When it is fully achieved, call the goal tool with action "complete" and a concise verification of what was accomplished. If you become blocked or need input from the user, call the goal tool with action "pause".`
+                  : `The session goal is not yet complete:\n\n${goal.text}\n\nKeep working toward it. When it is done, call the goal tool with action "complete" (include a short verification). If you are blocked, call it with action "pause".`
+
+              const start = Date.now()
+              const result = yield* prompt({
+                sessionID: input.sessionID,
+                parts: [{ type: "text", text }],
+              }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+              if (!result) break
+
+              const info = result.info
+              if (info.role === "assistant" && info.tokens) {
+                const t = info.tokens
+                const used = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
+                yield* goals.recordUsage({ sessionID: input.sessionID, tokens: used, durationMs: Date.now() - start })
+              }
+              step++
+            }
+          }),
+          Effect.sync(() => pursuing.delete(input.sessionID)),
+        )
+      },
+    )
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      return yield* state.startShell(
+        input.sessionID,
+        lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts>,
+        shellImpl(input, ready) as unknown as Effect.Effect<SessionV1.WithParts>,
+        ready,
+      )
+    })
+
+    const stopLoop = (sessionID: SessionID) => {
+      const loop = activeLoops.get(sessionID)
+      if (!loop) return false
+      loop.stop()
+      activeLoops.delete(sessionID)
+      return true
+    }
+
+    const readLoopPrompt = Effect.fn("SessionPrompt.readLoopPrompt")(function* () {
+      const ctx = yield* InstanceState.context
+      const filepath = path.join(ctx.worktree, ".opencode", "loop.md")
+      const exists = yield* fsys.exists(filepath).pipe(Effect.orDie)
+      if (!exists) return undefined
+      const content = (yield* fsys.readFileString(filepath).pipe(Effect.orDie)).trim()
+      return content || undefined
+    })
+
+    const normalizeLoopResult = Effect.fn("SessionPrompt.normalizeLoopResult")(function* (result: SessionV1.WithParts) {
+      const textPart = result.parts.findLast((part): part is SessionV1.TextPart => part.type === "text")
+      if (!textPart) return { continueLoop: false, result }
+      const parsed = extractLoopControl(textPart.text)
+      if (parsed.text === textPart.text) return { continueLoop: false, result }
+      textPart.text = parsed.text
+      yield* sessions.updatePart(textPart)
+      return { continueLoop: parsed.action === "continue", result }
+    })
+
+    const loopStep = Effect.fn("SessionPrompt.loopStep")(function* (input: {
+      sessionID: SessionID
+      agent: string
+      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      variant?: string
+      promptText: string
+      parts?: CommandInput["parts"]
+    }) {
+      const result = yield* prompt({
+        sessionID: input.sessionID,
+        messageID: MessageID.ascending(),
+        agent: input.agent,
+        model: input.model,
+        variant: input.variant,
+        parts: [{ type: "text", text: input.promptText }, ...(input.parts ?? [])],
+      })
+      return yield* normalizeLoopResult(result)
+    })
+
+    const startLoop = Effect.fn("SessionPrompt.startLoop")(function* (input: {
+      sessionID: SessionID
+      agent: string
+      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      variant?: string
+      promptText: string
+      intervalMs?: number
+    }) {
+      stopLoop(input.sessionID)
+      let stopped = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+
+      const schedule = (delayMs: number) => {
+        if (stopped) return
+        timer = setTimeout(() => {
+          void Effect.runPromiseExit(
+            loopStep({
+              sessionID: input.sessionID,
+              agent: input.agent,
+              model: input.model,
+              variant: input.variant,
+              promptText: input.promptText,
+            }).pipe(Effect.orDie),
+          ).then((exit) => {
+            if (stopped) return
+            if (Exit.isSuccess(exit)) {
+              const next = exit.value as { continueLoop: boolean }
+              if (!next.continueLoop) {
+                stopLoop(input.sessionID)
+                return
+              }
+              schedule(input.intervalMs ?? LOOP_SELF_PACED_DELAY_MS)
+              return
+            }
+
+            const error = Cause.squash(exit.cause)
+            if (error instanceof Session.BusyError) {
+              schedule(input.intervalMs ?? LOOP_SELF_PACED_DELAY_MS)
+              return
+            }
+
+            stopLoop(input.sessionID)
+            void Effect.runPromise(
+              events.publish(Session.Event.Error, {
+                sessionID: input.sessionID,
+                error: new NamedError.Unknown({
+                  message: error instanceof Error ? error.message : String(error),
+                }).toObject(),
+              }),
+            )
+          })
+        }, delayMs)
+      }
+
+      activeLoops.set(input.sessionID, {
+        stop: () => {
+          stopped = true
+          if (timer) clearTimeout(timer)
+        },
+      })
+
+      schedule(input.intervalMs ?? LOOP_SELF_PACED_DELAY_MS)
+    })
+
+    const handleGoalCommand = Effect.fn("SessionPrompt.goalCommand")(function* (input: CommandInput, agentName: string | undefined) {
+      const ctx = yield* InstanceState.context
+      const trimmed = input.arguments.trim()
+      const [sub, ...rest] = trimmed.split(/\s+/)
+      const goalText = rest.join(" ").trim()
+
+      const resolvedAgent = agentName ?? (yield* agents.defaultInfo()).name
+      const taskModel = input.model
+        ? Provider.parseModel(input.model)
+        : yield* currentModel(input.sessionID)
+
+      const userText = `/goal ${trimmed}`
+      const userMsg: SessionV1.User = {
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: input.sessionID,
+        time: { created: Date.now() },
+        agent: resolvedAgent,
+        model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
+      }
+      yield* sessions.updateMessage(userMsg)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        type: "text",
+        messageID: userMsg.id,
+        sessionID: input.sessionID,
+        text: userText,
+      })
+
+      let responseText: string
+
+      if (sub === "set" && goalText) {
+        yield* goals.set({ sessionID: input.sessionID, text: goalText })
+        responseText = `Goal set: ${goalText}\n\nAutonomous pursuit started. The agent will work toward this goal until it completes or you pause it.`
+        yield* pursue({ sessionID: input.sessionID }).pipe(Effect.forkIn(scope))
+      } else if (sub === "pause") {
+        const goal = yield* goals.pause(input.sessionID)
+        if (goal) {
+          yield* cancel(input.sessionID)
+          responseText = "Goal paused. The autonomous loop has been stopped."
+        } else {
+          responseText = "No active goal to pause."
+        }
+      } else if (sub === "resume") {
+        const goal = yield* goals.resume(input.sessionID)
+        if (goal) {
+          responseText = "Goal resumed. The autonomous loop has been restarted."
+          yield* pursue({ sessionID: input.sessionID }).pipe(Effect.forkIn(scope))
+        } else {
+          responseText = "No paused goal to resume."
+        }
+      } else if (sub === "complete") {
+        const goal = yield* goals.update({
+          sessionID: input.sessionID,
+          status: "completed",
+          verification: goalText || undefined,
+        })
+        if (goal) {
+          yield* cancel(input.sessionID)
+          responseText = `Goal completed.${goalText ? ` Verification: ${goalText}` : ""}`
+        } else {
+          responseText = "No active goal to complete."
+        }
+      } else if (sub === "clear") {
+        yield* goals.clear(input.sessionID)
+        yield* cancel(input.sessionID)
+        responseText = "Goal cleared."
+      } else if (sub === "show" || !sub) {
+        const goal = yield* goals.get(input.sessionID)
+        responseText = goal
+          ? `Goal: ${goal.text}\nStatus: ${goal.status}\nTokens used: ${goal.tokensUsed}${goal.budgetTokens ? ` / ${goal.budgetTokens}` : ""}\nTime: ${Math.round(goal.timeMs / 1000)}s${goal.verification ? `\nVerification: ${goal.verification}` : ""}`
+          : "No goal set for this session."
+      } else {
+        responseText = `Unknown subcommand: "${sub}". Use: set, pause, resume, complete, clear, or show.`
+      }
+
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: userMsg.id,
+        sessionID: input.sessionID,
+        mode: resolvedAgent,
+        agent: resolvedAgent,
+        cost: 0,
+        path: { cwd: ctx.directory, root: ctx.worktree },
+        time: { created: Date.now(), completed: Date.now() },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: taskModel.modelID,
+        providerID: taskModel.providerID,
+        finish: "stop",
+      }
+      yield* sessions.updateMessage(assistant)
+      const part: SessionV1.TextPart = {
+        id: PartID.ascending(),
+        type: "text",
+        messageID: assistant.id,
+        sessionID: input.sessionID,
+        text: responseText,
+      }
+      yield* sessions.updatePart(part)
+
+      const result = { info: assistant, parts: [part] }
+      yield* events.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID: input.sessionID,
+        arguments: input.arguments,
+        messageID: assistant.id,
+      })
+      return result
+    })
+
+    const handleLoopCommand = Effect.fn("SessionPrompt.loopCommand")(function* (
+      input: CommandInput,
+      agentName: string | undefined,
+    ) {
+      const resolvedAgent = agentName ?? (yield* agents.defaultInfo()).name
+      const taskModel = input.model ? Provider.parseModel(input.model) : yield* currentModel(input.sessionID)
+      yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
+
+      const parsed = parseLoopCommandArguments(input.arguments)
+      if (parsed.action === "stop") {
+        const stopped = stopLoop(input.sessionID)
+        const ctx = yield* InstanceState.context
+        const userMsg: SessionV1.User = {
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: input.sessionID,
+          time: { created: Date.now() },
+          agent: resolvedAgent,
+          model: {
+            providerID: taskModel.providerID,
+            modelID: taskModel.modelID,
+            ...(input.variant ? { variant: input.variant } : {}),
+          },
+        }
+        yield* sessions.updateMessage(userMsg)
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          type: "text",
+          messageID: userMsg.id,
+          sessionID: input.sessionID,
+          text: `/${input.command} stop`,
+        })
+        const assistant: SessionV1.Assistant = {
+          id: MessageID.ascending(),
+          role: "assistant",
+          parentID: userMsg.id,
+          sessionID: input.sessionID,
+          mode: resolvedAgent,
+          agent: resolvedAgent,
+          cost: 0,
+          path: { cwd: ctx.directory, root: ctx.worktree },
+          time: { created: Date.now(), completed: Date.now() },
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: taskModel.modelID,
+          providerID: taskModel.providerID,
+          ...(input.variant ? { variant: input.variant } : {}),
+          finish: "stop",
+        }
+        yield* sessions.updateMessage(assistant)
+        const part: SessionV1.TextPart = {
+          id: PartID.ascending(),
+          type: "text",
+          messageID: assistant.id,
+          sessionID: input.sessionID,
+          text: stopped ? "Stopped the active loop." : "No active loop is running for this session.",
+        }
+        yield* sessions.updatePart(part)
+        const result = { info: assistant, parts: [part] }
+        yield* events.publish(Command.Event.Executed, {
+          name: input.command,
+          sessionID: input.sessionID,
+          arguments: input.arguments,
+          messageID: assistant.id,
+        })
+        return result
+      }
+
+      const loopPrompt = parsed.prompt || (yield* readLoopPrompt().pipe(Effect.orDie)) || DEFAULT_LOOP_PROMPT
+      const first = yield* loopStep({
+        sessionID: input.sessionID,
+        agent: resolvedAgent,
+        model: taskModel,
+        variant: input.variant,
+        promptText: loopPrompt,
+        parts: input.parts,
+      }).pipe(Effect.orDie)
+      if (first.continueLoop) {
+        yield* startLoop({
+          sessionID: input.sessionID,
+          agent: resolvedAgent,
+          model: taskModel,
+          variant: input.variant,
+          promptText: loopPrompt,
+          intervalMs: parsed.intervalMs,
+        }).pipe(Effect.orDie)
+      } else {
+        stopLoop(input.sessionID)
+      }
+      yield* events.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID: input.sessionID,
+        arguments: input.arguments,
+        messageID: first.result.info.id,
+      })
+      return first.result
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
@@ -1368,6 +1782,14 @@ const layer = Layer.effect(
         throw error
       }
       const agentName = cmd.agent ?? input.agent
+
+      if (input.command === Command.Default.GOAL) {
+        return yield* handleGoalCommand(input, agentName)
+      }
+
+      if (input.command === Command.Default.LOOP) {
+        return yield* handleLoopCommand(input, agentName)
+      }
 
       const raw = input.arguments.match(argsRegex) ?? []
       const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
@@ -1483,6 +1905,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      pursue,
       loop,
       shell,
       command,
@@ -1541,7 +1964,7 @@ export const CommandInput = Schema.Struct({
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
-  // Inlined (no identifier annotation) to keep the original SDK output — the
+  // Inlined (no identifier annotation) to keep the original SDK output ÔÇö the
   // PromptInput call site below references FilePartInput by ref via the
   // Schema export in message-v2.ts.
   parts: Schema.optional(
@@ -1594,6 +2017,62 @@ const bashRegex = /!`([^`]+)`/g
 const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
+const durationRegex = /^([1-9]\d*)(s|m|h|d)$/i
+
+export const DEFAULT_LOOP_PROMPT = [
+  "You are running in loop mode.",
+  "",
+  "Perform proactive maintenance for the current session and project.",
+  "If there is nothing useful to do right now, say what you checked and stop.",
+  "",
+  `End your final text response with exactly one control marker on its own line: ${LOOP_CONTINUE_MARKER} if another loop iteration should run, or ${LOOP_STOP_MARKER} if the work is complete or blocked until the user or an external system changes state.`,
+].join("\n")
+
+export function parseLoopCommandArguments(input: string): LoopCommandParsed {
+  const trimmed = input.trim()
+  if (!trimmed) return { action: "start", prompt: "" }
+  if (/^(stop|off)$/i.test(trimmed)) return { action: "stop" }
+  const [first, ...rest] = trimmed.split(/\s+/)
+  const match = first.match(durationRegex)
+  if (!match) return { action: "start", prompt: buildLoopPrompt(trimmed) }
+  const value = Number(match[1])
+  const unit = match[2].toLowerCase()
+  const intervalMs =
+    unit === "s"
+      ? value * 1000
+      : unit === "m"
+        ? value * 60 * 1000
+        : unit === "h"
+          ? value * 60 * 60 * 1000
+          : value * 24 * 60 * 60 * 1000
+  return { action: "start", intervalMs, prompt: rest.length > 0 ? buildLoopPrompt(rest.join(" ")) : "" }
+}
+
+export function buildLoopPrompt(goal: string) {
+  const trimmed = goal.trim()
+  return [
+    "You are running in loop mode.",
+    "",
+    trimmed
+      ? `Goal:\n${trimmed}`
+      : "Perform proactive maintenance for the current session and project.",
+    "",
+    "Work autonomously until the goal is complete or you are blocked by the user, permissions, or an external dependency.",
+    "Re-check relevant state before stopping so you do not miss new changes.",
+    `End your final text response with exactly one control marker on its own line: ${LOOP_CONTINUE_MARKER} if another loop iteration should run, or ${LOOP_STOP_MARKER} if the work is complete or blocked until the user or an external system changes state.`,
+  ].join("\n")
+}
+
+export function extractLoopControl(text: string): { action: "continue" | "stop"; text: string } {
+  const trimmedEnd = text.replace(/\s+$/, "")
+  if (trimmedEnd.endsWith(LOOP_CONTINUE_MARKER)) {
+    return { action: "continue", text: trimmedEnd.slice(0, -LOOP_CONTINUE_MARKER.length).replace(/\s+$/, "") }
+  }
+  if (trimmedEnd.endsWith(LOOP_STOP_MARKER)) {
+    return { action: "stop", text: trimmedEnd.slice(0, -LOOP_STOP_MARKER.length).replace(/\s+$/, "") }
+  }
+  return { action: "stop", text }
+}
 
 export const node = LayerNode.make({
   service: Service,
@@ -1621,6 +2100,7 @@ export const node = LayerNode.make({
     SessionRevert.node,
     SessionSummary.node,
     SystemPrompt.node,
+    Goal.node,
     LLM.node,
     EventV2Bridge.node,
     RuntimeFlags.node,

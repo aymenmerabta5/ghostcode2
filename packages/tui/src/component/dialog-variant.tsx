@@ -2,6 +2,7 @@ import { createMemo } from "solid-js"
 import { useLocal } from "../context/local"
 import { DialogSelect } from "../ui/dialog-select"
 import { useDialog } from "../ui/dialog"
+import { EFFORT_SCALE } from "../util/effort"
 
 export function DialogVariant() {
   const local = useLocal()
@@ -17,7 +18,7 @@ export function DialogVariant() {
           local.model.variant.set(undefined)
         },
       },
-      ...local.model.variant.list().map((variant) => ({
+      ...EFFORT_SCALE.map((variant) => ({
         value: variant,
         title: variant,
         onSelect: () => {

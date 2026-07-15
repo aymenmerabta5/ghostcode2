@@ -165,6 +165,27 @@ export const SessionInputTable = sqliteTable(
   ],
 )
 
+export const GoalTable = sqliteTable(
+  "goal",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    text: text().notNull(),
+    status: text().notNull(),
+    budget_tokens: integer(),
+    tokens_used: integer().notNull().default(0),
+    time_ms: integer().notNull().default(0),
+    started_at: integer().notNull(),
+    paused_at: integer(),
+    completed_at: integer(),
+    verification: text(),
+    ...Timestamps,
+  },
+  (table) => [primaryKey({ columns: [table.session_id] }), index("goal_session_idx").on(table.session_id)],
+)
+
 export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
   session_id: text()
     .$type<SessionSchema.ID>()

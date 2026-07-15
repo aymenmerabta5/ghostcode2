@@ -1,4 +1,4 @@
-import type { BoxRenderable, TextareaRenderable, ScrollBoxRenderable } from "@opentui/core"
+﻿import type { BoxRenderable, TextareaRenderable, ScrollBoxRenderable } from "@opentui/core"
 import { pathToFileURL } from "bun"
 import fuzzysort from "fuzzysort"
 import path from "path"
@@ -23,6 +23,7 @@ import { useFrecency } from "../../prompt/frecency"
 import { useBindings, useCommandSlashes, useOpencodeModeStack } from "../../keymap"
 import { displayCharAt, mentionTriggerIndex } from "../../prompt/display"
 import type { FileSystemEntry } from "@opencode-ai/sdk/v2"
+import { listWorkflowInfos, reservedSlashNames } from "./workflow-autocomplete"
 
 function removeLineRange(input: string) {
   const hashIndex = input.lastIndexOf("#")
@@ -363,6 +364,17 @@ export function Autocomplete(props: {
     },
   )
 
+  const [workflowInfos] = createResource(
+    async () => {
+      try {
+        return await listWorkflowInfos(sdk.client.workflow, true)
+      } catch {
+        return []
+      }
+    },
+    { initialValue: [] },
+  )
+
   const mcpResources = createMemo(() => {
     if (!store.visible || store.visible === "/") return []
 
@@ -447,8 +459,11 @@ export function Autocomplete(props: {
   const commands = createMemo((): AutocompleteOption[] => {
     const results: AutocompleteOption[] = [...slashes()]
 
+    const tuiSlashNames = new Set(slashes().map((s) => s.display.replace(/^\//, "")))
+
     for (const serverCommand of sync.data.command) {
       if (serverCommand.source === "skill") continue
+      if (tuiSlashNames.has(serverCommand.name)) continue
       const label = serverCommand.source === "mcp" ? ":mcp" : ""
       results.push({
         display: "/" + serverCommand.name + label,
@@ -462,6 +477,34 @@ export function Autocomplete(props: {
         },
       })
     }
+
+    const reserved = reservedSlashNames(slashes(), sync.data.command)
+    for (const info of workflowInfos() ?? []) {
+      if (reserved.has(info.name)) continue
+      results.push({
+        display: "/" + info.name,
+        description: info.meta?.description,
+        onSelect: () => {
+          const newText = "/" + info.name + " "
+          const cursor = props.input().logicalCursor
+          props.input().deleteRange(0, 0, cursor.row, cursor.col)
+          props.input().insertText(newText)
+          props.input().cursorOffset = Bun.stringWidth(newText)
+        },
+      })
+    }
+
+    results.push({
+      display: "/workflow",
+      description: "Start a workflow",
+      onSelect: () => {
+        const newText = "/workflow "
+        const cursor = props.input().logicalCursor
+        props.input().deleteRange(0, 0, cursor.row, cursor.col)
+        props.input().insertText(newText)
+        props.input().cursorOffset = Bun.stringWidth(newText)
+      },
+    })
 
     results.sort((a, b) => a.display.localeCompare(b.display))
 

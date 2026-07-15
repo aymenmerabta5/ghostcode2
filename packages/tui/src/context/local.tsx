@@ -13,6 +13,7 @@ import { useTheme } from "./theme"
 import { useToast } from "../ui/toast"
 import { useRoute } from "./route"
 import { usePermission } from "./permission"
+import { EFFORT_SCALE } from "../util/effort"
 
 export type LocalTheme = {
   secondary: RGBA
@@ -368,8 +369,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           },
           current() {
             const v = this.selected()
-            if (!v) return undefined
-            if (!this.list().includes(v)) return undefined
+            if (!v || v === "default") return undefined
             return v
           },
           list() {
@@ -388,19 +388,18 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             save()
           },
           cycle() {
-            const variants = this.list()
-            if (variants.length === 0) return
-            const current = this.current()
-            if (!current) {
-              this.set(variants[0])
+            if (this.list().length === 0) return
+            const current = this.selected()
+            const index = current ? (EFFORT_SCALE as readonly string[]).indexOf(current) : -1
+            if (index === -1) {
+              this.set(EFFORT_SCALE[0])
               return
             }
-            const index = variants.indexOf(current)
-            if (index === -1 || index === variants.length - 1) {
+            if (index === EFFORT_SCALE.length - 1) {
               this.set(undefined)
               return
             }
-            this.set(variants[index + 1])
+            this.set(EFFORT_SCALE[index + 1])
           },
         },
       }

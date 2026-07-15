@@ -68,6 +68,9 @@ export type Event =
   | EventQuestionV2Replied
   | EventQuestionV2Rejected
   | EventTodoUpdated
+  | EventGoalUpdated
+  | EventWorkflowRunUpdated
+  | EventWorkflowRunFinished
   | EventLspUpdated
   | EventPermissionAsked
   | EventPermissionReplied
@@ -668,6 +671,21 @@ export type Todo = {
    * Priority level of the task: high, medium, low
    */
   priority: string
+}
+
+export type Goal = {
+  /**
+   * The active goal for this session
+   */
+  text: string
+  status: "active" | "paused" | "completed"
+  budgetTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  tokensUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  timeMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  startedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  pausedAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  completedAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  verification?: string
 }
 
 export type SessionStatus =
@@ -1364,6 +1382,50 @@ export type GlobalEvent = {
         properties: {
           sessionID: string
           todos: Array<Todo>
+        }
+      }
+    | {
+        id: string
+        type: "goal.updated"
+        properties: {
+          sessionID: string
+          goal: Goal
+        }
+      }
+    | {
+        id: string
+        type: "workflow.run.updated"
+        properties: {
+          id: string
+          workflow: string
+          status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+          current_phase: string
+          directory: string
+          agents: {
+            total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            running: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            failed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          }
+          pending_question: boolean
+          error: string
+        }
+      }
+    | {
+        id: string
+        type: "workflow.run.finished"
+        properties: {
+          id: string
+          workflow: string
+          status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+          current_phase: string
+          directory: string
+          agents: {
+            total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            running: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            failed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          }
+          pending_question: boolean
+          error: string
         }
       }
     | {
@@ -2647,6 +2709,158 @@ export type EventTuiSessionSelect = {
   }
 }
 
+export type WorkflowPhase = {
+  title: string
+  detail?: string
+  model?: string
+}
+
+export type WorkflowArgument = {
+  type?: string
+  default?: unknown
+  description?: string
+}
+
+export type WorkflowMeta = {
+  name: string
+  description?: string
+  whenToUse?: string
+  phases?: Array<string | WorkflowPhase>
+  arguments?: {
+    [key: string]: WorkflowArgument
+  }
+}
+
+export type WorkflowInfo = {
+  name: string
+  path: string
+  meta: WorkflowMeta
+  valid: boolean
+  error?: string
+  source_kind?: "builtin"
+}
+
+export type WorkflowDefinition = {
+  name: string
+  path: string
+  meta: WorkflowMeta
+  source?: string
+  temporary?: boolean
+}
+
+export type WorkflowLogEntry = {
+  time: number
+  phase?: string
+  message: string
+}
+
+export type WorkflowAgentRun = {
+  id: string
+  status: "running" | "completed" | "failed" | "skipped"
+  started_at: number
+  completed_at?: number
+  phase?: string
+  agent?: string
+  label?: string
+  model?: string
+  session_id?: string
+  message_id?: string
+  worktree?: string
+  prompt: string
+  output?: string
+  cost?: number
+  tokens?: {
+    total?: number
+    input: number
+    output: number
+    reasoning: number
+    cache: {
+      read: number
+      write: number
+    }
+  }
+  error?: string
+  cached?: boolean
+  kind?: "agent" | "question"
+  answer?: string
+}
+
+export type WorkflowRun = {
+  id: string
+  session_id?: string
+  workflow: string
+  args?: {
+    [key: string]: unknown
+  }
+  definition?: WorkflowDefinition
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+  started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  current_phase?: string
+  logs: Array<WorkflowLogEntry>
+  agents: Array<WorkflowAgentRun>
+  result?: unknown
+  error?: string
+  resume_of?: string
+  pending_question?: {
+    question: string
+    options?: Array<string>
+    asked_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type WorkflowSavePayload = {
+  name: string
+  source: string
+  scope?: "project" | "global"
+}
+
+export type WorkflowSaveResult = {
+  path: string
+}
+
+export type WorkflowApiError = {
+  _tag: "WorkflowApiError"
+  message: string
+  workflow?: string
+  path?: string
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
+export type WorkflowSource = {
+  name: string
+  path: string
+  source: string
+  source_kind?: "builtin"
+}
+
+export type WorkflowStartPayload = {
+  args?: {
+    [key: string]: unknown
+  }
+  budget?: number
+  budget_tokens?: number
+  permissionSessionID?: string
+  resume_of?: string
+  invalidate_agents?: Array<number>
+  replay?: "prefix" | "keyed"
+}
+
+export type WorkflowAnswerPayload = {
+  answer: string
+  permissionSessionID?: string
+}
+
+export type WorkflowExportResult = {
+  path: string
+  files: Array<string>
+}
+
 export type Workspace = {
   id: string
   type: string
@@ -2704,12 +2918,6 @@ export type PromptInput = {
   text: string
   files?: Array<PromptInputFileAttachment>
   agents?: Array<PromptAgentAttachment>
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type ServiceUnavailableError = {
@@ -2791,6 +2999,21 @@ export type OutputFormat1 =
       schema: JsonSchema
       retryCount?: number
     }
+
+export type Goal1 = {
+  /**
+   * The active goal for this session
+   */
+  text: string
+  status: "active" | "paused" | "completed"
+  budgetTokens?: number | "NaN" | "Infinity" | "-Infinity"
+  tokensUsed: number | "NaN" | "Infinity" | "-Infinity"
+  timeMs: number | "NaN" | "Infinity" | "-Infinity"
+  startedAt: number | "NaN" | "Infinity" | "-Infinity"
+  pausedAt?: number | "NaN" | "Infinity" | "-Infinity"
+  completedAt?: number | "NaN" | "Infinity" | "-Infinity"
+  verification?: string
+}
 
 export type SessionStatus2 = {
   id: string
@@ -2911,6 +3134,9 @@ export type V2Event =
   | QuestionV2Replied
   | QuestionV2Rejected
   | TodoUpdated
+  | GoalUpdated
+  | WorkflowRunUpdated
+  | WorkflowRunFinished
   | LspUpdated
   | PermissionAsked
   | PermissionReplied
@@ -2954,6 +3180,21 @@ export type ProjectCopyError = {
 
 export type EffectHttpApiErrorForbidden = {
   _tag: "Forbidden"
+}
+
+export type Goal2 = {
+  /**
+   * The active goal for this session
+   */
+  text: string
+  status: "active" | "paused" | "completed"
+  budgetTokens?: number | "NaN" | "Infinity" | "-Infinity"
+  tokensUsed: number | "NaN" | "Infinity" | "-Infinity"
+  timeMs: number | "NaN" | "Infinity" | "-Infinity"
+  startedAt: number | "NaN" | "Infinity" | "-Infinity"
+  pausedAt?: number | "NaN" | "Infinity" | "-Infinity"
+  completedAt?: number | "NaN" | "Infinity" | "-Infinity"
+  verification?: string
 }
 
 export type EventTuiPromptAppend2 = {
@@ -5671,6 +5912,80 @@ export type TodoUpdated = {
   }
 }
 
+export type GoalUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "goal.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    goal: Goal1
+  }
+}
+
+export type WorkflowRunUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "workflow.run.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    id: string
+    workflow: string
+    status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+    current_phase: string
+    directory: string
+    agents: {
+      total: number | "NaN" | "Infinity" | "-Infinity"
+      running: number | "NaN" | "Infinity" | "-Infinity"
+      failed: number | "NaN" | "Infinity" | "-Infinity"
+    }
+    pending_question: boolean
+    error: string
+  }
+}
+
+export type WorkflowRunFinished = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "workflow.run.finished"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    id: string
+    workflow: string
+    status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+    current_phase: string
+    directory: string
+    agents: {
+      total: number | "NaN" | "Infinity" | "-Infinity"
+      running: number | "NaN" | "Infinity" | "-Infinity"
+      failed: number | "NaN" | "Infinity" | "-Infinity"
+    }
+    pending_question: boolean
+    error: string
+  }
+}
+
 export type LspUpdated = {
   id: string
   metadata?: {
@@ -6840,6 +7155,53 @@ export type EventTodoUpdated = {
   properties: {
     sessionID: string
     todos: Array<Todo>
+  }
+}
+
+export type EventGoalUpdated = {
+  id: string
+  type: "goal.updated"
+  properties: {
+    sessionID: string
+    goal: Goal2
+  }
+}
+
+export type EventWorkflowRunUpdated = {
+  id: string
+  type: "workflow.run.updated"
+  properties: {
+    id: string
+    workflow: string
+    status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+    current_phase: string
+    directory: string
+    agents: {
+      total: number | "NaN" | "Infinity" | "-Infinity"
+      running: number | "NaN" | "Infinity" | "-Infinity"
+      failed: number | "NaN" | "Infinity" | "-Infinity"
+    }
+    pending_question: boolean
+    error: string
+  }
+}
+
+export type EventWorkflowRunFinished = {
+  id: string
+  type: "workflow.run.finished"
+  properties: {
+    id: string
+    workflow: string
+    status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+    current_phase: string
+    directory: string
+    agents: {
+      total: number | "NaN" | "Infinity" | "-Infinity"
+      running: number | "NaN" | "Infinity" | "-Infinity"
+      failed: number | "NaN" | "Infinity" | "-Infinity"
+    }
+    pending_question: boolean
+    error: string
   }
 }
 
@@ -10994,6 +11356,405 @@ export type TuiControlResponseResponses = {
 }
 
 export type TuiControlResponseResponse = TuiControlResponseResponses[keyof TuiControlResponseResponses]
+
+export type WorkflowListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow"
+}
+
+export type WorkflowListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type WorkflowListError = WorkflowListErrors[keyof WorkflowListErrors]
+
+export type WorkflowListResponses = {
+  /**
+   * List of workflows
+   */
+  200: Array<WorkflowInfo>
+}
+
+export type WorkflowListResponse = WorkflowListResponses[keyof WorkflowListResponses]
+
+export type WorkflowRunsData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run"
+}
+
+export type WorkflowRunsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type WorkflowRunsError = WorkflowRunsErrors[keyof WorkflowRunsErrors]
+
+export type WorkflowRunsResponses = {
+  /**
+   * List of workflow runs
+   */
+  200: Array<WorkflowRun>
+}
+
+export type WorkflowRunsResponse = WorkflowRunsResponses[keyof WorkflowRunsResponses]
+
+export type WorkflowSaveData = {
+  body?: WorkflowSavePayload
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/save"
+}
+
+export type WorkflowSaveErrors = {
+  /**
+   * WorkflowApiError | InvalidRequestError
+   */
+  400: WorkflowApiError | InvalidRequestError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowSaveError = WorkflowSaveErrors[keyof WorkflowSaveErrors]
+
+export type WorkflowSaveResponses = {
+  /**
+   * Workflow saved to disk
+   */
+  200: WorkflowSaveResult
+}
+
+export type WorkflowSaveResponse = WorkflowSaveResponses[keyof WorkflowSaveResponses]
+
+export type WorkflowDeleteData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}"
+}
+
+export type WorkflowDeleteErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type WorkflowDeleteError = WorkflowDeleteErrors[keyof WorkflowDeleteErrors]
+
+export type WorkflowDeleteResponses = {
+  /**
+   * Workflow run deleted
+   */
+  200: boolean
+}
+
+export type WorkflowDeleteResponse = WorkflowDeleteResponses[keyof WorkflowDeleteResponses]
+
+export type WorkflowGetData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}"
+}
+
+export type WorkflowGetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowGetError = WorkflowGetErrors[keyof WorkflowGetErrors]
+
+export type WorkflowGetResponses = {
+  /**
+   * Workflow run
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowGetResponse = WorkflowGetResponses[keyof WorkflowGetResponses]
+
+export type WorkflowSourceData = {
+  body?: never
+  path: {
+    name: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{name}/source"
+}
+
+export type WorkflowSourceErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowSourceError = WorkflowSourceErrors[keyof WorkflowSourceErrors]
+
+export type WorkflowSourceResponses = {
+  /**
+   * Workflow source
+   */
+  200: WorkflowSource
+}
+
+export type WorkflowSourceResponse = WorkflowSourceResponses[keyof WorkflowSourceResponses]
+
+export type WorkflowStartData = {
+  body?: WorkflowStartPayload
+  path: {
+    name: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{name}/start"
+}
+
+export type WorkflowStartErrors = {
+  /**
+   * WorkflowApiError | InvalidRequestError
+   */
+  400: WorkflowApiError | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowStartError = WorkflowStartErrors[keyof WorkflowStartErrors]
+
+export type WorkflowStartResponses = {
+  /**
+   * Workflow run started
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowStartResponse = WorkflowStartResponses[keyof WorkflowStartResponses]
+
+export type WorkflowCancelData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/cancel"
+}
+
+export type WorkflowCancelErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowCancelError = WorkflowCancelErrors[keyof WorkflowCancelErrors]
+
+export type WorkflowCancelResponses = {
+  /**
+   * Workflow run cancelled
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowCancelResponse = WorkflowCancelResponses[keyof WorkflowCancelResponses]
+
+export type WorkflowPauseData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/pause"
+}
+
+export type WorkflowPauseErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowPauseError = WorkflowPauseErrors[keyof WorkflowPauseErrors]
+
+export type WorkflowPauseResponses = {
+  /**
+   * Workflow run paused
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowPauseResponse = WorkflowPauseResponses[keyof WorkflowPauseResponses]
+
+export type WorkflowSkipData = {
+  body?: never
+  path: {
+    id: string
+    agentId: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/agent/{agentId}/skip"
+}
+
+export type WorkflowSkipErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowSkipError = WorkflowSkipErrors[keyof WorkflowSkipErrors]
+
+export type WorkflowSkipResponses = {
+  /**
+   * Workflow run after requesting the skip
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowSkipResponse = WorkflowSkipResponses[keyof WorkflowSkipResponses]
+
+export type WorkflowAnswerData = {
+  body?: WorkflowAnswerPayload
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/answer"
+}
+
+export type WorkflowAnswerErrors = {
+  /**
+   * BadRequest | WorkflowApiError | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | WorkflowApiError | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowAnswerError = WorkflowAnswerErrors[keyof WorkflowAnswerErrors]
+
+export type WorkflowAnswerResponses = {
+  /**
+   * Workflow run after answering its open question
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowAnswerResponse = WorkflowAnswerResponses[keyof WorkflowAnswerResponses]
+
+export type WorkflowExportData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/export"
+}
+
+export type WorkflowExportErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowExportError = WorkflowExportErrors[keyof WorkflowExportErrors]
+
+export type WorkflowExportResponses = {
+  /**
+   * Workflow run transcripts exported
+   */
+  200: WorkflowExportResult
+}
+
+export type WorkflowExportResponse = WorkflowExportResponses[keyof WorkflowExportResponses]
 
 export type ExperimentalWorkspaceAdapterListData = {
   body?: never

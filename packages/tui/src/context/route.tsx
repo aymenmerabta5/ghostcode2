@@ -12,6 +12,10 @@ export type SessionRoute = {
   type: "session"
   sessionID: string
   prompt?: PromptInfo
+  workflowRunID?: string
+  workflowPhase?: string
+  workflowAgentID?: string
+  workflowReturnSessionID?: string
 }
 
 export type PluginRoute = {

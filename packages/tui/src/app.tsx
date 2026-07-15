@@ -1,5 +1,4 @@
-import { render, TimeToFirstDraw, useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { registerOpencodeSpinner } from "./component/register-spinner"
+﻿import { render, TimeToFirstDraw, useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Deferred, Effect } from "effect"
 import { Global } from "@opencode-ai/core/global"
@@ -43,7 +42,6 @@ import { DialogModel } from "./component/dialog-model"
 import { useConnected } from "./component/use-connected"
 import { DialogMcp } from "./component/dialog-mcp"
 import { DialogStatus } from "./component/dialog-status"
-import { DialogDebug } from "./component/dialog-debug"
 import { DialogThemeList } from "./component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { DialogAgent } from "./component/dialog-agent"
@@ -81,13 +79,12 @@ import {
 
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
+import { DialogWorkflow } from "./component/dialog-workflow"
 import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
 import { cliErrorMessage, errorFormat } from "./util/error"
-
-registerOpencodeSpinner()
 
 const appGlobalBindingCommands = [
   "session.list",
@@ -101,6 +98,7 @@ const appGlobalBindingCommands = [
   "session.quick_switch.7",
   "session.quick_switch.8",
   "session.quick_switch.9",
+  "workflow.list",
 ] as const
 
 const appBindingCommands = [
@@ -119,7 +117,6 @@ const appBindingCommands = [
   "provider.connect",
   "console.org.switch",
   "opencode.status",
-  "opencode.debug",
   "theme.switch",
   "theme.switch_mode",
   "theme.mode.lock",
@@ -770,15 +767,6 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         category: "System",
       },
       {
-        name: "opencode.debug",
-        title: "View debug info",
-        slashName: "debug",
-        run: () => {
-          dialog.replace(() => <DialogDebug />)
-        },
-        category: "System",
-      },
-      {
         name: "theme.switch",
         title: "Switch theme",
         slashName: "themes",
@@ -950,6 +938,37 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         category: "System",
         run: () => {
           local.permission.toggle()
+          dialog.clear()
+        },
+      },
+      {
+        name: "workflow.list",
+        title: "Open workflows",
+        category: "Workflow",
+        slashName: "workflows",
+        run: () => {
+          dialog.replace(() => <DialogWorkflow />)
+        },
+      },
+      {
+        name: "goal.set",
+        title: "Set session goal",
+        category: "Session",
+        run: () => {
+          const p = promptRef.current
+          if (!p) return
+          p.current.input = "/goal "
+          dialog.clear()
+        },
+      },
+      {
+        name: "loop.start",
+        title: "Start a loop",
+        category: "Session",
+        run: () => {
+          const p = promptRef.current
+          if (!p) return
+          p.current.input = "/loop "
           dialog.clear()
         },
       },

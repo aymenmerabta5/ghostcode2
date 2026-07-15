@@ -1,4 +1,4 @@
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+﻿import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectBridge } from "@/effect/bridge"
@@ -8,6 +8,8 @@ import { Config } from "@/config/config"
 import { MCP } from "../mcp"
 import { Skill } from "../skill"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
+import PROMPT_GOAL from "./template/goal.txt"
+import PROMPT_LOOP from "./template/loop.txt"
 import PROMPT_REVIEW from "./template/review.txt"
 import { LegacyEvent } from "@opencode-ai/schema/legacy-event"
 
@@ -45,6 +47,8 @@ export function hints(template: string) {
 
 export const Default = {
   INIT: "init",
+  GOAL: "goal",
+  LOOP: "loop",
   REVIEW: "review",
 } as const
 
@@ -85,6 +89,24 @@ const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands[Default.GOAL] = {
+        name: Default.GOAL,
+        description: "set or update the session goal",
+        source: "command",
+        get template() {
+          return PROMPT_GOAL
+        },
+        hints: ["$ARGUMENTS"],
+      }
+      commands[Default.LOOP] = {
+        name: Default.LOOP,
+        description: "run a prompt on a loop until stopped",
+        source: "command",
+        get template() {
+          return PROMPT_LOOP
+        },
+        hints: ["$ARGUMENTS"],
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

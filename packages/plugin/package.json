@@ -12,6 +12,7 @@
     ".": "./src/index.ts",
     "./tool": "./src/tool.ts",
     "./tui": "./src/tui.ts",
+    "./workflow": "./src/workflow.ts",
     "./v2/effect": "./src/v2/effect/index.ts",
     "./v2/effect/integration": "./src/v2/effect/integration.ts",
     "./v2/effect/plugin": "./src/v2/effect/plugin.ts",

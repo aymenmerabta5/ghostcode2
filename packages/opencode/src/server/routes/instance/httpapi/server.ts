@@ -47,6 +47,8 @@ import { Snapshot } from "@/snapshot"
 import { Storage } from "@/storage/storage"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
+import { Workflow } from "@/workflow/workflow"
+import { Goal } from "@/session/goal"
 import { Worktree } from "@/worktree"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
@@ -70,6 +72,7 @@ import { lazy } from "@/util/lazy"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@opencode-ai/server/cors"
 import { serveUIEffect } from "@/server/shared/ui"
 import { ServerAuth } from "@/server/auth"
+import { anthropicRoute } from "@/server/routes/anthropic"
 import { InstanceHttpApi, RootHttpApi } from "./api"
 import { Api } from "@opencode-ai/server/api"
 import { PublicApi } from "./public"
@@ -99,6 +102,7 @@ import { questionHandlers } from "./handlers/question"
 import { sessionHandlers } from "./handlers/session"
 import { syncHandlers } from "./handlers/sync"
 import { tuiHandlers } from "./handlers/tui"
+import { workflowHandlers } from "./handlers/workflow"
 import { handlers } from "@opencode-ai/server/handlers"
 import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
 import { layer as locationLayer } from "@opencode-ai/server/location"
@@ -167,6 +171,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     sessionHandlers,
     syncHandlers,
     tuiHandlers,
+    workflowHandlers,
     workspaceHandlers,
   ]),
 )
@@ -252,6 +257,8 @@ const app = LayerNode.group([
   Command.node,
   Truncate.node,
   ToolRegistry.node,
+  Workflow.node,
+  Goal.node,
   Format.node,
   Project.node,
   Vcs.node,
@@ -270,8 +277,11 @@ const app = LayerNode.group([
 
 export function createRoutes(
   corsOptions?: CorsOptions,
+  anthropicDirectory?: string,
 ): Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements> {
   const locationServiceMapV2 = buildLocationServiceMap()
+
+  const anthropicRoutes = anthropicDirectory ? anthropicRoute(anthropicDirectory) : Layer.empty
 
   return Layer.mergeAll(
     rootApiRoutes,
@@ -281,6 +291,7 @@ export function createRoutes(
     serverRoutes,
     docRoute,
     uiRoute,
+    anthropicRoutes,
   ).pipe(
     Layer.provide([
       errorLayer,

@@ -395,6 +395,33 @@ import type {
   VcsGetResponses,
   VcsStatusErrors,
   VcsStatusResponses,
+  WorkflowAnswerErrors,
+  WorkflowAnswerPayload,
+  WorkflowAnswerResponses,
+  WorkflowCancelErrors,
+  WorkflowCancelResponses,
+  WorkflowDeleteErrors,
+  WorkflowDeleteResponses,
+  WorkflowExportErrors,
+  WorkflowExportResponses,
+  WorkflowGetErrors,
+  WorkflowGetResponses,
+  WorkflowListErrors,
+  WorkflowListResponses,
+  WorkflowPauseErrors,
+  WorkflowPauseResponses,
+  WorkflowRunsErrors,
+  WorkflowRunsResponses,
+  WorkflowSaveErrors,
+  WorkflowSavePayload,
+  WorkflowSaveResponses,
+  WorkflowSkipErrors,
+  WorkflowSkipResponses,
+  WorkflowSourceErrors,
+  WorkflowSourceResponses,
+  WorkflowStartErrors,
+  WorkflowStartPayload,
+  WorkflowStartResponses,
   WorktreeCreateErrors,
   WorktreeCreateInput,
   WorktreeCreateResponses,
@@ -5021,6 +5048,409 @@ export class Tui extends HeyApiClient {
   }
 }
 
+export class Workflow extends HeyApiClient {
+  /**
+   * List workflows
+   *
+   * List discovered workflow definitions.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowListResponses, WorkflowListErrors, ThrowOnError>({
+      url: "/workflow",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List workflow runs
+   *
+   * List persisted workflow execution runs for this instance.
+   */
+  public runs<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowRunsResponses, WorkflowRunsErrors, ThrowOnError>({
+      url: "/workflow/run",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Save workflow
+   *
+   * Save a workflow source string as a discoverable workflow file.
+   */
+  public save<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      workflowSavePayload?: WorkflowSavePayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowSavePayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowSaveResponses, WorkflowSaveErrors, ThrowOnError>({
+      url: "/workflow/save",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Delete workflow run
+   *
+   * Delete a workflow run from persisted history.
+   */
+  public delete<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<WorkflowDeleteResponses, WorkflowDeleteErrors, ThrowOnError>({
+      url: "/workflow/run/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get workflow run
+   *
+   * Get details for a workflow execution run.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowGetResponses, WorkflowGetErrors, ThrowOnError>({
+      url: "/workflow/run/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Read workflow source
+   *
+   * Resolve a named workflow's module source for the pre-run approval preview.
+   */
+  public source<ThrowOnError extends boolean = false>(
+    parameters: {
+      name: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "name" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowSourceResponses, WorkflowSourceErrors, ThrowOnError>({
+      url: "/workflow/{name}/source",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Start workflow
+   *
+   * Start a workflow execution run.
+   */
+  public start<ThrowOnError extends boolean = false>(
+    parameters: {
+      name: string
+      directory?: string
+      workspace?: string
+      workflowStartPayload?: WorkflowStartPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "name" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowStartPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowStartResponses, WorkflowStartErrors, ThrowOnError>({
+      url: "/workflow/{name}/start",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Cancel workflow run
+   *
+   * Cancel a running workflow execution run.
+   */
+  public cancel<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowCancelResponses, WorkflowCancelErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/cancel",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Pause workflow run
+   *
+   * Pause a running workflow execution run.
+   */
+  public pause<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowPauseResponses, WorkflowPauseErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/pause",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Skip workflow agent step
+   *
+   * Skip one in-flight agent step of a live workflow run.
+   */
+  public skip<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      agentId: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "path", key: "agentId" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowSkipResponses, WorkflowSkipErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/agent/{agentId}/skip",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Answer workflow question
+   *
+   * Answer a run's open human-in-the-loop question.
+   */
+  public answer<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+      workflowAnswerPayload?: WorkflowAnswerPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowAnswerPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowAnswerResponses, WorkflowAnswerErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/answer",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Export workflow run transcripts
+   *
+   * Export a run's transcripts as JSONL files.
+   */
+  public export<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowExportResponses, WorkflowExportErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/export",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Health extends HeyApiClient {
   /**
    * Check server health
@@ -7210,6 +7640,11 @@ export class OpencodeClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
+  }
+
+  private _workflow?: Workflow
+  get workflow(): Workflow {
+    return (this._workflow ??= new Workflow({ client: this.client }))
   }
 
   private _v2?: V2

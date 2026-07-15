@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -18,7 +18,8 @@ import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
-import type { Provider } from "@/provider/provider"
+import { Provider } from "@/provider/provider"
+import { KeyRotator } from "@/provider/key-rotator"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
@@ -94,6 +95,7 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const rotator = yield* KeyRotator.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -632,12 +634,14 @@ const layer = Layer.effect(
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
+        const keyIndex = { current: undefined as number | undefined }
+
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream({ ...streamInput, onKeyIndex: (i) => (keyIndex.current = i) })
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
@@ -659,17 +663,48 @@ const layer = Layer.effect(
             ),
             Effect.retry(
               SessionRetry.policy({
-                provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
+                set: (info) =>
+                  info.isRateLimit
+                    ? Effect.gen(function* () {
+                        const hasAvailable = yield* rotator.hasAvailableKeys(input.model.providerID)
+                        if (hasAvailable) return
+                        yield* status.set(ctx.sessionID, {
+                          type: "retry",
+                          attempt: info.attempt,
+                          message: info.message,
+                          next: info.next,
+                        })
+                      })
+                    : status.set(ctx.sessionID, {
+                        type: "retry",
+                        attempt: info.attempt,
+                        message: info.message,
+                        next: info.next,
+                      }),
+                onRateLimited: (info) =>
+                  keyIndex.current !== undefined
+                    ? rotator.markRateLimited(input.model.providerID, keyIndex.current, {
+                        retryAfterMs: info?.retryAfterMs,
+                      })
+                    : Effect.void,
+                onKeyExhausted: () =>
+                  keyIndex.current !== undefined
+                    ? rotator.markRateLimited(input.model.providerID, keyIndex.current, { exhausted: true })
+                    : Effect.void,
+                canRotateKey: () => rotator.hasAvailableKeys(input.model.providerID),
+                delay: ({ isRateLimit }) =>
+                  Effect.gen(function* () {
+                    if (!isRateLimit) return Duration.millis(SessionRetry.RETRY_FIXED_DELAY)
+                    const hasAvailable = yield* rotator.hasAvailableKeys(input.model.providerID)
+                    if (hasAvailable) return Duration.millis(0)
+                    const waitMs = yield* rotator.getWaitTime(input.model.providerID)
+                    return Duration.millis(Math.max(waitMs, 1000))
+                  }),
+                shouldContinue: ({ isRateLimit }) =>
+                  isRateLimit
+                    ? rotator.hasAvailableKeys(input.model.providerID)
+                    : Effect.succeed(false),
               }),
             ),
             Effect.catch(halt),
@@ -712,6 +747,7 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    KeyRotator.node,
   ],
 })
 

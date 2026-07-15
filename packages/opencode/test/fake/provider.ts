@@ -65,6 +65,10 @@ export namespace ProviderTest {
           getLanguage: Effect.fn("TestProvider.getLanguage")(() =>
             Effect.die(new Error("ProviderTest.getLanguage not configured")),
           ),
+          getRotation: Effect.fn("TestProvider.getRotation")(() =>
+            Effect.succeed({ hasPool: false as const, total: 0, available: 0, waitMs: 0 }),
+          ),
+          markRateLimited: Effect.fn("TestProvider.markRateLimited")(() => Effect.void),
           closest: Effect.fn("TestProvider.closest")((providerID) =>
             Effect.succeed(providerID === row.id ? { providerID: row.id, modelID: mdl.id } : undefined),
           ),

@@ -12,6 +12,10 @@ import { ReadTool } from "./read"
 import { TaskTool } from "./task"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
+import { GoalTool } from "./goal"
+import { WorkflowTool } from "./workflow"
+import { Goal } from "../session/goal"
+import { Workflow } from "@/workflow/workflow"
 import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
@@ -98,6 +102,8 @@ const layer = Layer.effect(
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
+    const goal = yield* GoalTool
+    const workflow = yield* WorkflowTool
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
     const webfetch = yield* WebFetchTool
@@ -211,8 +217,10 @@ const layer = Layer.effect(
           write: Tool.init(writetool),
           task: Tool.init(task),
           fetch: Tool.init(webfetch),
-          todo: Tool.init(todo),
-          search: Tool.init(websearch),
+            todo: Tool.init(todo),
+            goal: Tool.init(goal),
+            workflow: Tool.init(workflow),
+            search: Tool.init(websearch),
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
@@ -234,8 +242,10 @@ const layer = Layer.effect(
             tool.write,
             tool.task,
             tool.fetch,
-            tool.todo,
-            tool.search,
+              tool.todo,
+              tool.goal,
+              tool.workflow,
+              tool.search,
             tool.skill,
             tool.patch,
             ...(tool.execute ? [tool.execute] : []),
@@ -425,9 +435,11 @@ export const node = LayerNode.make({
   deps: [
     Config.node,
     Plugin.node,
-    Question.node,
-    Todo.node,
-    Agent.node,
+      Question.node,
+      Todo.node,
+      Goal.node,
+      Workflow.node,
+      Agent.node,
     Skill.node,
     Session.node,
     BackgroundJob.node,

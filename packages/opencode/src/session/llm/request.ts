@@ -1,4 +1,4 @@
-import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+﻿import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import type { Auth } from "@/auth"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { RuntimeFlags } from "@/effect/runtime-flags"
@@ -14,6 +14,7 @@ import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
+import { resolveEffort } from "@/util/effort"
 
 const USER_AGENT = `opencode/${InstallationVersion}`
 
@@ -55,15 +56,14 @@ const mergeOptions = (target: Record<string, any>, source: Record<string, any> |
 
 export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
   const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
-  const system = [
-    [
-      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
-      ...input.system,
-      ...(input.user.system ? [input.user.system] : []),
-    ]
-      .filter((x) => x)
-      .join("\n"),
-  ]
+  const hasGoalFirst = input.system.length > 0 && input.system[0].startsWith("<session-goal")
+  const systemBase = [
+    ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+    ...(hasGoalFirst ? [] : input.system),
+    ...(input.user.system ? [input.user.system] : []),
+  ].filter((x) => x)
+  const parts = hasGoalFirst ? [input.system[0], ...systemBase, ...input.system.slice(1)] : systemBase
+  const system = [parts.join("\n")]
 
   const header = system[0]
   yield* input.plugin.trigger(
@@ -71,16 +71,16 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     { sessionID: input.sessionID, model: input.model },
     { system },
   )
-  if (system.length > 2 && system[0] === header) {
+  if (system.length > 2 && system[0] === header && !header.startsWith("<session-goal")) {
     const rest = system.slice(1)
     system.length = 0
     system.push(header, rest.join("\n"))
   }
 
+  const variantKeys = input.model.variants ? Object.keys(input.model.variants) : []
+  const variantKey = resolveEffort(input.user.model.variant, variantKeys)
   const variant =
-    !input.small && input.model.variants && input.user.model.variant
-      ? input.model.variants[input.user.model.variant]
-      : {}
+    !input.small && input.model.variants && variantKey ? input.model.variants[variantKey] : {}
   const base = input.small
     ? ProviderTransform.smallOptions(input.model)
     : ProviderTransform.options({

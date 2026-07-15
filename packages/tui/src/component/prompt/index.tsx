@@ -1,4 +1,4 @@
-import {
+﻿import {
   BoxRenderable,
   RGBA,
   TextareaRenderable,
@@ -10,7 +10,8 @@ import {
 } from "@opentui/core"
 import type { CommandContext } from "@opentui/keymap"
 import { createEffect, createMemo, onMount, createSignal, onCleanup, on, Show, Switch, Match } from "solid-js"
-import { registerOpencodeSpinner } from "../register-spinner"
+import { registerSpinner } from "opentui-spinner/solid"
+registerSpinner()
 import path from "path"
 import { fileURLToPath } from "url"
 import { useLocal } from "../../context/local"
@@ -51,14 +52,12 @@ import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
 import { useArgs } from "../../context/args"
-import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
+import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useCommandSlashes, useLeaderActive, useOpencodeKeymap } from "../../keymap"
+import { DialogWorkflow } from "../dialog-workflow"
 import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
-import { useLocation } from "../../context/location"
-
-registerOpencodeSpinner()
 
 export type PromptProps = {
   sessionID?: string
@@ -149,7 +148,6 @@ export function Prompt(props: PromptProps) {
   const local = useLocal()
   const args = useArgs()
   const paths = useTuiPaths()
-  const location = useLocation()
   const terminalEnvironment = useTuiTerminalEnvironment()
   const clipboard = useClipboard()
   const sdk = useSDK()
@@ -164,6 +162,7 @@ export function Prompt(props: PromptProps) {
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
+  const tuiSlashes = useCommandSlashes()
   const agentShortcut = useCommandShortcut("agent.cycle")
   const paletteShortcut = useCommandShortcut("command.palette.show")
   const renderer = useRenderer()
@@ -932,7 +931,7 @@ export function Prompt(props: PromptProps) {
     // input's native onSubmit racing another dispatch). Without this guard,
     // a second call slips past the empty-input check before the first call
     // clears `store.prompt.input`, then awaits its own `session.create` and
-    // ultimately reads the now-empty store — sending a phantom empty prompt
+    // ultimately reads the now-empty store ÔÇö sending a phantom empty prompt
     // to a freshly created session.
     if (submitting) return false
     submitting = true
@@ -1067,6 +1066,50 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
+    } else if (inputText.startsWith("/workflow ") || inputText === "/workflow") {
+      move.startSubmit()
+      const parts = inputText.slice(1).split(/\s+/)
+      const wfName = parts[1]
+      if (!wfName) {
+        toast.show({ message: "Usage: /workflow <name> [args]", variant: "error" })
+      } else {
+        const argParts = parts.slice(2)
+        const args: Record<string, unknown> = {}
+        for (const arg of argParts) {
+          const eq = arg.indexOf("=")
+          if (eq > 0) {
+            const key = arg.slice(0, eq).replace(/^--?/, "")
+            const val = arg.slice(eq + 1)
+            args[key] = val
+          } else {
+            args[arg.replace(/^--?/, "")] = true
+          }
+        }
+        try {
+          const result = await sdk.client.workflow.start({
+            name: wfName,
+            workflowStartPayload: Object.keys(args).length > 0 ? { args } : undefined,
+          })
+          if (result.data) {
+            dialog.replace(() => <DialogWorkflow openRunID={result.data!.id} />)
+          }
+        } catch (err) {
+          toast.show({
+            message: err instanceof Error ? err.message : "Failed to start workflow",
+            variant: "error",
+          })
+        }
+      }
+    } else if (
+      inputText.startsWith("/") &&
+      tuiSlashes().some((s) => s.display === inputText.split("\n")[0].split(" ")[0])
+    ) {
+      move.startSubmit()
+      const cmdName = inputText.split("\n")[0].split(" ")[0]
+      const entry = tuiSlashes().find((s) => s.display === cmdName)
+      if (entry) {
+        entry.onSelect()
+      }
     } else if (
       inputText.startsWith("/") &&
       sync.data.command.some((x) => x.name === inputText.split("\n")[0].split(" ")[0].slice(1))
@@ -1353,7 +1396,7 @@ export function Prompt(props: PromptProps) {
           borderColor={borderHighlight()}
           customBorderChars={{
             ...SplitBorder.customBorderChars,
-            bottomLeft: "╹",
+            bottomLeft: "Ôò╣",
           }}
         >
           <box
@@ -1451,7 +1494,7 @@ export function Prompt(props: PromptProps) {
                       </Show>
                       <Show when={store.mode === "normal"}>
                         <box flexDirection="row" gap={1}>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
+                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>┬À</text>
                           <text
                             flexShrink={0}
                             fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
@@ -1460,7 +1503,7 @@ export function Prompt(props: PromptProps) {
                           </text>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
                           <Show when={showVariant()}>
-                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
+                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>┬À</text>
                             <text>
                               <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
                                 {local.model.variant.current()}
@@ -1487,7 +1530,7 @@ export function Prompt(props: PromptProps) {
           borderColor={borderHighlight()}
           customBorderChars={{
             ...EmptyBorder,
-            vertical: theme.backgroundElement.a !== 0 ? "╹" : " ",
+            vertical: theme.backgroundElement.a !== 0 ? "Ôò╣" : " ",
           }}
         >
           <box
@@ -1498,7 +1541,7 @@ export function Prompt(props: PromptProps) {
               theme.backgroundElement.a !== 0
                 ? {
                     ...EmptyBorder,
-                    horizontal: "▀",
+                    horizontal: "ÔûÇ",
                   }
                 : {
                     ...EmptyBorder,
@@ -1518,7 +1561,7 @@ export function Prompt(props: PromptProps) {
               >
                 <box flexShrink={0} flexDirection="row" gap={1}>
                   <box marginLeft={1}>
-                    <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
+                    <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[Ôï»]</text>}>
                       <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
                     </Show>
                   </box>
@@ -1639,15 +1682,7 @@ export function Prompt(props: PromptProps) {
                 <text fg={theme.accent}>(new working copy)</text>
               </box>
             </Match>
-            <Match when={true}>
-              {props.hint ?? (
-                <Show when={props.sessionID}>
-                  <box marginLeft={1}>
-                    <text fg={theme.textMuted}>{location()?.directory ?? paths.cwd}</text>
-                  </box>
-                </Show>
-              )}
-            </Match>
+            <Match when={true}>{props.hint ?? <text />}</Match>
           </Switch>
           <Show when={status().type !== "retry"}>
             <box gap={2} flexDirection="row">
@@ -1662,7 +1697,7 @@ export function Prompt(props: PromptProps) {
                     <Match when={usage()}>
                       {(item) => (
                         <text fg={theme.textMuted} wrapMode="none">
-                          {[item().context, item().cost].filter(Boolean).join(" · ")}
+                          {[item().context, item().cost].filter(Boolean).join(" ┬À ")}
                         </text>
                       )}
                     </Match>
