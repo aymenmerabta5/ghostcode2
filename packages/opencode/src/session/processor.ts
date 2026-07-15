@@ -688,7 +688,7 @@ const layer = Layer.effect(
                     const hasAvailable = yield* rotator.hasAvailableKeys(input.model.providerID)
                     if (hasAvailable) return Duration.millis(0)
                     const waitMs = yield* rotator.getWaitTime(input.model.providerID)
-                    return Duration.millis(Math.max(waitMs, 1000))
+                    return Duration.millis(Math.min(Math.max(waitMs, 1000), 5000))
                   }),
                 shouldContinue: ({ isRateLimit }) =>
                   isRateLimit

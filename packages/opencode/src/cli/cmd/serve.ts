@@ -22,8 +22,7 @@ export const ServeCommand = effectCmd({
       console.log("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }
     const base = yield* resolveNetworkOptions(args)
-    const anthropicDirectory =
-      process.env.OPENCODE_ANTHROPIC_DIRECTORY ?? process.env.GHOSTCODE_ANTHROPIC_DIRECTORY ?? os.homedir()
+    const anthropicDirectory = process.env.OPENCODE_ANTHROPIC_DIRECTORY ?? os.homedir()
     const opts = args.anthropic
       ? { ...base, anthropic: true as const, anthropicDirectory }
       : { ...base, anthropic: false as const }
