@@ -1,8 +1,8 @@
-﻿Discover, run, and manage long-running workflow programs. Workflows are multi-step scripts that orchestrate subagents with parallel execution, budget caps, and phase tracking.
+Discover, run, and manage long-running workflow programs. Workflows are multi-step scripts that orchestrate subagents with parallel execution, budget caps, and phase tracking.
 
 ## What are workflows?
 
-Workflows are TypeScript files that export a `meta` object and a `run` function. They orchestrate multiple subagent calls across named phases, with support for parallel execution, structured outputs, budget caps, and phase tracking. Workflows persist their state to disk ÔÇö a run survives a crash and can be inspected, paused, resumed, or cancelled.
+Workflows are TypeScript files that export a `meta` object and a `run` function. They orchestrate multiple subagent calls across named phases, with support for parallel execution, structured outputs, budget caps, and phase tracking. Workflows persist their state to disk — a run survives a crash and can be inspected, paused, resumed, or cancelled.
 
 ## When to use workflows vs the Task tool
 
@@ -13,8 +13,8 @@ Workflows are TypeScript files that export a `meta` object and a `run` function.
 
 - **list**: List all available workflows (built-in + project + global). Always call this first to see what exists.
 - **read**: Get a workflow's source code by name. Call this before creating a similar workflow or to understand an existing one.
-- **start**: Run a workflow by name with optional args and budget. Returns the run ID. The workflow runs in the background ÔÇö use **inspect** or **wait** to check progress.
-- **wait**: Block until a run finishes or timeout. Use sparingly ÔÇö prefer **inspect** for non-blocking checks.
+- **start**: Run a workflow by name with optional args and budget. Returns the run ID. The workflow runs in the background — use **inspect** or **wait** to check progress.
+- **wait**: Block until a run finishes or timeout. Use sparingly — prefer **inspect** for non-blocking checks.
 - **inspect**: Get a run's current status, phases, agents, and logs.
 - **cancel**: Cancel a running workflow.
 - **create**: Save a new workflow source to disk. Files are saved to `.opencode/workflows/<name>.ts` (project) or the global workflows dir.
@@ -93,6 +93,6 @@ Global workflows: `<global-config>/workflows/<name>.ts`
 - Always call `action: "list"` first to see what workflows already exist.
 - Use `action: "read"` to inspect an existing workflow before creating a similar one.
 - Phases in `meta.phases` should match the `ctx.setPhase()` calls in `run()`.
-- Structured schemas on `ctx.agent()` give you typed responses ÔÇö use them for parsing.
+- Structured schemas on `ctx.agent()` give you typed responses — use them for parsing.
 - `ctx.parallel()` is the key to fan-out: pass an array of thunks that each call `ctx.agent()`.
 - Budget caps (`budget` param on start) prevent runaway costs. Use USD or token limits.

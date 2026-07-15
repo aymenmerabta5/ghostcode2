@@ -1,4 +1,4 @@
-﻿import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -1145,7 +1145,7 @@ const layer = Layer.effect(
 
           if (
             lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+            !["tool-calls"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
             lastUser.id < lastAssistant.id
           ) {
@@ -1303,7 +1303,7 @@ const layer = Layer.effect(
             const goalResult = yield* goals.get(sessionID).pipe(Effect.option)
             const goal = Option.isSome(goalResult) ? goalResult.value : undefined
             const goalBlock = goal
-              ? `<session-goal>\ntext: ${goal.text}\nstatus: ${goal.status}\n${goal.budgetTokens ? `budgetTokens: ${goal.budgetTokens}\n` : ""}${goal.verification ? `verification: ${goal.verification}\n` : ""}</session-goal>`
+              ? `<session-goal>\ntext: ${goal.text.slice(0, 2000)}\nstatus: ${goal.status}\n${goal.budgetTokens ? `budgetTokens: ${goal.budgetTokens}\n` : ""}${goal.verification ? `verification: ${goal.verification ? goal.verification.slice(0, 500) : ""}\n` : ""}</session-goal>`
               : undefined
             const system = [
               ...(goalBlock ? [goalBlock] : []),
@@ -1337,11 +1337,11 @@ const layer = Layer.effect(
               return "break" as const
             }
 
-            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            const finished = handle.message.finish && !["tool-calls"].includes(handle.message.finish)
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
-              // output at all ÔÇö previously the session went idle silently ÔÇö or
+              // output at all — previously the session went idle silently — or
               // partial text that was cut off by the provider's filter.
               if (handle.message.finish === "content-filter") {
                 handle.message.error = new SessionV1.ContentFilterError({
@@ -1964,7 +1964,7 @@ export const CommandInput = Schema.Struct({
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
-  // Inlined (no identifier annotation) to keep the original SDK output ÔÇö the
+  // Inlined (no identifier annotation) to keep the original SDK output — the
   // PromptInput call site below references FilePartInput by ref via the
   // Schema export in message-v2.ts.
   parts: Schema.optional(

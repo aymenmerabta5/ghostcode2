@@ -1,6 +1,7 @@
 import fs from "fs"
 import path from "path"
 import crypto from "crypto"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer, Context, Clock, Semaphore } from "effect"
 import { Global } from "@opencode-ai/core/global"
 
@@ -114,6 +115,14 @@ export const layer = Layer.effect(
         }
 
         pools.set(providerID, pool)
+
+        if (persistedState && persistedState[providerID]) {
+          const now = Date.now()
+          const hasExpired = Object.values(persistedState[providerID]).some((cd: any) => cd.expiry <= now)
+          if (hasExpired) {
+            Effect.runPromise(writeCooldownsFile(now)).catch(() => {})
+          }
+        }
       },
 
       getNext(providerID) {
@@ -248,5 +257,7 @@ export const layer = Layer.effect(
 )
 
 export const defaultLayer = layer
+
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [] })
 
 export * as KeyRotator from "./key-rotator"

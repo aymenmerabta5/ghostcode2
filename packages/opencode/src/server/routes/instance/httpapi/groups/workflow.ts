@@ -1,4 +1,4 @@
-﻿import { SessionID } from "@/session/schema"
+import { SessionID } from "@/session/schema"
 import { Workflow } from "@/workflow/workflow"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiError, OpenApi } from "effect/unstable/httpapi"

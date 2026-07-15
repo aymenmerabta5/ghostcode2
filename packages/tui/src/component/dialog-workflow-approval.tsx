@@ -1,4 +1,4 @@
-﻿import { TextAttributes, type ScrollBoxRenderable } from "@opentui/core"
+import { TextAttributes, type ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
 import { createMemo, createResource, createSignal, For, Show } from "solid-js"
@@ -46,7 +46,7 @@ export function DialogWorkflowApproval(props: {
   const { theme } = useTheme()
   const [active, setActive] = createSignal(0)
 
-  // Item 9: phases may be structured entries (string | {title, ÔÇª}); normalize to
+  // Item 9: phases may be structured entries (string | {title, …}); normalize to
   // the title strings so a structured phase never renders as "[object Object]".
   const phases = createMemo(() => phaseTitles(props.info.meta.phases))
   const description = createMemo(() => props.info.meta.description)
@@ -96,7 +96,7 @@ export function DialogWorkflowApproval(props: {
           </text>
         </box>
         <Show when={props.info.meta.name !== props.info.name}>
-          <text fg={theme.textMuted}>{`/${props.info.name} ÔÇö ${props.info.path}`}</text>
+          <text fg={theme.textMuted}>{`/${props.info.name} — ${props.info.path}`}</text>
         </Show>
       </box>
 
@@ -139,7 +139,7 @@ export function DialogWorkflowApproval(props: {
                 onMouseUp={() => choose(option)}
               >
                 <text fg={isActive() ? selectedForeground(theme) : theme.textMuted}>
-                  {`${isActive() ? "ÔÇ║" : " "} ${option.label}`}
+                  {`${isActive() ? "›" : " "} ${option.label}`}
                 </text>
               </box>
             )
@@ -151,7 +151,7 @@ export function DialogWorkflowApproval(props: {
 }
 
 // Read-only pager for a workflow's source. The source is fetched lazily through
-// the workflow source endpoint BY NAME (`sdk.client.workflow.source`) ÔÇö the server
+// the workflow source endpoint BY NAME (`sdk.client.workflow.source`) — the server
 // resolves the bundled string for a builtin and the file text for an on-disk
 // workflow. The previous `file.read({ path: info.path })` was broken for every
 // real workflow: an ABSOLUTE on-disk path errored and a synthetic `builtin:`/
@@ -190,7 +190,7 @@ function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void })
     >
       <box flexDirection="row" justifyContent="space-between">
         <text attributes={TextAttributes.BOLD} fg={theme.text}>
-          {props.info.name} ÔÇö {props.info.path}
+          {props.info.name} — {props.info.path}
         </text>
         <text fg={theme.textMuted} onMouseUp={() => props.onBack()}>
           esc
@@ -205,7 +205,7 @@ function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void })
         scrollAcceleration={getScrollAcceleration()}
       >
         <text fg={theme.textMuted} wrapMode="none">
-          {source.loading ? "LoadingÔÇª" : (source() ?? "No source recorded.")}
+          {source.loading ? "Loading…" : (source() ?? "No source recorded.")}
         </text>
       </scrollbox>
       <text fg={theme.textMuted}>[Esc]/[B] Back to approval</text>

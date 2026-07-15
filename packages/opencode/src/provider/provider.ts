@@ -18,7 +18,7 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types } from "effect"
+import { Duration, Effect, Layer, Context, Schema, Types } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectPromise } from "@/effect/promise"
@@ -132,6 +132,11 @@ const BUNDLED_PROVIDERS: Record<string, () => Promise<(opts: any) => BundledSDK>
   "@ai-sdk/github-copilot": () =>
     import("@opencode-ai/core/github-copilot/copilot-provider").then((m) => m.createOpenaiCompatible),
   "venice-ai-sdk-provider": () => import("venice-ai-sdk-provider").then((m) => m.createVenice),
+  "@augmentcode/auggie-sdk": () =>
+    // @ts-ignore - optional dep, may not be installed
+    import("@augmentcode/auggie-sdk" as any).then((m: any) => (opts: any) => ({
+      languageModel: (modelId: string) => new m.AugmentLanguageModel(modelId, opts?.credentials),
+    })),
 }
 
 type CustomModelLoader = (sdk: any, modelID: string, options?: Record<string, any>, model?: Model) => Promise<any>
@@ -725,6 +730,103 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         },
       }
     }),
+    augment: Effect.fnUntraced(function* (input: Info) {
+      const env = yield* dep.env()
+      const auth = yield* dep.auth("augment")
+
+      const sessionAuth = yield* Effect.promise(async () => {
+        try {
+          return await Bun.file(path.join(os.homedir(), ".augment", "session.json")).json()
+        } catch {
+          return undefined
+        }
+      })
+
+      const credentials = iife(() => {
+        const directKey = input.options?.apiKey
+        const directUrl = input.options?.apiUrl || input.options?.baseURL
+        if (directKey && directUrl) {
+          return { apiKey: directKey, apiUrl: directUrl }
+        }
+
+        const envAuth = env["AUGMENT_SESSION_AUTH"]
+        if (envAuth) {
+          try {
+            const parsed = JSON.parse(envAuth)
+            return { apiKey: parsed.accessToken, apiUrl: parsed.tenantURL }
+          } catch {}
+        }
+
+        if (sessionAuth) {
+          const accessToken = sessionAuth.accessToken
+          const tenantURL = sessionAuth.tenantURL
+          if (accessToken && tenantURL) {
+            return { apiKey: accessToken, apiUrl: tenantURL }
+          }
+        }
+
+        if (auth?.type === "api") {
+          return {
+            apiKey: auth.key,
+            apiUrl: auth.metadata?.apiUrl,
+          }
+        }
+
+        return undefined
+      })
+
+      if (!credentials?.apiKey || !credentials?.apiUrl) {
+        const apiKeys = input.options?.apiKeys
+        if (Array.isArray(apiKeys) && apiKeys.length > 0) {
+          return {
+            autoload: true,
+            options: {
+              apiKeys,
+            },
+            async getModel(sdk: any, modelID: string) {
+              return sdk.languageModel(modelID)
+            },
+            async discoverModels(): Promise<Record<string, Model>> {
+              try {
+                const first = apiKeys[0] as any
+                const apiKey = typeof first === "string" ? first : first.apiKey
+                const apiUrl = typeof first === "string" ? undefined : first.apiUrl
+                if (!apiKey || !apiUrl) return {}
+                const res = await fetch(`${apiUrl}/models`, {
+                  headers: { Authorization: `Bearer ${apiKey}` },
+                })
+                if (!res.ok) return {}
+                const data = await res.json()
+                return parseAugmentModels(data, apiUrl)
+              } catch {
+                return {}
+              }
+            },
+          }
+        }
+        return { autoload: false }
+      }
+
+      return {
+        autoload: true,
+        options: { credentials },
+        async getModel(sdk: any, modelID: string) {
+          return sdk.languageModel(modelID)
+        },
+        async discoverModels(): Promise<Record<string, Model>> {
+          try {
+            const res = await fetch(`${credentials.apiUrl}/models`, {
+              headers: { Authorization: `Bearer ${credentials.apiKey}` },
+            })
+            if (!res.ok) return {}
+            const data = await res.json()
+            return parseAugmentModels(data, credentials.apiUrl)
+          } catch {
+            return {}
+          }
+        },
+      }
+    }),
     "cloudflare-workers-ai": Effect.fnUntraced(function* (input: Info) {
       if (input.options?.baseURL) return { autoload: false }
 
@@ -1255,6 +1357,55 @@ function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
   return result
 }
 
+function parseAugmentModels(data: any, apiUrl: string): Record<string, Model> {
+  const models: Record<string, Model> = {}
+  const list = Array.isArray(data) ? data : data?.models ?? data?.data ?? []
+  for (const m of list) {
+    if (!m?.id && !m?.name) continue
+    const modelId = String(m.id || m.name)
+    const displayName = m.name || m.displayName || modelId
+    const supportsTemperature = m.supportsTemperature ?? m.capabilities?.temperature ?? false
+    const supportsReasoning = m.supportsReasoning ?? m.capabilities?.reasoning ?? false
+    const supportsAttachments = m.supportsAttachments ?? m.capabilities?.attachments ?? false
+    const supportsTools = m.supportsTools ?? m.capabilities?.tools ?? true
+    const supportsImages = m.supportsImages ?? m.capabilities?.images ?? false
+    const supportsPdf = m.supportsPdf ?? m.capabilities?.pdf ?? false
+    const contextWindow = m.contextWindow ?? m.maxContextLength ?? m.context ?? 0
+    const maxOutputTokens = m.maxOutputTokens ?? m.maxOutputLength ?? m.outputLimit ?? 0
+    const inputCost = m.cost?.input ?? m.inputCost ?? m.pricing?.input ?? 0
+    const outputCost = m.cost?.output ?? m.outputCost ?? m.pricing?.output ?? 0
+    const cacheReadCost = m.cost?.cacheRead ?? m.cacheReadCost ?? 0
+    const cacheWriteCost = m.cost?.cacheWrite ?? m.cacheWriteCost ?? 0
+    const family = m.family ?? m.modelFamily ?? ""
+    const releaseDate = m.releaseDate ?? m.release_date ?? ""
+
+    models[modelId] = {
+      id: ModelV2.ID.make(modelId),
+      providerID: ProviderV2.ID.make("augment"),
+      name: displayName,
+      family,
+      api: { id: modelId, npm: "@augmentcode/auggie-sdk", url: apiUrl },
+      capabilities: {
+        temperature: supportsTemperature,
+        reasoning: supportsReasoning,
+        attachment: supportsAttachments,
+        toolcall: supportsTools,
+        input: { text: true, audio: false, image: supportsImages, video: false, pdf: supportsPdf },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: supportsReasoning ? { field: "reasoning_content" } : false,
+      },
+      cost: { input: inputCost, output: outputCost, cache: { read: cacheReadCost, write: cacheWriteCost } },
+      limit: { context: contextWindow, output: maxOutputTokens },
+      status: "active",
+      release_date: releaseDate,
+      headers: {},
+      options: {},
+      variants: {},
+    }
+  }
+  return models
+}
+
 function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
   const base: Model = {
     id: ModelV2.ID.make(model.id),
@@ -1681,6 +1832,20 @@ const layer = Layer.effect(
           })
         }
 
+        const augment = ProviderV2.ID.make("augment")
+        if (discoveryLoaders[augment] && providers[augment] && isProviderAllowed(augment)) {
+          yield* Effect.promise(async () => {
+            try {
+              const discovered = await discoveryLoaders[augment]()
+              for (const [modelID, model] of Object.entries(discovered)) {
+                if (!providers[augment].models[modelID]) {
+                  providers[augment].models[modelID] = model
+                }
+              }
+            } catch (e) {}
+          })
+        }
+
         for (const [id, provider] of Object.entries(providers)) {
           const providerID = ProviderV2.ID.make(id)
           if (!isProviderAllowed(providerID)) {
@@ -1957,14 +2122,35 @@ const layer = Layer.effect(
         if (!hasPool && s.models.has(key)) return s.models.get(key)!
 
         const provider = s.providers[model.providerID]
-        return yield* EffectPromise.refineRejection(
-          async () => {
-            let keyOverride: { entry: KeyRotator.KeyEntry; index: number } | undefined
-            if (hasPool) {
-              const result = await Effect.runPromise(s.rotator.getNext(model.providerID))
+        let keyOverride: { entry: KeyRotator.KeyEntry; index: number } | undefined
+
+        if (hasPool) {
+          let attempts = 0
+          while (attempts < 10) {
+            const result = yield* s.rotator.getNext(model.providerID)
+            if (result.status === "available") {
               keyOverride = { entry: result.entry, index: result.index }
               onKeyIndex?.(result.index)
+              break
             }
+            const waitMs = yield* s.rotator.getWaitTime(model.providerID)
+            if (waitMs > 0) {
+              const capped = Math.min(waitMs, 1000)
+              yield* Effect.sleep(Duration.millis(capped))
+              const hasAvailable = yield* s.rotator.hasAvailableKeys(model.providerID)
+              if (hasAvailable) {
+                attempts++
+                continue
+              }
+            }
+            keyOverride = { entry: result.entry, index: result.index }
+            onKeyIndex?.(result.index)
+            break
+          }
+        }
+
+        return yield* EffectPromise.refineRejection(
+          async () => {
             const sdk = await resolveSDK(model, s, envs, keyOverride)
             const language = s.modelLoaders[model.providerID]
               ? await s.modelLoaders[model.providerID](
@@ -2153,8 +2339,8 @@ export function parseModel(model: string) {
 
 export const node = LayerNode.make({
   service: Service,
-  layer: Layer.provide(layer, KeyRotator.layer),
-  deps: [FSUtil.node, Config.node, Auth.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node],
+  layer: layer,
+  deps: [FSUtil.node, Config.node, Auth.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node, KeyRotator.node],
 })
 
 export * as Provider from "./provider"

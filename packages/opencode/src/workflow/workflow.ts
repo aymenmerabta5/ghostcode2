@@ -1,4 +1,4 @@
-﻿import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { WorkflowRunTable } from "@opencode-ai/core/workflow/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -620,7 +620,7 @@ const layer = Layer.effect(
               if (!input.prompt?.prompt) {
                 node.status = "failed"
                 node.completed_at = Date.now()
-                node.error = "No prompt service available ÔÇö cannot execute agent"
+                node.error = "No prompt service available — cannot execute agent"
                 await doPersist()
                 return null
               }

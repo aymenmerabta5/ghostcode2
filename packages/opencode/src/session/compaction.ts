@@ -1,4 +1,4 @@
-﻿import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
@@ -349,7 +349,9 @@ const layer = Layer.effect(
       )
       const goalResult = yield* goals.get(input.sessionID).pipe(Effect.option)
       const goal = Option.isSome(goalResult) ? goalResult.value : undefined
-      const goalContext = goal ? [`Active session goal (preserve in summary): ${goal.text}`] : []
+      const goalContext = goal
+        ? [`Active session goal (preserve in summary): ${goal.text.slice(0, 1000)}${goal.text.length > 1000 ? "…" : ""}`]
+        : []
       const nextPrompt =
         compacting.prompt ?? buildPrompt({ previousSummary, context: [...compacting.context, ...goalContext] })
       const msgs = structuredClone(selected.head)

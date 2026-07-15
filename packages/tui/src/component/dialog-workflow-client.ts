@@ -1,4 +1,4 @@
-﻿import type { Event, WorkflowRun } from "@opencode-ai/sdk/v2"
+import type { Event, WorkflowRun } from "@opencode-ai/sdk/v2"
 import type { useSDK } from "../context/sdk"
 
 export const WORKFLOW_RUN_UPDATED = "workflow.run.updated"

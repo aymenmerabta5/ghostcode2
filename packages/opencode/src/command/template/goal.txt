@@ -1,11 +1,11 @@
-﻿Manage the session goal for autonomous pursuit.
+Manage the session goal for autonomous pursuit.
 
 Usage:
-- `/goal set <description>` ÔÇö set a new active goal and start pursuing it
-- `/goal pause` ÔÇö pause the active goal (stops the autonomous loop)
-- `/goal resume` ÔÇö resume the paused goal (restarts the autonomous loop)
-- `/goal complete [verification]` ÔÇö mark the goal as completed
-- `/goal clear` ÔÇö remove the goal entirely
-- `/goal show` ÔÇö display the current goal and its status
+- `/goal set <description>` — set a new active goal and start pursuing it
+- `/goal pause` — pause the active goal (stops the autonomous loop)
+- `/goal resume` — resume the paused goal (restarts the autonomous loop)
+- `/goal complete [verification]` — mark the goal as completed
+- `/goal clear` — remove the goal entirely
+- `/goal show` — display the current goal and its status
 
 $ARGUMENTS

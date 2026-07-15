@@ -1,4 +1,4 @@
-﻿import ts from "typescript"
+import ts from "typescript"
 
 export type Finding = { line: number; rule: string; text: string }
 

@@ -1,4 +1,4 @@
-﻿export * as SessionGoal from "./session-goal"
+export * as SessionGoal from "./session-goal"
 
 import { Schema } from "effect"
 import { define, inventory } from "./event"

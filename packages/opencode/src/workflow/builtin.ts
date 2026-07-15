@@ -1,4 +1,4 @@
-﻿export const BUILTIN_PATH_PREFIX = "builtin:"
+export const BUILTIN_PATH_PREFIX = "builtin:"
 
 export function builtinPath(name: string) {
   return `${BUILTIN_PATH_PREFIX}${name}`

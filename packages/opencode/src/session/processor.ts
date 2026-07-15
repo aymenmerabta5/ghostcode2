@@ -665,23 +665,12 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 parse,
                 set: (info) =>
-                  info.isRateLimit
-                    ? Effect.gen(function* () {
-                        const hasAvailable = yield* rotator.hasAvailableKeys(input.model.providerID)
-                        if (hasAvailable) return
-                        yield* status.set(ctx.sessionID, {
-                          type: "retry",
-                          attempt: info.attempt,
-                          message: info.message,
-                          next: info.next,
-                        })
-                      })
-                    : status.set(ctx.sessionID, {
-                        type: "retry",
-                        attempt: info.attempt,
-                        message: info.message,
-                        next: info.next,
-                      }),
+                  status.set(ctx.sessionID, {
+                    type: "retry",
+                    attempt: info.attempt,
+                    message: info.message,
+                    next: info.next,
+                  }),
                 onRateLimited: (info) =>
                   keyIndex.current !== undefined
                     ? rotator.markRateLimited(input.model.providerID, keyIndex.current, {

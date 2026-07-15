@@ -1,4 +1,4 @@
-﻿// Approval mode for interactive workflow starts. Mirrors the `workflows.approval`
+// Approval mode for interactive workflow starts. Mirrors the `workflows.approval`
 // config literal: `first-run` (default) asks once per workflow until "Yes, always"
 // persists consent; `always` asks on every start regardless of stored consent;
 // `never` starts without ever prompting.
@@ -80,7 +80,7 @@ export function createApprovalStack(input: {
   }
 
   // Swap the approval screen for the source pager. notifyClose:false stops the
-  // approval item's onClose (= decide("cancel")) from firing during the swap ÔÇö
+  // approval item's onClose (= decide("cancel")) from firing during the swap —
   // otherwise merely viewing the script would resolve the promise as "cancel".
   // The pager gets its OWN onClose (= decide("cancel")) so a backdrop/Esc
   // dismissal inside the pager still resolves the promise instead of hanging.
@@ -88,7 +88,7 @@ export function createApprovalStack(input: {
     input.dialog.replace(input.renderSource(controller), () => decide("cancel"), { notifyClose: false })
   }
 
-  // Pager ÔåÆ approval (the "Back" action). Same notifyClose:false reasoning on the
+  // Pager → approval (the "Back" action). Same notifyClose:false reasoning on the
   // return path so swapping back does not fire the pager's onClose; the
   // re-rendered approval item again gets its abort-safe onClose.
   function back() {

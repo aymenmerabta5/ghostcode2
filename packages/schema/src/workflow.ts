@@ -1,4 +1,4 @@
-﻿export * as Workflow from "./workflow"
+export * as Workflow from "./workflow"
 
 import { Schema, SchemaGetter } from "effect"
 import { define, inventory } from "./event"

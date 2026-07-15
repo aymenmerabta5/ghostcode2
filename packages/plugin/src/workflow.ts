@@ -1,4 +1,4 @@
-﻿type WorkflowArgumentType = "string" | "number" | "boolean"
+type WorkflowArgumentType = "string" | "number" | "boolean"
 
 type WorkflowArgument = {
   type?: WorkflowArgumentType

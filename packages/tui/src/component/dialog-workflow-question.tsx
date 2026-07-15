@@ -1,4 +1,4 @@
-﻿import { TextAttributes, type TextareaRenderable } from "@opentui/core"
+import { TextAttributes, type TextareaRenderable } from "@opentui/core"
 import type { WorkflowRun } from "@opencode-ai/sdk/v2"
 import { createMemo, createSignal, For, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
@@ -10,7 +10,7 @@ import { useBindings } from "../keymap"
 import { answerWorkflowRun } from "./dialog-workflow-client"
 import { isResumeAnswer, questionOptions, selectedAnswer, shouldEnableNav } from "./dialog-workflow-question-helpers"
 
-// Thin Solid component for the question dialog (Spec ┬º5.2 (4)): renders the
+// Thin Solid component for the question dialog (Spec §5.2 (4)): renders the
 // question + declared options + a free-text entry, and submits the resolved
 // answer via the generated `sdk.client.workflow.answer` route (answerWorkflowRun).
 // All decision logic (option list, answer resolution, resume detection) lives in
@@ -68,8 +68,8 @@ export function DialogWorkflowQuestion(props: {
   // letters j/k) can be typed. The dialog form bindings are therefore scoped to
   // the textarea target with priority 1 so they win over the global managed
   // textarea input layer (mirrors DialogWorkflowSave / DialogPrompt / the prompt
-  // autocomplete). Only Ôåæ/Ôåô navigate the option list ÔÇö the bare k/j aliases are
-  // gone (they belong to the textarea now) ÔÇö and nav is enabled only when there
+  // autocomplete). Only ↑/↓ navigate the option list — the bare k/j aliases are
+  // gone (they belong to the textarea now) — and nav is enabled only when there
   // is an option to move between (shouldEnableNav), so a free-text-only question
   // leaves the arrows to the textarea cursor.
   useBindings(() => ({
@@ -125,7 +125,7 @@ export function DialogWorkflowQuestion(props: {
                     }}
                   >
                     <text fg={active() ? selectedForeground(theme) : theme.text}>
-                      {option.kind === "option" ? option.label : `Ôå│ ${option.label}`}
+                      {option.kind === "option" ? option.label : `↳ ${option.label}`}
                     </text>
                   </box>
                 )
@@ -144,7 +144,7 @@ export function DialogWorkflowQuestion(props: {
             focusedTextColor={theme.text}
             cursorColor={theme.text}
           />
-          <text fg={theme.textMuted}>[Ôåæ/Ôåô] Select | [Enter] Submit | [Esc] Cancel</text>
+          <text fg={theme.textMuted}>[↑/↓] Select | [Enter] Submit | [Esc] Cancel</text>
         </box>
       </Show>
     </box>

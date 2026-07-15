@@ -1,4 +1,4 @@
-﻿import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
+import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { Timestamps } from "../database/schema.sql"
 
 export type WorkflowDefinitionRow = {

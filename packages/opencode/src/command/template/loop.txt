@@ -1,4 +1,4 @@
-﻿Run a prompt repeatedly while the session stays open.
+Run a prompt repeatedly while the session stays open.
 
 Usage:
 - `/loop <prompt>` starts a self-paced loop.

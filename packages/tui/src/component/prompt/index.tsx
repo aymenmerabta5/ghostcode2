@@ -1,4 +1,4 @@
-﻿import {
+import {
   BoxRenderable,
   RGBA,
   TextareaRenderable,
@@ -213,7 +213,7 @@ export function Prompt(props: PromptProps) {
   const rotation = createMemo(() => {
     const selectedModel = local.model.current()
     if (!selectedModel) return
-    const provider = sync.data.provider.find((x: any) => x.id === selectedModel.providerID)
+    const provider = sync.data.provider.find((x) => x.id === selectedModel.providerID) as any
     if (!provider?.rotation) return
     return `${provider.rotation.available}/${provider.rotation.total}`
   })
@@ -938,7 +938,7 @@ export function Prompt(props: PromptProps) {
     // input's native onSubmit racing another dispatch). Without this guard,
     // a second call slips past the empty-input check before the first call
     // clears `store.prompt.input`, then awaits its own `session.create` and
-    // ultimately reads the now-empty store ÔÇö sending a phantom empty prompt
+    // ultimately reads the now-empty store — sending a phantom empty prompt
     // to a freshly created session.
     if (submitting) return false
     submitting = true
@@ -1403,7 +1403,7 @@ export function Prompt(props: PromptProps) {
           borderColor={borderHighlight()}
           customBorderChars={{
             ...SplitBorder.customBorderChars,
-            bottomLeft: "Ôò╣",
+            bottomLeft: "╹",
           }}
         >
           <box
@@ -1501,7 +1501,7 @@ export function Prompt(props: PromptProps) {
                       </Show>
                       <Show when={store.mode === "normal"}>
                         <box flexDirection="row" gap={1}>
-                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>┬À</text>
+                          <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
                           <text
                             flexShrink={0}
                             fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
@@ -1513,7 +1513,7 @@ export function Prompt(props: PromptProps) {
                             {(item) => <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{item()}</text>}
                           </Show>
                           <Show when={showVariant()}>
-                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>┬À</text>
+                            <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
                             <text>
                               <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
                                 {local.model.variant.current()}
@@ -1540,7 +1540,7 @@ export function Prompt(props: PromptProps) {
           borderColor={borderHighlight()}
           customBorderChars={{
             ...EmptyBorder,
-            vertical: theme.backgroundElement.a !== 0 ? "Ôò╣" : " ",
+            vertical: theme.backgroundElement.a !== 0 ? "╹" : " ",
           }}
         >
           <box
@@ -1551,7 +1551,7 @@ export function Prompt(props: PromptProps) {
               theme.backgroundElement.a !== 0
                 ? {
                     ...EmptyBorder,
-                    horizontal: "ÔûÇ",
+                    horizontal: "▀",
                   }
                 : {
                     ...EmptyBorder,
@@ -1571,7 +1571,7 @@ export function Prompt(props: PromptProps) {
               >
                 <box flexShrink={0} flexDirection="row" gap={1}>
                   <box marginLeft={1}>
-                    <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[Ôï»]</text>}>
+                    <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
                       <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
                     </Show>
                   </box>
@@ -1707,7 +1707,7 @@ export function Prompt(props: PromptProps) {
                     <Match when={usage()}>
                       {(item) => (
                         <text fg={theme.textMuted} wrapMode="none">
-                          {[item().context, item().cost].filter(Boolean).join(" ┬À ")}
+                          {[item().context, item().cost].filter(Boolean).join(" · ")}
                         </text>
                       )}
                     </Match>

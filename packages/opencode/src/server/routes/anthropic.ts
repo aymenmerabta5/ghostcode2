@@ -1,4 +1,4 @@
-﻿import { Context, Effect, Stream } from "effect"
+import { Context, Effect, Stream } from "effect"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { generateText, jsonSchema, streamText, tool, type ToolSet } from "ai"
 import { z } from "zod"

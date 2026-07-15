@@ -1,4 +1,4 @@
-﻿import { Effect, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Workflow } from "@/workflow/workflow"
 import type { TaskPromptOps } from "@/tool/task"
@@ -99,7 +99,7 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Workflow.Se
             const run = result.success
             return {
               title: `${run.workflow} started`,
-              output: `Started workflow '${run.workflow}' ÔÇö run ID: ${run.id}\nStatus: ${run.status}\nPhases: ${run.definition?.meta.phases?.map((p: any) => typeof p === "string" ? p : p.title).join(" ÔåÆ ") ?? "(none)"}`,
+              output: `Started workflow '${run.workflow}' — run ID: ${run.id}\nStatus: ${run.status}\nPhases: ${run.definition?.meta.phases?.map((p: any) => typeof p === "string" ? p : p.title).join(" → ") ?? "(none)"}`,
               metadata: { runID: run.id, workflow: run.workflow, status: run.status },
             } satisfies Tool.ExecuteResult<Metadata>
           }
@@ -135,7 +135,7 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Workflow.Se
             const run = yield* workflows.cancel(params.id as Workflow.RunID)
             return {
               title: run?.status ?? "not found",
-              output: run ? `Cancelled run ${run.id} ÔÇö status: ${run.status}` : `Run '${params.id}' not found`,
+              output: run ? `Cancelled run ${run.id} — status: ${run.status}` : `Run '${params.id}' not found`,
               metadata: { runID: run?.id, status: run?.status },
             } satisfies Tool.ExecuteResult<Metadata>
           }

@@ -1,4 +1,4 @@
-﻿import { Effect } from "effect"
+import { Effect } from "effect"
 import type { DatabaseMigration } from "../migration"
 
 export default {

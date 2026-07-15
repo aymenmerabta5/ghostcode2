@@ -1,4 +1,4 @@
-﻿export type Limit = { total: number; committed: number; reserved: number }
+export type Limit = { total: number; committed: number; reserved: number }
 
 export type Pool = {
   id: string

@@ -21,15 +21,14 @@ export const ServeCommand = effectCmd({
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
       console.log("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }
-    const opts = yield* resolveNetworkOptions(args)
+    const base = yield* resolveNetworkOptions(args)
     const anthropicDirectory =
       process.env.OPENCODE_ANTHROPIC_DIRECTORY ?? process.env.GHOSTCODE_ANTHROPIC_DIRECTORY ?? os.homedir()
-    if (args.anthropic) {
-      ;(opts as Record<string, unknown>).anthropic = true
-      ;(opts as Record<string, unknown>).anthropicDirectory = anthropicDirectory
-    }
+    const opts = args.anthropic
+      ? { ...base, anthropic: true as const, anthropicDirectory }
+      : { ...base, anthropic: false as const }
     const { warmupAnthropicProvider } = yield* Effect.promise(() => import("../../server/routes/anthropic"))
-    const server = yield* Effect.promise(() => Server.listen(opts as any))
+    const server = yield* Effect.promise(() => Server.listen(opts))
     console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
     if (args.anthropic) {
       console.log(`Anthropic API available at http://${server.hostname}:${server.port}/api/anthropic`)

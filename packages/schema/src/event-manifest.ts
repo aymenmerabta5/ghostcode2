@@ -1,4 +1,4 @@
-﻿export * as EventManifest from "./event-manifest"
+export * as EventManifest from "./event-manifest"
 
 import { Catalog } from "./catalog"
 import { Durable } from "./durable-event-manifest"

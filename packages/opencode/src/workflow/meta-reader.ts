@@ -1,4 +1,4 @@
-﻿import ts from "typescript"
+import ts from "typescript"
 import { Cause, Exit, Schema } from "effect"
 import { Meta } from "@opencode-ai/schema/workflow"
 

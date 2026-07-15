@@ -1,4 +1,4 @@
-﻿export const EFFORT_SCALE = ["low", "medium", "high", "xhigh", "max"] as const
+export const EFFORT_SCALE = ["low", "medium", "high", "xhigh", "max"] as const
 export type Effort = (typeof EFFORT_SCALE)[number]
 
 const EFFORT_RANK: Record<string, number> = {

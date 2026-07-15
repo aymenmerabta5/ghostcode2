@@ -1,4 +1,4 @@
-﻿import type { TextareaRenderable } from "@opentui/core"
+import type { TextareaRenderable } from "@opentui/core"
 import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
 import type { AutocompleteOption } from "./autocomplete"
 
@@ -203,7 +203,7 @@ export function workflowArgOptions(
           argument.description,
         ]
           .filter(Boolean)
-          .join(" ┬À "),
+          .join(" · "),
         onSelect: () => {
           const text = argument.type === "string" ? `${name}=""` : `${name}=`
           replaceArgQuery(input, ctx, text, argument.type === "string" ? 1 : 0)
@@ -214,7 +214,7 @@ export function workflowArgOptions(
     options.push({
       display: "budget=",
       value: "budget",
-      description: "reserved ┬À USD cost cap for this run",
+      description: "reserved · USD cost cap for this run",
       onSelect: () => replaceArgQuery(input, ctx, "budget=", 0),
     })
   }

@@ -1,4 +1,4 @@
-﻿import { TextAttributes, type ScrollBoxRenderable, type TextareaRenderable } from "@opentui/core"
+import { TextAttributes, type ScrollBoxRenderable, type TextareaRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import { Locale } from "../util/locale"
@@ -69,16 +69,16 @@ function formatLogTime(value: unknown) {
 }
 
 function agentIcon(status: WorkflowRun["agents"][number]["status"]) {
-  if (status === "running") return "Ôùï"
-  if (status === "completed") return "Ô£ô"
-  return "Ô£ù"
+  if (status === "running") return "○"
+  if (status === "completed") return "✓"
+  return "✗"
 }
 
 // Fund 34 (TUI defensive): the engine now closes every agent node at a terminal
 // transition (N11) and the orphan sweep normalizes zombies (Fund 15), so a
 // terminal run should not carry a `running` agent. Still, render defensively: if
 // a terminal run ever shows a lingering `running` agent, treat it as terminal so
-// no perpetual live `Ôùï` icon appears, and clamp its elapsed time to the run's
+// no perpetual live `○` icon appears, and clamp its elapsed time to the run's
 // completion instead of `formatShortElapsed`'s `Date.now()` fallback (which made
 // the duration grow on every open). Live runs are unchanged.
 export function agentEffectiveStatus(run: WorkflowRun, agent: WorkflowRun["agents"][number]) {
@@ -185,7 +185,7 @@ function agentMetrics(run: WorkflowRun, agent: WorkflowRun["agents"][number]) {
     formatShortElapsed(agent.started_at, agentEffectiveEnd(run, agent)),
   ]
     .filter((item) => item !== undefined)
-    .join(" ┬À ")
+    .join(" · ")
 }
 
 function phaseRowLabel(row: SelectablePhaseRow) {
@@ -199,23 +199,23 @@ function phaseRowModel(row: SelectablePhaseRow) {
 }
 
 function phaseRowMetrics(run: WorkflowRun, row: SelectablePhaseRow) {
-  if (row.type === "result") return `0 tok ┬À ${formatShortDuration(run)}`
+  if (row.type === "result") return `0 tok · ${formatShortDuration(run)}`
   return agentMetrics(run, row.agent)
 }
 
 function phaseRowIcon(run: WorkflowRun, row: SelectablePhaseRow) {
-  if (row.type === "result") return "Ô£ô"
+  if (row.type === "result") return "✓"
   // Fund 34: a lingering `running` agent on a terminal run renders terminal
-  // (never the live `Ôùï`), so a finished run never shows a perpetually-live agent.
+  // (never the live `○`), so a finished run never shows a perpetually-live agent.
   return agentIcon(agentEffectiveStatus(run, row.agent))
 }
 
 function phaseRowTitle(phase: string | undefined, rows: readonly WorkflowPhaseRow[]) {
   const agents = rows.filter((row) => row.type === "agent").length
   const result = rows.some((row) => row.type === "result")
-  if (!result) return `${phase ?? "Phase"} ┬À ${agents} agents`
-  if (agents === 0) return `${phase ?? "Phase"} ┬À result`
-  return `${phase ?? "Phase"} ┬À ${agents} agents + result`
+  if (!result) return `${phase ?? "Phase"} · ${agents} agents`
+  if (agents === 0) return `${phase ?? "Phase"} · result`
+  return `${phase ?? "Phase"} · ${agents} agents + result`
 }
 
 function workflowResultText(result: unknown) {
@@ -273,10 +273,10 @@ function dashboardPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
   return formatPhase(run, workflow)
 }
 
-// Funds 57, 58: the STATUS cell must fit "Ôèÿ interrupt" (icon + space + the 9-char
+// Funds 57, 58: the STATUS cell must fit "⊘ interrupt" (icon + space + the 9-char
 // "interrupt" label) without truncation, so the cell is 11 wide and the layout
 // budget reserves 12 for it (cell + its separator space). Previously the cell was
-// 8 wide and "interrupt" was clipped to "interrÔÇª".
+// 8 wide and "interrupt" was clipped to "interr…".
 const STATUS_WIDTH = 11
 
 function dashboardWidths(width: number) {
@@ -334,7 +334,7 @@ function dashboardRowText(
 }
 
 function sectionTitle(title: string, width: number) {
-  return ` ${title} ${"ÔöÇ".repeat(Math.max(0, width - title.length - 2))}`
+  return ` ${title} ${"─".repeat(Math.max(0, width - title.length - 2))}`
 }
 
 function scrollIndexIntoView(scroll: ScrollBoxRenderable | undefined, index: number) {
@@ -409,7 +409,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   })
 
   onMount(() => {
-    // QW1 (Spec ┬º5.2 (1)): subscribe to workflow.run.updated/finished so the
+    // QW1 (Spec §5.2 (1)): subscribe to workflow.run.updated/finished so the
     // dashboard refreshes instantly on a server that emits them. The 1s poll
     // below STAYS as the degraded-but-correct fallback against an older server
     // that does not (Delta 10) : a double read is harmless (only network).
@@ -499,7 +499,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     }
   }
 
-  // Spec ┬º5.2 (4): answer the selected run's pending question, read straight off
+  // Spec §5.2 (4): answer the selected run's pending question, read straight off
   // the generated `WorkflowRun.pending_question`. Live runs resolve in place; a
   // parked (paused) run spawns a NEW resume run, and we then follow that new id
   // into its detail view. The dialog replaces the dashboard, so we re-open the
@@ -610,7 +610,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
           tableWidth(),
         )}
       </text>
-      <text fg={theme.textMuted}>{"ÔöÇ".repeat(tableWidth())}</text>
+      <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
 
       <scrollbox
         ref={(element: ScrollBoxRenderable) => (scroll = element)}
@@ -643,10 +643,10 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                 <text fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
                   {dashboardRowText(
                     {
-                      // Spec ┬º5.2 (4): a run waiting on an answer (running/parked
-                      // with a pending question) shows the ÔÅ│ badge; otherwise the
+                      // Spec §5.2 (4): a run waiting on an answer (running/parked
+                      // with a pending question) shows the ⏳ badge; otherwise the
                       // selection arrow when active. The marker cell is 2 wide.
-                      marker: questionBadge(run) || (active() ? "ÔÇ║" : ""),
+                      marker: questionBadge(run) || (active() ? "›" : ""),
                       id: shortRunID(run),
                       workflow: run.workflow,
                       input: workflowInput(run),
@@ -665,7 +665,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
         </For>
       </scrollbox>
 
-      <text fg={theme.textMuted}>{"ÔöÇ".repeat(tableWidth())}</text>
+      <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.textMuted}>
           Spent this month: {formatCost(monthlySpend())} | Active Background Workers: {activeWorkers()}
@@ -823,7 +823,7 @@ function DialogWorkflowRun(props: {
   const workflow = createMemo(() => props.workflows.find((item) => item.name === current().workflow))
   const phases = createMemo(() => runPhases(current(), workflow()))
   // Item 14: phase titles observed from a nested ctx.workflow child ('<name>: x')
-  // render indented with a 'Ôå│' marker so the parent plan stays visually primary.
+  // render indented with a '↳' marker so the parent plan stays visually primary.
   const childPhases = createMemo(
     () =>
       new Set(
@@ -934,7 +934,7 @@ function DialogWorkflowRun(props: {
   })
 
   onMount(() => {
-    // QW1 (Spec ┬º5.2 (1)): refetch the detail view the moment THIS run emits an
+    // QW1 (Spec §5.2 (1)): refetch the detail view the moment THIS run emits an
     // updated/finished event. The 1s running-only poll below STAYS as the
     // fallback against a server that does not emit (Delta 10).
     const off = events.subscribe((evt) => {
@@ -1063,7 +1063,7 @@ function DialogWorkflowRun(props: {
   function copySelectedResponse() {
     const row = selectedRow()
     // Item 19: a narrator log row copies its message (the narration is copyable
-    // even though the row is not selectable via ÔåÉ/ÔåÆ : e.g. a logs-only phase).
+    // even though the row is not selectable via ←/→ : e.g. a logs-only phase).
     const text =
       row?.type === "result"
         ? workflowResultText(current().result)
@@ -1145,7 +1145,7 @@ function DialogWorkflowRun(props: {
     const row = props.row
     if (row.type === "log") {
       // Item 19: narrator row : dimmed, indented under the agent rows, no
-      // metrics columns, no 'ÔÇ║' marker, and no mouse selection (click is a
+      // metrics columns, no '›' marker, and no mouse selection (click is a
       // no-op: log rows are not selectable). If the 1s refetch ever causes
       // visible flicker here, memoize on entry.time+message.
       return (
@@ -1165,7 +1165,7 @@ function DialogWorkflowRun(props: {
     const labelWidth = createMemo(() => Math.min(30, Math.max(14, Math.floor(agentPanelWidth() * 0.32))))
     const rowText = createMemo(() =>
       fitColumns(
-        `${active() ? "ÔÇ║" : phaseRowIcon(current(), row)} ${Locale.truncate(phaseRowLabel(row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(row)}`,
+        `${active() ? "›" : phaseRowIcon(current(), row)} ${Locale.truncate(phaseRowLabel(row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(row)}`,
         phaseRowMetrics(current(), row),
         agentPanelWidth() - 2,
       ),
@@ -1196,7 +1196,7 @@ function DialogWorkflowRun(props: {
         <text fg={theme.primary} attributes={TextAttributes.BOLD} wrapMode="none" overflow="hidden">
           {fitColumns(
             workflow()?.meta.name ?? current().workflow,
-            `${agentProgress(current())} ┬À ${formatShortDuration(current())}`,
+            `${agentProgress(current())} · ${formatShortDuration(current())}`,
             headerWidth(),
           )}
         </text>
@@ -1228,12 +1228,12 @@ function DialogWorkflowRun(props: {
               {(phase, index) => {
                 const status = createMemo(() => phaseStatus(current(), phases(), phase))
                 const active = createMemo(() => index() === store.selectedPhase)
-                // Item 14: a child-workflow phase reads as a nested step : 'Ôå│'
+                // Item 14: a child-workflow phase reads as a nested step : '↳'
                 // instead of the number/status icon when inactive (active keeps
-                // the 'ÔÇ║' selection arrow) plus a 2-space title indent.
+                // the '›' selection arrow) plus a 2-space title indent.
                 const child = createMemo(() => childPhases().has(phase))
                 const marker = createMemo(() =>
-                  active() ? "ÔÇ║" : child() ? "Ôå│" : status() === "pending" ? `${index() + 1}` : phaseIcon(status()),
+                  active() ? "›" : child() ? "↳" : status() === "pending" ? `${index() + 1}` : phaseIcon(status()),
                 )
                 const color = createMemo(() => {
                   if (active()) return theme.primary
@@ -1358,7 +1358,7 @@ function DialogWorkflowRun(props: {
 
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.textMuted}>
-          [Ôåæ/Ôåô] Phase | [ÔåÉ/ÔåÆ] Agent/result | [Y] Copy response | [S] Save as command | [Enter/O] Open agent | [X] Kill
+          [↑/↓] Phase | [←/→] Agent/result | [Y] Copy response | [S] Save as command | [Enter/O] Open agent | [X] Kill
           run | [Esc/B] Back
         </text>
         <Show when={current().status === "running"}>
@@ -1385,5 +1385,3 @@ function DialogWorkflowRun(props: {
     </box>
   )
 }
-
-

@@ -1,30 +1,30 @@
-﻿import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
+import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import type { WorkflowRunEvent } from "./dialog-workflow-client"
 import path from "path"
 
 // The engine persists timestamps as numbers, but the SDK schema widens them to
 // include stringified non-finite sentinels ("NaN"/"Infinity"). Normalize any of
-// those ÔÇö plus genuine numeric strings ÔÇö to a finite number or `undefined`.
+// those — plus genuine numeric strings — to a finite number or `undefined`.
 export function timestamp(value: unknown) {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
 export function statusIcon(status: WorkflowRun["status"]) {
-  if (status === "running") return "ÔùÅ"
-  if (status === "completed") return "Ô£ö"
-  if (status === "failed") return "Ô£û"
+  if (status === "running") return "●"
+  if (status === "completed") return "✔"
+  if (status === "failed") return "✖"
   // Fund 32: `cancelled` (a user-requested kill) now reads apart from every
   // other terminal state with its own crossed-circle glyph; previously it fell
-  // through to the hollow pending marker `Ôùî` and looked unfinished.
-  if (status === "cancelled") return "Ôèù"
+  // through to the hollow pending marker `◌` and looked unfinished.
+  if (status === "cancelled") return "⊗"
   // `interrupted` is a failure-like terminal state (orphaned/zombie run), shown
   // with a distinct broken-circle marker so it reads apart from a clean cancel.
-  if (status === "interrupted") return "Ôèÿ"
+  if (status === "interrupted") return "⊘"
   // `paused` is the only non-terminal state besides running: a user-suspended run
   // that can be resumed. The pause glyph reads apart from every terminal marker.
-  if (status === "paused") return "ÔÅ©"
-  return "Ôùî"
+  if (status === "paused") return "⏸"
+  return "◌"
 }
 
 // N5: the engine never advances/clears `current_phase` at completion (only
@@ -33,7 +33,7 @@ export function statusIcon(status: WorkflowRun["status"]) {
 // later phase rendering as `pending` forever on a terminal run. A terminal run
 // will NEVER reach those phases, so they are reported `skipped` (a distinct,
 // non-live rendering) rather than the misleading `pending`. This is purely a
-// derived TUI view ÔÇö the engine row is untouched, so the persisted lifecycle
+// derived TUI view — the engine row is untouched, so the persisted lifecycle
 // stays honest (no synthetic "current_phase = last" lie).
 export function phaseStatus(run: WorkflowRun, phases: readonly string[], phase: string) {
   const current = run.current_phase ? phases.indexOf(run.current_phase) : -1
@@ -50,16 +50,16 @@ export function phaseStatus(run: WorkflowRun, phases: readonly string[], phase: 
 }
 
 export function phaseIcon(status: ReturnType<typeof phaseStatus>) {
-  if (status === "completed") return "Ô£ö"
-  if (status === "running") return "ÔùÅ"
-  if (status === "failed") return "Ô£û"
+  if (status === "completed") return "✔"
+  if (status === "running") return "●"
+  if (status === "failed") return "✖"
   if (status === "cancelled") return statusIcon("cancelled")
-  if (status === "interrupted") return "Ôèÿ"
+  if (status === "interrupted") return "⊘"
   // The phase a paused run stopped on reads with the pause glyph (it can resume).
   if (status === "paused") return statusIcon("paused")
   // `skipped` (never-reached phase on a terminal run) and `pending` both read as
-  // the hollow marker ÔÇö neither is live; `skipped` simply will never advance.
-  return "Ôùî"
+  // the hollow marker — neither is live; `skipped` simply will never advance.
+  return "◌"
 }
 
 // `now` is injected so the duration is deterministic in tests and frozen on a
@@ -80,8 +80,8 @@ export function formatPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
   const phases = workflow?.meta.phases ?? []
   if (!run.current_phase || phases.length === 0) return run.current_phase ?? "pending"
   const index = phases.indexOf(run.current_phase)
-  // Item 14: a child-workflow current_phase ('<child>: ÔÇª') is never in
-  // meta.phases, so the dashboard LIST deliberately shows '[?/N]' for it ÔÇö the
+  // Item 14: a child-workflow current_phase ('<child>: …') is never in
+  // meta.phases, so the dashboard LIST deliberately shows '[?/N]' for it — the
   // list only knows the declared plan. The detail view merges observed phases
   // (mergeObservedPhases) and renders the child phase properly.
   return `[${index >= 0 ? index + 1 : "?"}/${phases.length}] ${run.current_phase}`
@@ -120,7 +120,7 @@ export function reanchorSelection(prevId: string | undefined, rows: readonly Wor
 // as dimmed narrator rows interleaved chronologically between the agent rows of
 // their phase. The old separate, 20-entry-capped Logs box is gone, along with its
 // log-capping helper (the App keeps its OWN copy of that helper in
-// app/components/dialog-workflow-helpers.ts ÔÇö deliberately untouched).
+// app/components/dialog-workflow-helpers.ts — deliberately untouched).
 export type WorkflowPhaseRow =
   | { type: "agent"; agent: WorkflowRun["agents"][number] }
   | { type: "log"; entry: WorkflowRun["logs"][number] }
@@ -129,7 +129,7 @@ export type WorkflowPhaseRow =
 // Item 19: phase membership for agents AND logs. The engine writes both with
 // `phase: undefined` before the first setPhase, so phase-less items belong to the
 // FIRST phase group. Previously phase-less agents were invisible in every phase
-// filter and phase-less logs were duplicated under EVERY phase ÔÇö both fixed here.
+// filter and phase-less logs were duplicated under EVERY phase — both fixed here.
 export function belongsToPhase(itemPhase: string | undefined, phase: string, phases: readonly string[]) {
   return itemPhase === phase || (itemPhase == null && phase === phases[0])
 }
@@ -154,7 +154,7 @@ function rowTime(row: WorkflowPhaseRow) {
   return Number.POSITIVE_INFINITY
 }
 
-// Item 19: the rows of one phase group ÔÇö agent rows and (unless includeLogs is
+// Item 19: the rows of one phase group — agent rows and (unless includeLogs is
 // false) narrator log rows, stably sorted by time. Agents are listed before logs
 // in the pre-sort array, so an ES-stable sort keeps an agent ahead of a log on a
 // timestamp tie and preserves the original order within each kind. The result
@@ -195,11 +195,11 @@ export function stepSelectableRow(rows: readonly WorkflowPhaseRow[], current: nu
   return current
 }
 
-// Event-driven dashboard refresh (Spec ┬º5.2, Delta 10): a workflow.run.* event
+// Event-driven dashboard refresh (Spec §5.2, Delta 10): a workflow.run.* event
 // carries a lean wire shape (status/current_phase/error), not the full run with
 // its agents. Overlay only those fields onto the matching run so the list updates
-// instantly without waiting for the Ôëñ1s poll. An event for a run not in the list
-// returns the SAME reference (identity-stable: no re-render churn) ÔÇö a full
+// instantly without waiting for the ≤1s poll. An event for a run not in the list
+// returns the SAME reference (identity-stable: no re-render churn) — a full
 // refetch picks up the genuinely-new run. Agent detail comes from the refetch,
 // not the lean event.
 export function mergeRunEvent(runs: WorkflowRun[], event: WorkflowRunEvent): WorkflowRun[] {
@@ -215,13 +215,13 @@ export function mergeRunEvent(runs: WorkflowRun[], event: WorkflowRunEvent): Wor
   return next
 }
 
-// Dashboard waiting badge (Spec ┬º5.2 (4)): a run that has asked a question and is
+// Dashboard waiting badge (Spec §5.2 (4)): a run that has asked a question and is
 // still running or parked (paused) shows the hourglass so the operator can spot
 // it needs an answer. Any other state (no pending question, or terminal) shows no
 // badge. Reads `pending_question` directly off the generated WorkflowRun type.
-export function questionBadge(run: WorkflowRun): "ÔÅ│" | "" {
+export function questionBadge(run: WorkflowRun): "⏳" | "" {
   if (!run.pending_question) return ""
-  if (run.status === "running" || run.status === "paused") return "ÔÅ│"
+  if (run.status === "running" || run.status === "paused") return "⏳"
   return ""
 }
 
@@ -230,7 +230,7 @@ export function questionBadge(run: WorkflowRun): "ÔÅ│" | "" {
 // display_name + description (from the statically parsed meta, display only),
 // action ("start"/"create"), args, and background. metadata is untrusted
 // Record<string, unknown> (possibly from an older server), so every field is
-// type-checked defensively ÔÇö missing/empty metadata degrades to a generic
+// type-checked defensively — missing/empty metadata degrades to a generic
 // title, never a crash.
 export function workflowPermissionDisplay(metadata: Record<string, unknown> | undefined): {
   title: string
@@ -262,32 +262,32 @@ export function workflowPermissionDisplay(metadata: Record<string, unknown> | un
   }
 }
 
-// Item 9: meta.phases entries are string | {title, ÔÇª} (structured phases carry
-// detail/model). Normalize to the title strings ÔÇö exactly like runPhases in
+// Item 9: meta.phases entries are string | {title, …} (structured phases carry
+// detail/model). Normalize to the title strings — exactly like runPhases in
 // dialog-workflow.tsx, which Item 14 will converge onto this helper. Rendering
 // the raw entry produced "[object Object]" for structured phases.
 export function phaseTitles(phases: readonly (string | { title: string })[] | undefined): string[] {
   return (phases ?? []).map((phase) => (typeof phase === "string" ? phase : phase.title))
 }
 
-// Item 14: a phase entry in the detail view's phase panel ÔÇö `child: true` marks
-// a phase observed from a nested ctx.workflow child (rendered indented with 'Ôå│').
+// Item 14: a phase entry in the detail view's phase panel — `child: true` marks
+// a phase observed from a nested ctx.workflow child (rendered indented with '↳').
 export type RunPhaseEntry = { title: string; child: boolean }
 
 // Item 14: the engine attributes ctx.workflow children purely by prefixing their
 // current_phase/log/agent phases with '<child-name>: ' (engine logPrefix), so a
 // title matching /^.+?: ./ reads as a child phase. HEURISTIC until the engine
 // persists a structured child field on LogEntry/AgentNode (the engine half of
-// roadmap item 14) ÔÇö switch to that field once it lands. Known limit: a parent
+// roadmap item 14) — switch to that field once it lands. Known limit: a parent
 // setPhase containing ': ' (e.g. 'Deploy: prod') is also rendered as a child;
-// that only affects the 'Ôå│'+indent optics, never behavior.
+// that only affects the '↳'+indent optics, never behavior.
 export function isChildPhaseTitle(title: string): boolean {
   return /^.+?: ./.test(title)
 }
 
 // Item 14 (BUG): the detail view used to build its phase list ONLY from the
-// declared meta.phases, but observed phases ÔÇö child-workflow phases ('<name>: x')
-// and undeclared parent setPhase titles ÔÇö never match a declared title, so their
+// declared meta.phases, but observed phases — child-workflow phases ('<name>: x')
+// and undeclared parent setPhase titles — never match a declared title, so their
 // agents/logs were completely invisible. Merge them in:
 //   - declared phases stay in DECLARED order (the canonical plan, never re-sorted)
 //     and are always child:false;
@@ -331,7 +331,7 @@ export function mergeObservedPhases(declared: readonly string[], run: WorkflowRu
     const entry: RunPhaseEntry = { title, child: isChildPhaseTitle(title) }
     if (anchor === -1) {
       // No anchor: the extra precedes every observed declared phase (or no
-      // declared phase was ever observed) ÔÇö append, never re-sort the plan.
+      // declared phase was ever observed) — append, never re-sort the plan.
       result.push(entry)
       continue
     }
@@ -394,7 +394,7 @@ export function parseWorkflowCommand(input: string): WorkflowCommand | undefined
 
 // Item 30: a typed `/<name> args` submit is a DIRECT workflow start candidate
 // (Claude-Code parity with the `/` popover entries, which already insert the
-// routed `/workflow <name> ` text on selection). Pure parse only ÔÇö the caller
+// routed `/workflow <name> ` text on selection). Pure parse only — the caller
 // owns precedence (a real command of the same name always wins) and resolution
 // against the discovered workflows; an unresolved name falls back to a plain
 // prompt exactly as today. Like parseWorkflowCommand, only the FIRST line is
