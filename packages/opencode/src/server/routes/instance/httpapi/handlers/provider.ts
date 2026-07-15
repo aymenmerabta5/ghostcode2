@@ -47,9 +47,14 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
         if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) filtered[key] = value
       }
       const connected = yield* provider.list()
+      const connectedWithRotation: Record<string, Provider.Info & { rotation?: any }> = {}
+      for (const [id, providerInfo] of Object.entries(connected)) {
+        const rotation = yield* provider.getRotation(ProviderV2.ID.make(id)).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
+        connectedWithRotation[id] = rotation ? { ...providerInfo, rotation } as any : providerInfo
+      }
       const providers = Object.assign(
         mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
-        connected,
+        connectedWithRotation,
       )
       return {
         all: Object.values(providers).map(Provider.toPublicInfo),

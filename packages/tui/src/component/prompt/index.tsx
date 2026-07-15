@@ -210,6 +210,13 @@ export function Prompt(props: PromptProps) {
   const move = usePromptMove({ projectID: project.project, sessionID: () => props.sessionID })
   const [cursorVersion, setCursorVersion] = createSignal(0)
   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
+  const rotation = createMemo(() => {
+    const selectedModel = local.model.current()
+    if (!selectedModel) return
+    const provider = sync.data.provider.find((x: any) => x.id === selectedModel.providerID)
+    if (!provider?.rotation) return
+    return `${provider.rotation.available}/${provider.rotation.total}`
+  })
   const hasRightContent = createMemo(() => Boolean(props.right))
 
   function promptModelWarning() {
@@ -1502,6 +1509,9 @@ export function Prompt(props: PromptProps) {
                             {local.model.parsed().model}
                           </text>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
+                          <Show when={rotation()}>
+                            {(item) => <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{item()}</text>}
+                          </Show>
                           <Show when={showVariant()}>
                             <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>┬À</text>
                             <text>
