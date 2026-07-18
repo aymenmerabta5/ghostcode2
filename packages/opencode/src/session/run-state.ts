@@ -138,7 +138,8 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
         ),
       { concurrency: "unbounded", discard: true },
     )
-    batch = jobs.filter(matches)
+    const freshJobs = yield* background.list()
+    batch = freshJobs.filter(matches)
   }
 })
 

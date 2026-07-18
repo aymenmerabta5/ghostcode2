@@ -765,6 +765,7 @@ const layer = Layer.effect(
               active.skipRequests.delete(node.id)
               if (ai.label) active.skipRequests.delete(ai.label)
               await doPersist()
+              await run(Semaphore.release(active.agentSemaphore, 1)).catch(() => {})
               return null
             }
             try {
@@ -823,7 +824,7 @@ const layer = Layer.effect(
               if (ai.onError === "null") return null
               throw err
             } finally {
-              Semaphore.release(active.agentSemaphore, 1)
+              await run(Semaphore.release(active.agentSemaphore, 1)).catch(() => {})
             }
           },
           async tool(name: string, args?: Record<string, unknown>) {
@@ -901,10 +902,8 @@ const layer = Layer.effect(
               const result = await childRunFn(args ?? {}, childCtx)
               return result
             } finally {
-              if (prevPhase !== undefined) {
-                active.run.current_phase = prevPhase
-                doPersist()
-              }
+              active.run.current_phase = prevPhase
+              doPersist()
             }
           },
           async question(input: { question: string; options?: readonly string[]; timeout?: number }) {
@@ -983,7 +982,17 @@ const layer = Layer.effect(
       g.budget = ctx.budget
 
       // Import workflow module AFTER globals are set so top-level await using bare agent works
-      const mod = yield* Effect.promise(() => import(`${pathToFileURL(modulePath).href}?t=${Date.now()}-${Math.random().toString(36).slice(2)}`))
+      let mod: any
+      try {
+        mod = yield* Effect.promise(() => import(`${pathToFileURL(modulePath).href}?t=${Date.now()}-${Math.random().toString(36).slice(2)}`))
+      } catch (e) {
+        // Restore globals on import failure to avoid leak
+        for (const k of globalKeys) {
+          if (prevGlobalsBeforeImport[k] === undefined) delete g[k]
+          else g[k] = prevGlobalsBeforeImport[k]
+        }
+        return yield* new InvalidError({ path: targetPath, message: `Failed to import workflow: ${e instanceof Error ? e.message : String(e)}` })
+      }
       // Cleanup temp file immediately after import
       if (isBuiltinPath(targetPath) || isInlinePath(targetPath) || input.temporary) {
         yield* Effect.promise(() => import("fs/promises").then((fs) => fs.unlink(tempPath).catch(() => {}))).pipe(Effect.ignore)

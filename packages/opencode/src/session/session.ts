@@ -941,17 +941,23 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
   background: BackgroundJob.Interface,
   sessionID: SessionID,
 ) {
-  const jobs = yield* background.list()
-  yield* Effect.forEach(
-    jobs.filter((job) => {
+  let jobs = yield* background.list()
+  let toCancel = jobs.filter((job) => {
+    if (job.status !== "running") return false
+    if (job.id === sessionID) return true
+    if (job.metadata?.sessionId === sessionID) return true
+    return job.metadata?.parentSessionId === sessionID
+  })
+  while (toCancel.length > 0) {
+    yield* Effect.forEach(toCancel, (job) => background.cancel(job.id), { concurrency: "unbounded", discard: true })
+    jobs = yield* background.list()
+    toCancel = jobs.filter((job) => {
       if (job.status !== "running") return false
       if (job.id === sessionID) return true
       if (job.metadata?.sessionId === sessionID) return true
       return job.metadata?.parentSessionId === sessionID
-    }),
-    (job) => background.cancel(job.id),
-    { concurrency: "unbounded", discard: true },
-  )
+    })
+  }
 })
 
 function listByProject(
