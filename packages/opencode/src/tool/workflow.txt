@@ -1,98 +1,221 @@
-Discover, run, and manage long-running workflow programs. Workflows are multi-step scripts that orchestrate subagents with parallel execution, budget caps, and phase tracking.
+Discover, run, and manage long-running workflow programs. Workflows orchestrate many subagents from a script you can rerun, with phases, parallel execution, budget caps, verification agents, and durable state. Compatible with `.claude/workflows/` and `.opencode/workflows/`. Supports both `ctx.agent` and global `agent` style.
 
 ## What are workflows?
 
-Workflows are TypeScript files that export a `meta` object and a `run` function. They orchestrate multiple subagent calls across named phases, with support for parallel execution, structured outputs, budget caps, and phase tracking. Workflows persist their state to disk — a run survives a crash and can be inspected, paused, resumed, or cancelled.
-
-## When to use workflows vs the Task tool
-
-- Use the **Task tool** for a single subagent that does one thing and returns.
-- Use **Workflows** when you need multi-step orchestration: multiple agents across phases, parallel fan-out, structured schemas, or a durable run that the user can monitor in the dashboard.
-
-## Actions
-
-- **list**: List all available workflows (built-in + project + global). Always call this first to see what exists.
-- **read**: Get a workflow's source code by name. Call this before creating a similar workflow or to understand an existing one.
-- **start**: Run a workflow by name with optional args and budget. Returns the run ID. The workflow runs in the background — use **inspect** or **wait** to check progress.
-- **wait**: Block until a run finishes or timeout. Use sparingly — prefer **inspect** for non-blocking checks.
-- **inspect**: Get a run's current status, phases, agents, and logs.
-- **cancel**: Cancel a running workflow.
-- **create**: Save a new workflow source to disk. Files are saved to `.opencode/workflows/<name>.ts` (project) or the global workflows dir.
-
-## How to create a workflow
-
-A workflow is a TypeScript file that default-exports an object with `meta` and `run`:
+A workflow is a JavaScript/TypeScript file that exports a `meta` block and a `run` function. The runtime executes it in the background while the session stays responsive. Intermediate results live in script variables, not the main context.
 
 ```ts
+// .opencode/workflows/audit-routes.ts  OR  .claude/workflows/audit-routes.ts
 export default {
   meta: {
-    name: "my-workflow",
-    description: "What this workflow does",
-    phases: ["plan", "execute", "review"],
-    arguments: {
-      topic: { type: "string", description: "The topic to process" }
-    }
+    name: "audit-routes",
+    description: "Audit every route handler for missing auth checks",
+    phases: ["discover", "audit", "verify", "report"],
+    arguments: { dir: { type: "string", default: "src/routes", description: "Routes directory" } },
+    whenToUse: "When auditing API routes for auth"
   },
   async run(args, ctx) {
-    ctx.setPhase("plan")
-    const plan = await ctx.agent({
-      prompt: `Plan the work for: ${args.topic}`,
-      schema: { type: "object", properties: { steps: { type: "array", items: { type: "string" } } }, required: ["steps"] }
+    ctx.setPhase("discover")
+    const found = await ctx.agent({
+      prompt: `List every .ts file under ${args.dir}`,
+      schema: { type: "object", required: ["files"], properties: { files: { type: "array", items: { type: "string" } } } },
+      label: "discover-files"
     })
 
-    ctx.setPhase("execute")
-    const results = await ctx.parallel(
-      plan.data.steps.map((step) => () => ctx.agent({ prompt: `Execute: ${step}` }))
-    )
+    ctx.setPhase("audit")
+    const audits = (await ctx.parallel(
+      found.data.files.map((file: string) => () =>
+        ctx.agent({ prompt: `Audit ${file} for missing auth. Return {file, issues[]}`, schema: { type: "object", properties: { file: {type:"string"}, issues:{type:"array",items:{type:"string"}} }, required:["file","issues"] }, label: file })
+      ),
+      { concurrencyLimit: 8 }
+    )).filter(Boolean)
 
-    ctx.setPhase("review")
-    const review = await ctx.agent({ prompt: `Review these results: ${JSON.stringify(results)}` })
+    // --- Verification pattern ---
+    ctx.setPhase("verify")
+    const flattened = audits.flatMap((a: any) => a.data.issues.map((iss: string) => ({ file: a.data.file, issue: iss })))
+    const verified = (await ctx.parallel(
+      flattened.map(item => () =>
+        ctx.agent({
+          prompt: `Adversarially verify: Does ${item.file} really have issue "${item.issue}"? Fetch the file, check. Reply via schema {supported:boolean, reason:string}`,
+          schema: { type: "object", required: ["supported","reason"], properties: { supported:{type:"boolean"}, reason:{type:"string"} } },
+          label: `verify:${item.file}`
+        }).then(v => ({ ...item, verdict: v.data }))
+      ),
+      { concurrencyLimit: 8 }
+    )).filter(Boolean)
 
-    return { review: review.text }
+    const surviving = verified.filter((v: any) => v.verdict.supported)
+    const rejected = verified.filter((v: any) => !v.verdict.supported)
+
+    ctx.setPhase("report")
+    const report = await ctx.agent({
+      prompt: `Write ranked report from verified findings: ${JSON.stringify(surviving)}. Briefly list rejected: ${JSON.stringify(rejected)}. Cite files.`,
+      label: "report"
+    })
+
+    return { report: report.text, verified: surviving.length, rejected: rejected.length }
   }
 }
 ```
 
-### Meta fields
-- `name` (required): The workflow name. Must match the filename.
-- `description`: Short summary shown in listings and the dashboard.
-- `phases`: Array of phase names (strings or `{ title, detail?, model? }`). Used for progress tracking.
-- `arguments`: Declared arguments with type, default, and description. Validated at start.
-- `whenToUse`: When this workflow should be used (shown in autocomplete).
+**Also supports global style** (top-level await, no ctx prefix):
+```js
+export const meta = { name: "audit-routes", description: "Audit routes" }
+const found = await agent("List files under src/routes", { schema: {...} })
+const audits = await pipeline(found.files, file => agent(`Audit ${file}`, { label: file }))
+// verification agents
+const verified = await parallel( audits.flatMap(a=>a.issues).map(issue => () => agent(`Verify ${issue}`, { schema: {...} })) )
+return verified.filter(v=>v.supported)
+```
+Globals available: `agent`, `pipeline`, `parallel`, `log`, `setPhase`, `workflow`, `shell`, `tool`, `question`, `args`, `budget`.
 
-### Context API (ctx)
-- `ctx.setPhase(name)`: Advance to a named phase. Drives the dashboard progress.
-- `ctx.agent({ prompt, schema?, model?, tools? })`: Run a subagent. Returns `{ text, data }` (data is parsed from schema if provided).
-- `ctx.parallel(tasks, { concurrencyLimit? })`: Run tasks in parallel. Returns array of results (null for failures).
-- `ctx.log(message)`: Log a message visible in the dashboard.
-- `ctx.workflow(name, args?)`: Start a child workflow and wait for its result.
-- `ctx.question(question, options?)`: Ask the user a question (pauses the run until answered).
+## When to use workflows vs alternatives
 
-### Creating a workflow with the tool
+|  | Subagent (Task tool) | Skill | Workflow |
+|---|---|---|---|
+| What | One worker | Instructions | Script runtime executes |
+| Who decides next | Model turn-by-turn | Model following prompt | Script holds loop/branching |
+| Where results live | Context window | Context window | Script variables |
+| Repeatable | Worker definition | Instructions | Orchestration itself |
+| Scale | Few per turn | Few per turn | Dozens to hundreds per run |
+| Interruption | Restarts turn | Restarts turn | Resumable (cached completed agents) |
+| Quality | Single pass | Single pass | Can use verification agents for adversarial review |
 
-Use `action: "create"` with `name` and `source`:
+Use workflows when task needs more agents than one conversation can coordinate, or when you want orchestration codified as script you can rerun (codebase audit, 500-file migration, research with cross-checked sources, hard plan drafted from several angles).
 
+## Actions (tool)
+
+- **list**: List all discovered workflows (builtin + project + global + .claude compat). Always call first. Returns name, description, valid, error.
+- **read**: Get source by name. Use before creating similar workflow.
+- **start**: Run by name with args/budget. Returns run ID immediately, runs in background. Use **inspect** or **wait**. Args are coerced per meta.arguments (number/boolean/string). Supports `budget` as number or `{usd, tokens}`. Also supports inline `source` for ephemeral runs.
+- **wait**: Block until run finishes or timeout seconds. Returns status, result, error, agents summary. Use sparingly.
+- **inspect**: Get full run JSON: status, current_phase, logs, agents (id,status,phase,label,model,prompt,output,cost,tokens,error,cached), result, pending_question.
+- **cancel**: Cancel running run.
+- **create**: Save source to disk. Scope `project` => `.opencode/workflows/<name>.ts`, `global` => global config. Name must match `^[A-Za-z0-9_-]+$` (sanitized, no `/..`). Overwrite protected.
+
+## Meta fields (WorkflowInfo)
+
+- `name` (required): Must match filename `^[A-Za-z0-9_-]+$`.
+- `description`: Short summary in listings/dashboard.
+- `whenToUse`: When to use (autocomplete hint).
+- `phases`: `Array<string | {title, detail?, model?}>`. Model can route stage to different model. Normalized via `phaseTitles`. Should match `setPhase()` calls.
+- `arguments`: `Record<string, {type?:"string"|"number"|"boolean", default?, description?}>`. Coerced at start, defaults applied.
+
+Meta must be statically analyzable (literal values only) - `meta-reader` AST extracts.
+
+## Context API (ctx) - Production
+
+- `ctx.setPhase(name)`: Advance phase, drives dashboard. Child phases prefixed automatically as `<child>: phase` for nested `workflow()` calls (merged in TUI via `^.+?: .`).
+- `ctx.log(msg)`: Log visible in dashboard, interleaved chronologically with agents (narrator rows).
+- `ctx.agent({prompt, agent?, model?, variant?, tools?, skills?, files?, schema?, permissionSessionID?, phase?, label?, isolation?:"worktree", onError?:"fail"|"null"})`: Spawn subagent session, returns `{text, data}` or null if onError=null. Schema adds JSON-only instruction, parsed via fenced json extraction. Label used for skipRequests and journal matching. Cost/tokens tracked: `budgetRemaining -= cost`, `tokensSpent += input+output+reasoning`.
+- `ctx.parallel(tasks, {concurrencyLimit?:20})`: Fan-out, `MAX_BATCH_ITEMS=4096`, returns `(T|null)[]` (null on failure). Concurrency capped by `min(16, cpus-2)` semaphore.
+- `ctx.pipeline(items, ...stages, {concurrencyLimit?:5})`: Pipeline stages `(prev,item,index)=>Promise<next>`, concurrency default 5.
+- `ctx.workflow(name, args?)`: Start child workflow inline, shares budget, prefixes phase as `<name>: <phase>` for visibility. Waits for result.
+- `ctx.shell(cmd, {timeout?:60000, cwd?})`: Run shell command, returns `{output, exitCode}`. Timeout kills proc.
+- `ctx.tool(name, args?)`: Log invocation, returns stub (future ToolRegistry delegation).
+- `ctx.question({question, options?:string[], timeout?:600000})`: Creates pending_question, pauses run, returns `{answer}` when `answer` action called via API. Stored in DB `pending_question` JSON, node kind=question.
+- `ctx.budgetRemaining`, `ctx.budget.total/spent()/remaining()/tokensTotal/tokensSpent()/tokensRemaining()`: Budget tracking.
+- Globals: `agent`, `pipeline`, `parallel`, `log`, `setPhase`, `workflow`, `shell`, `tool`, `question`, `args`, `budget` injected onto `globalThis` before runFn execution for top-level await support.
+
+## Verification pattern (spawn verification agent)
+
+Quality pattern: have independent agents adversarially review findings before reporting.
+
+**Shape:**
+1. Discover / fan-out initial agents
+2. Collect claims/issues
+3. Parallel verification agents with adversarial prompt: "Verify this claim against sources, fetch them, reply {supported, reason}"
+4. Filter `supported==true`
+5. Synthesize report from surviving, list rejected as unverified.
+
+Built-in `deep-research` implements exactly this: plan (3-5 angles) -> research parallel -> verify parallel concurrency 8 -> synthesize. Requires web/search tools; throws if none.
+
+Example audit + verify shown at top. Use `filter(Boolean)` after parallel because failures return null.
+
+**Verification agent template:**
+```ts
+const verified = (await ctx.parallel(
+  claims.map(c => () => ctx.agent({
+    prompt: `Adversarially verify: ${c.claim} Sources: ${c.sources.join(", ")}. Fetch sources, check if claim backed. Schema {supported:boolean}`,
+    schema: { type:"object", required:["supported","reason"], properties:{supported:{type:"boolean"},reason:{type:"string"}} },
+    label: `verify:${c.id}`
+  }).then(v => ({ ...c, verdict: v.data }))
+)).filter(Boolean)
+.filter(v => v.verdict.supported)
+```
+
+## Behavior and limits
+
+- No mid-run user input (only `question` + permission prompts pause run). For sign-off between stages, run each stage as own workflow.
+- No direct fs/shell from workflow script itself (agents do). Source lint flags `fs, child_process, net, http, https, dns, os, worker_threads, vm, Bun.spawn, fetch, process.env`.
+- Up to 16 concurrent agents (min 16, max 2, cpus-2), fewer on low CPU.
+- 1000 agents total per run (`DEFAULT_AGENT_LIMIT`).
+- 4096 items max per `parallel`/`pipeline` batch.
+- Budget: `budget: 5` or `{usd:10, tokens:100000}`. `BudgetExceededError` thrown when exhausted.
+- `onError:"null"` returns null instead of throwing, useful for verification where some claims fail.
+- Duplicate names: project-first precedence (project `.opencode`/.claude > global). Seen names deduped, builtins first.
+- Temp cache: `.opencode/workflows/.cache/*.ts` for builtin/inline modules, cleaned up after import + sweep of >1h old files.
+- Resumable: `paused|interrupted|failed|completed` are resumable. `resume_of` copies completed agents as cached (prefix replay), cursor tracks, invalidated via `invalidate_agents:[indices]`. Cached nodes marked `cached:true`, zero cost. Running agents not saved restart on resume.
+- Child workflows: phase prefixed `<child>: <phase>`, merged via `mergeObservedPhases` heuristic `^.+?: .` rendered with `↳` indent.
+
+## Manage runs (TUI / API)
+
+- **Dashboard**: `/workflows` slash opens dashboard. Shows RUN (#id), WORKFLOW, STATUS (● running ✔ completed ✖ failed ⊗ cancelled ⊘ interrupted ⏸ paused), STARTED (MM-DD HH:MM), DUR (s/m/h), PHASE ([n/N] phase), TOKENS, INPUT (args). Header stats: spent this month $, active workers, runs count. Empty state: centered bordered box with accent `/workflow name --arg=value` hint and tips.
+- **Detail view**: left Phases (number/icon, title, progress done/total), right Agents+logs interleaved, result pager. Footer keys:
+  - `↑↓` Phase | `←→` Agent/result | `Enter/O` Open agent detail | `Y` Copy response | `S` Save as command | `F` Filter | `R` Restart agent / resume invalidating | `P` Pause/resume | `X` Kill run / skip agent | `Esc/B` Back | `j/k` scroll within agent detail.
+- **Agent detail modal** (to be opened via Enter): shows label, status icon, stats (model, tokens, cost, duration, cached badge), Prompt scrollbox, Output scrollbox, Error if any, `O` open session, `Y` copy.
+- **Filter `f`**: toggles filter input, filters by workflow name/status/id.
+- **Save `s`**: Writes run's `definition.source` to disk as real workflow file. Prefilled name = workflow, Tab toggles `project .opencode/workflows` vs `global`. Collision is hard warning, never overwrite. Actual paths shown.
+- **Question `⏳` badge**: running/paused with `pending_question` shows hourglass. Answer via `answer` action: `sdk.client.workflow.answer({id, answer})`. Live runs resolve in place, parked spawns new resume run followed into detail.
+- **Pause/resume `p`**: running -> `pause`, keeps journal; paused/interrupted -> `start({resume_of})` fresh run replaying journal via resume_of, new id followed.
+- **Task panel**: one-line progress summary while running (future).
+
+API routes:
+- `GET /workflow` list, `GET /workflow/run` runs, `GET /workflow/run/{id}` get, `GET /workflow/{name}/source` source
+- `POST /workflow/{name}/start` body `args?, budget?, budget_tokens?, resume_of?, invalidate_agents?, replay?`
+- `POST /workflow/run/{id}/cancel|pause|agent/{agentId}/skip|answer|export`
+- `POST /workflow/save` save, `DELETE /workflow/run/{id}` remove
+
+## File locations (discovery - improved)
+
+Project workflows: `.opencode/workflows/<name>.ts` (priority 1) AND `.claude/workflows/<name>.ts` (compat)
+Global: `<global-config>/workflows/<name>.ts`, `~/.claude/workflows/<name>.ts`, `~/.config/claude/workflows/`
+Builtin: `builtin:deep-research` (in-memory)
+Temp cache: `.opencode/workflows/.cache/` (auto-cleaned >1h)
+Saved via `s`: `.opencode/workflows/` = project, global = `<data>/workflows/`
+Load order: builtins first, then instance `.opencode/.claude`, then project ancestors `.opencode/.claude`, then global. First valid wins per name.
+
+## Creating workflow with tool
+
+Use `action: "create"`:
 ```json
 {
   "action": "create",
-  "name": "code-review",
-  "source": "export default {\n  meta: { name: \"code-review\", ... },\n  async run(args, ctx) { ... }\n}",
+  "name": "audit-auth",
+  "source": "export default { meta: { name: \"audit-auth\", description: \"...\", phases: [\"discover\",\"audit\",\"verify\",\"report\"], arguments: { dir:{type:\"string\",default:\"src/routes\"} } }, async run(args, ctx) { ctx.setPhase(\"discover\"); const files = await ctx.agent({prompt:`List files under ${args.dir}`, schema:{type:\"object\",properties:{files:{type:\"array\",items:{type:\"string\"}}}, required:[\"files\"]}); const audits = (await ctx.parallel(files.data.files.map(f=>()=>ctx.agent({prompt:`Audit ${f} for auth`, label:f})))).filter(Boolean); const verified = (await ctx.parallel(audits.map(a=>()=>ctx.agent({prompt:`Verify ${a.text}`, schema:{type:\"object\",properties:{supported:{type:\"boolean\"}}, required:[\"supported\"]}}))).filter(Boolean); return {verified} } }",
   "scope": "project"
 }
 ```
 
-After creating, use `action: "start"` with the same name to run it.
+## Example prompts
 
-## Workflow file location
+- **Audit many files + verify:** "use a workflow to audit every route handler under src/routes/ for missing authentication checks, and adversarially verify each finding before reporting it"
+- **Fix until check passes:** "use a workflow to run npx tsc --noEmit and keep fixing errors until typecheck passes or two rounds make no progress"
+- **Migrate parallel isolated:** "use a workflow to migrate every component under src/components/ from styled-components to Tailwind, each in own isolated"
+- **Review PR:** "use a workflow to review every file changed in this PR for correctness, merge per-file findings into ranked summary"
+- **Research:** "use a workflow to research how competitors handle rate limiting: read public docs and changelog in parallel, then compare"
+- **Flaky finder:** "use a workflow to find flaky tests: run suite repeatedly, record intermittent failures, stop when two rounds find nothing new"
 
-Project workflows: `.opencode/workflows/<name>.ts`
-Global workflows: `<global-config>/workflows/<name>.ts`
+## Tips - Production
 
-## Tips
-
-- Always call `action: "list"` first to see what workflows already exist.
-- Use `action: "read"` to inspect an existing workflow before creating a similar one.
-- Phases in `meta.phases` should match the `ctx.setPhase()` calls in `run()`.
-- Structured schemas on `ctx.agent()` give you typed responses — use them for parsing.
-- `ctx.parallel()` is the key to fan-out: pass an array of thunks that each call `ctx.agent()`.
-- Budget caps (`budget` param on start) prevent runaway costs. Use USD or token limits.
+- Always `list` first to see what exists.
+- `read` before creating similar workflow.
+- Phases must match `setPhase()` calls.
+- `parallel` returns null on failure → `filter(Boolean)`.
+- Use `label` for skipRequests and journal matching.
+- For verification, chain `parallel` with `concurrencyLimit:8`.
+- Budget caps prevent runaway: `{usd:10, tokens:100000}`.
+- `isolation:"worktree"` for migrate workflows to avoid conflicts (future).
+- `schema` gives typed `data`, parses fenced json.
+- Save via `s` in TUI: `.opencode/workflows/` project (shared), `~/.claude/workflows/` personal compat.
+- Child workflows prefixed automatically, rendered indented `↳` in detail.

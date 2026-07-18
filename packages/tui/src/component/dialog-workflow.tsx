@@ -69,9 +69,11 @@ function formatLogTime(value: unknown) {
 }
 
 function agentIcon(status: WorkflowRun["agents"][number]["status"]) {
-  if (status === "running") return "○"
-  if (status === "completed") return "✓"
-  return "✗"
+  if (status === "running") return "●"
+  if (status === "completed") return "✔"
+  if (status === "failed") return "✖"
+  if (status === "skipped") return "◌"
+  return "◌"
 }
 
 // Fund 34 (TUI defensive): the engine now closes every agent node at a terminal
@@ -204,7 +206,7 @@ function phaseRowMetrics(run: WorkflowRun, row: SelectablePhaseRow) {
 }
 
 function phaseRowIcon(run: WorkflowRun, row: SelectablePhaseRow) {
-  if (row.type === "result") return "✓"
+  if (row.type === "result") return "✔"
   // Fund 34: a lingering `running` agent on a terminal run renders terminal
   // (never the live `○`), so a finished run never shows a perpetually-live agent.
   return agentIcon(agentEffectiveStatus(run, row.agent))
@@ -278,14 +280,25 @@ function dashboardPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
 // budget reserves 12 for it (cell + its separator space). Previously the cell was
 // 8 wide and "interrupt" was clipped to "interr…".
 const STATUS_WIDTH = 11
+const AGENTS_WIDTH = 9
 
 function dashboardWidths(width: number) {
-  const total = Math.min(width, 150)
-  const phase = total < 104 ? 8 : 12
-  const fixed = 2 + 10 + (STATUS_WIDTH + 1) + 11 + 7 + phase + 8 + 8
+  const total = Math.min(width, 108)
+  const phase = total < 90 ? 8 : 12
+  const fixed = 2 + 10 + (STATUS_WIDTH + 1) + 12 + 7 + phase + 8 + AGENTS_WIDTH + 8
   const available = Math.max(28, total - fixed)
-  const workflow = Math.min(26, Math.max(14, Math.floor(available * 0.38)))
-  return { workflow, phase, input: Math.max(14, available - workflow), total }
+  const workflow = Math.min(18, Math.max(12, Math.floor(available * 0.35)))
+  return { workflow, phase, input: Math.max(10, available - workflow), total }
+}
+
+function statusColor(status: WorkflowRun["status"], theme: ReturnType<typeof useTheme>["theme"]) {
+  if (status === "running") return theme.primary
+  if (status === "completed") return theme.success
+  if (status === "failed") return theme.error
+  if (status === "cancelled") return theme.warning
+  if (status === "interrupted") return theme.error
+  if (status === "paused") return theme.warning
+  return theme.textMuted
 }
 
 function workflowInput(run: WorkflowRun) {
@@ -371,17 +384,37 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   })
   const runs = createMemo(() => runsResource() ?? [])
   const workflows = createMemo(() => workflowsResource() ?? [])
-  const selected = createMemo(() => runs()[store.selected])
+  const [filter, setFilter] = createSignal("")
+  const [filterMode, setFilterMode] = createSignal(false)
+  let filterInputRef: any
+  const filteredRuns = createMemo(() => {
+    const f = filter().trim().toLowerCase()
+    if (!f) return runs()
+    return runs().filter(
+      (run) =>
+        run.workflow.toLowerCase().includes(f) ||
+        run.status.toLowerCase().includes(f) ||
+        run.id.toLowerCase().includes(f) ||
+        workflowInput(run).toLowerCase().includes(f) ||
+        shortRunID(run).toLowerCase().includes(f),
+    )
+  })
+  function effectiveRuns() {
+    return filter() ? filteredRuns() : runs()
+  }
+  const selected = createMemo(() => effectiveRuns()[store.selected])
   const activeWorkers = createMemo(() => runs().filter((run) => run.status === "running").length)
-  const tableWidth = createMemo(() => Math.max(40, dimensions().width - 5))
+  const tableWidth = createMemo(() => Math.max(40, Math.min(108, dimensions().width - 14)))
   const monthlySpend = createMemo(() => spentThisMonth(runs()))
+  const listHeight = createMemo(() => Math.min(Math.max(8, filteredRuns().length + 2), Math.floor(dimensions().height / 2)))
 
   // Fund 10: re-anchor the selection to the row that still carries the previously
   // selected id after each re-sort, clamping when that run is gone (e.g. deleted).
   createEffect(() => {
-    const next = reanchorSelection(store.selectedID || selected()?.id, runs())
+    const effective = filter() ? filteredRuns() : runs()
+    const next = reanchorSelection(store.selectedID || selected()?.id, effective)
     if (next !== store.selected) setStore("selected", next)
-    const id = runs()[next]?.id ?? ""
+    const id = effective[next]?.id ?? ""
     if (id !== store.selectedID) setStore("selectedID", id)
   })
 
@@ -430,10 +463,11 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   }
 
   function move(direction: number) {
-    if (runs().length === 0) return
-    const next = Math.max(0, Math.min(runs().length - 1, store.selected + direction))
+    const list = effectiveRuns()
+    if (list.length === 0) return
+    const next = Math.max(0, Math.min(list.length - 1, store.selected + direction))
     setStore("selected", next)
-    setStore("selectedID", runs()[next]?.id ?? "")
+    setStore("selectedID", list[next]?.id ?? "")
     if (!scroll) return
     if (next < scroll.scrollTop) scroll.scrollBy(next - scroll.scrollTop)
     if (next >= scroll.scrollTop + scroll.height) scroll.scrollBy(next - scroll.scrollTop - scroll.height + 1)
@@ -441,7 +475,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
 
   function selectIndex(index: number) {
     setStore("selected", index)
-    setStore("selectedID", runs()[index]?.id ?? "")
+    setStore("selectedID", effectiveRuns()[index]?.id ?? "")
   }
 
   function openSelected() {
@@ -562,116 +596,326 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       })
   }
 
+  function restartSelected() {
+    const run = selected()
+    if (!run) return
+    // For paused/interrupted, resume via resume_of, else restart fresh with same args
+    if (run.status === "paused" || run.status === "interrupted") {
+      pauseOrResumeSelected()
+      return
+    }
+    void sdk.client.workflow
+      .start({ name: run.workflow, workflowStartPayload: { args: run.args } })
+      .then((result) => {
+        if (!result.data) {
+          toast.show({ message: `Failed to restart workflow ${run.id}`, variant: "error" })
+          return
+        }
+        toast.show({ message: `Restarted workflow ${run.workflow}`, variant: "info" })
+        void refetch()
+      })
+      .catch(toast.error)
+  }
+
+  function toggleFilter() {
+    setFilterMode(!filterMode())
+    if (!filterMode()) {
+      // Entering filter mode
+      setTimeout(() => {
+        if (filterInputRef && !filterInputRef.isDestroyed) filterInputRef.focus()
+      }, 1)
+    } else {
+      // Exiting filter mode
+      setFilter("")
+    }
+  }
+
   useBindings(() => ({
     bindings: [
-      { key: "up,k", desc: "Previous workflow run", group: "Workflow", cmd: () => move(-1) },
-      { key: "down,j", desc: "Next workflow run", group: "Workflow", cmd: () => move(1) },
-      { key: "return", desc: "View workflow details", group: "Workflow", cmd: openSelected },
-      { key: "r", desc: "Refresh workflows", group: "Workflow", cmd: () => void refetchWorkflows() },
-      { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancelSelected },
-      { key: "a", desc: "Answer pending question", group: "Workflow", cmd: () => void answerSelected() },
-      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: pauseOrResumeSelected },
-      { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => void deleteSelected() },
-      { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => dialog.clear() },
+      { key: "up,k", desc: "Previous workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : move(-1)) },
+      { key: "down,j", desc: "Next workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : move(1)) },
+      { key: "return", desc: "View workflow details", group: "Workflow", cmd: () => (filterMode() ? undefined : openSelected()) },
+      { key: "f", desc: "Filter workflow runs", group: "Workflow", cmd: toggleFilter },
+      { key: "escape", desc: "Clear filter / exit", group: "Workflow", cmd: () => {
+        if (filterMode()) {
+          setFilter("")
+          setFilterMode(false)
+        } else {
+          dialog.clear()
+        }
+      }},
+      { key: "r", desc: "Restart workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : restartSelected()) },
+      { key: "R", desc: "Refresh workflow definitions", group: "Workflow", cmd: () => void refetchWorkflows() },
+      { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : cancelSelected()) },
+      { key: "a", desc: "Answer pending question", group: "Workflow", cmd: () => (filterMode() ? undefined : void answerSelected()) },
+      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: () => (filterMode() ? undefined : pauseOrResumeSelected()) },
+      { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => (filterMode() ? undefined : void deleteSelected()) },
+      { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => {
+        if (filterMode()) {
+          setFilter("")
+          setFilterMode(false)
+        } else {
+          dialog.clear()
+        }
+      }},
     ],
   }))
 
   return (
-    <box
-      width={dimensions().width}
-      height={dimensions().height - 1}
-      paddingLeft={2}
-      paddingRight={2}
-      paddingBottom={1}
-      gap={1}
-    >
-      <box flexDirection="row" justifyContent="space-between">
+    <box width="100%" gap={1} paddingLeft={4} paddingRight={4} paddingBottom={1} flexDirection="column">
+      <box flexDirection="row" justifyContent="space-between" alignItems="center">
         <text fg={theme.text} attributes={TextAttributes.BOLD}>
-          OpenCode Workflows
+          Workflows
         </text>
         <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
           esc
         </text>
       </box>
-      <text fg={theme.textMuted}>Select a run and press [Enter] to inspect phases, agents, and results.</text>
-      <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-        {dashboardRowText(
-          {
-            marker: "",
-            id: "RUN",
-            workflow: "WORKFLOW",
-            input: "INPUT",
-            status: "STATUS",
-            started: "STARTED",
-            duration: "DUR",
-            phase: "PHASE",
-            tokens: "TOKENS",
-          },
-          tableWidth(),
-        )}
-      </text>
-      <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
 
-      <scrollbox
-        ref={(element: ScrollBoxRenderable) => (scroll = element)}
-        flexGrow={1}
-        minHeight={0}
-        verticalScrollbarOptions={{ visible: true }}
-        horizontalScrollbarOptions={{ visible: false }}
-        scrollAcceleration={getScrollAcceleration()}
-      >
-        <For
-          each={runs()}
-          fallback={
-            <box paddingTop={1}>
-              <text fg={theme.textMuted}>
-                No workflow runs yet. Start one with /workflow workflow_name --arg=value.
-              </text>
+      <box flexDirection="column" gap={1} paddingBottom={1}>
+        <Show when={!filterMode()} fallback={
+          <box flexDirection="row" gap={1} alignItems="center" border={["bottom"]} borderColor={theme.borderSubtle} paddingBottom={1}>
+            <text fg={theme.textMuted}>Filter:</text>
+            <input
+              ref={(r: any) => (filterInputRef = r)}
+              placeholder="workflow, status, id..."
+              placeholderColor={theme.textMuted}
+              focusedBackgroundColor={theme.backgroundElement}
+              cursorColor={theme.primary}
+              focusedTextColor={theme.text}
+              textColor={theme.textMuted}
+              width={Math.min(40, tableWidth() - 10)}
+              onInput={(v: string) => setFilter(v)}
+              onSubmit={() => setFilterMode(false)}
+            />
+            <text fg={theme.textMuted} onMouseUp={() => { setFilterMode(false); setFilter("") }}>
+              [Esc] clear
+            </text>
+          </box>
+        }>
+          <text fg={theme.textMuted}>Select a run and press [Enter] to inspect phases, agents, and results.</text>
+        </Show>
+        <box flexDirection="row" gap={2}>
+          <text fg={theme.textMuted}>
+            Spent <span style={{ fg: theme.text }}>{formatCost(monthlySpend())}</span> this month
+          </text>
+          <Show when={activeWorkers() > 0}>
+            <text fg={theme.textMuted}>
+              <span style={{ fg: theme.primary }}>●</span> {activeWorkers()} active
+            </text>
+          </Show>
+          <text fg={theme.textMuted}>
+            {runs().length} {runs().length === 1 ? "run" : "runs"}
+            <Show when={filter()}>
+              <span style={{ fg: theme.text }}> / {filteredRuns().length} filtered</span>
+            </Show>
+          </text>
+        </box>
+      </box>
+
+      <Show
+        when={runs().length > 0}
+        fallback={
+          <box
+            flexDirection="column"
+            alignItems="center"
+            justifyContent="center"
+            border={["top", "bottom", "left", "right"]}
+            borderColor={theme.border}
+            paddingTop={3}
+            paddingBottom={3}
+            paddingLeft={2}
+            paddingRight={2}
+            gap={1}
+            backgroundColor={theme.backgroundElement}
+          >
+            <text fg={theme.text} attributes={TextAttributes.BOLD}>
+              No workflow runs yet
+            </text>
+            <text fg={theme.textMuted}>Start one with</text>
+            <text fg={theme.accent}>/workflow workflow_name --arg=value</text>
+            <box paddingTop={1} flexDirection="column" gap={1} alignItems="center">
+              <text fg={theme.textMuted}>Your runs will appear here with status, duration, and tokens.</text>
+              <text fg={theme.textMuted}>Tip: Workflows can be saved to .opencode/workflows/ or .claude/workflows/</text>
             </box>
-          }
+          </box>
+        }
+      >
+        <Show when={filteredRuns().length > 0} fallback={
+          <box
+            flexDirection="column"
+            alignItems="center"
+            justifyContent="center"
+            border={["top", "bottom", "left", "right"]}
+            borderColor={theme.border}
+            paddingTop={2}
+            paddingBottom={2}
+            paddingLeft={2}
+            paddingRight={2}
+            gap={1}
+          >
+            <text fg={theme.textMuted}>No runs match filter "{filter()}"</text>
+            <text fg={theme.textMuted} onMouseUp={() => { setFilter(""); setFilterMode(false) }}>[Esc] clear filter</text>
+          </box>
+        }>
+        <box
+          flexDirection="column"
+          border={["top", "bottom", "left", "right"]}
+          borderColor={theme.border}
+          minHeight={0}
         >
-          {(run, index) => {
-            const active = createMemo(() => index() === store.selected)
-            return (
-              <box
-                paddingLeft={1}
-                paddingRight={1}
-                backgroundColor={active() ? theme.primary : undefined}
-                onMouseDown={() => selectIndex(index())}
-                onMouseUp={openSelected}
-              >
-                <text fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
-                  {dashboardRowText(
-                    {
-                      // Spec §5.2 (4): a run waiting on an answer (running/parked
-                      // with a pending question) shows the ⏳ badge; otherwise the
-                      // selection arrow when active. The marker cell is 2 wide.
-                      marker: questionBadge(run) || (active() ? "›" : ""),
-                      id: shortRunID(run),
-                      workflow: run.workflow,
-                      input: workflowInput(run),
-                      status: `${statusIcon(run.status)} ${statusLabel(run.status)}`,
-                      started: formatStartedShort(run.started_at),
-                      duration: formatShortDuration(run),
-                      phase: dashboardPhase(run, workflow(run)),
-                      tokens: formatShortTokens(runUsage(run).tokens.total),
-                    },
-                    tableWidth(),
-                  )}
-                </text>
-              </box>
-            )
-          }}
-        </For>
-      </scrollbox>
+          <box
+            flexDirection="row"
+            backgroundColor={theme.backgroundElement}
+            paddingLeft={1}
+            paddingRight={1}
+            paddingTop={1}
+            paddingBottom={1}
+            gap={1}
+          >
+            <text width={2} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              {" "}
+            </text>
+            <text width={10} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              RUN
+            </text>
+            <text width={dashboardWidths(tableWidth()).workflow} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              WORKFLOW
+            </text>
+            <text width={STATUS_WIDTH} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              STATUS
+            </text>
+            <text width={12} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              STARTED
+            </text>
+            <text width={7} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              DUR
+            </text>
+            <text width={AGENTS_WIDTH} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              AGENTS
+            </text>
+            <text width={dashboardWidths(tableWidth()).phase} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              PHASE
+            </text>
+            <text width={8} fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              TOKENS
+            </text>
+            <text fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+              INPUT
+            </text>
+          </box>
 
-      <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
-      <box flexDirection="row" justifyContent="space-between">
+          <box height={1} border={["bottom"]} borderColor={theme.borderSubtle} />
+
+          <scrollbox
+            ref={(element: ScrollBoxRenderable) => (scroll = element)}
+            maxHeight={listHeight()}
+            minHeight={0}
+            verticalScrollbarOptions={{ visible: true }}
+            horizontalScrollbarOptions={{ visible: false }}
+            scrollAcceleration={getScrollAcceleration()}
+          >
+            <For each={filteredRuns()}>
+              {(run, index) => {
+                const active = createMemo(() => index() === store.selected)
+                const sColor = createMemo(() => statusColor(run.status, theme))
+                const cols = createMemo(() => dashboardWidths(tableWidth()))
+                return (
+                  <box
+                    flexDirection="row"
+                    paddingLeft={1}
+                    paddingRight={1}
+                    gap={1}
+                    backgroundColor={active() ? theme.primary : undefined}
+                    onMouseDown={() => selectIndex(index())}
+                    onMouseUp={openSelected}
+                  >
+                    <text width={2} fg={active() ? selectedForeground(theme) : theme.accent} wrapMode="none">
+                      {questionBadge(run) || (active() ? "›" : "")}
+                    </text>
+                    <text width={10} fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
+                      {Locale.truncate(shortRunID(run), 10)}
+                    </text>
+                    <text
+                      width={cols().workflow}
+                      fg={active() ? selectedForeground(theme) : theme.text}
+                      attributes={active() ? TextAttributes.BOLD : undefined}
+                      wrapMode="none"
+                      overflow="hidden"
+                    >
+                      {Locale.truncate(run.workflow, cols().workflow)}
+                    </text>
+                    <box width={STATUS_WIDTH} flexDirection="row" gap={1}>
+                      <text fg={active() ? selectedForeground(theme) : sColor()} wrapMode="none">
+                        {statusIcon(run.status)}
+                      </text>
+                      <text fg={active() ? selectedForeground(theme) : theme.textMuted} wrapMode="none" overflow="hidden">
+                        {Locale.truncate(statusLabel(run.status), STATUS_WIDTH - 2)}
+                      </text>
+                    </box>
+                    <text width={12} fg={active() ? selectedForeground(theme) : theme.textMuted} wrapMode="none" overflow="hidden">
+                      {formatStartedShort(run.started_at)}
+                    </text>
+                    <text width={7} fg={active() ? selectedForeground(theme) : theme.textMuted} wrapMode="none" overflow="hidden">
+                      {formatShortDuration(run)}
+                    </text>
+                    <text width={AGENTS_WIDTH} fg={active() ? selectedForeground(theme) : theme.textMuted} wrapMode="none" overflow="hidden">
+                      {Locale.truncate(agentProgress(run), AGENTS_WIDTH)}
+                    </text>
+                    <text width={cols().phase} fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
+                      {Locale.truncate(dashboardPhase(run, workflow(run)), cols().phase)}
+                    </text>
+                    <text width={8} fg={active() ? selectedForeground(theme) : theme.textMuted} wrapMode="none" overflow="hidden">
+                      {formatShortTokens(runUsage(run).tokens.total)}
+                    </text>
+                    <text fg={active() ? selectedForeground(theme) : theme.textMuted} wrapMode="none" overflow="hidden">
+                      {Locale.truncate(workflowInput(run), cols().input)}
+                    </text>
+                  </box>
+                )
+              }}
+            </For>
+          </scrollbox>
+        </box>
+      </Show>
+      </Show>
+
+      <box
+        flexDirection="row"
+        justifyContent="space-between"
+        border={["top"]}
+        borderColor={theme.borderSubtle}
+        paddingTop={1}
+        gap={2}
+      >
+        <box flexDirection="row" gap={2} flexWrap="wrap">
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Enter]</span> View
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[F]</span> Filter
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[R]</span> Restart
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[A]</span> Answer
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[X]</span> Kill
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[P]</span> Pause
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[D]</span> Delete
+          </text>
+        </box>
         <text fg={theme.textMuted}>
-          Spent this month: {formatCost(monthlySpend())} | Active Background Workers: {activeWorkers()}
-        </text>
-        <text fg={theme.textMuted}>
-          [Enter] View Details | [A] Answer | [R] Refresh | [X] Kill | [D] Delete history | [Esc]/[B] Exit
+          <span style={{ attributes: TextAttributes.BOLD }}>Esc</span> / <span style={{ attributes: TextAttributes.BOLD }}>B</span> Exit
+          <Show when={filterMode()}>
+            <span style={{ fg: theme.warning }}> • FILTER</span>
+          </Show>
         </text>
       </box>
     </box>
@@ -756,9 +1000,12 @@ function DialogWorkflowSave(props: { run: WorkflowRun; onClose: () => void }) {
     }, 1)
   })
 
+  const namePreview = createMemo(() => sanitizeWorkflowFilename(textarea?.plainText ?? props.run.workflow) ?? props.run.workflow)
+  const targetsPreview = createMemo(() => saveTargets(projectDir(), globalDir(), namePreview() ?? "workflow"))
+
   return (
-    <box paddingLeft={2} paddingRight={2} gap={1}>
-      <box flexDirection="row" justifyContent="space-between">
+    <box paddingLeft={4} paddingRight={4} gap={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" alignItems="center">
         <text attributes={TextAttributes.BOLD} fg={theme.text}>
           Save workflow as command
         </text>
@@ -771,7 +1018,7 @@ function DialogWorkflowSave(props: { run: WorkflowRun; onClose: () => void }) {
         fallback={<text fg={theme.textMuted}>This run has no captured source, so it cannot be saved.</text>}
       >
         <box gap={1}>
-          <text fg={theme.textMuted}>Name (becomes /name); written to {target()}.</text>
+          <text fg={theme.textMuted}>Name becomes /{namePreview()} command. Edit below:</text>
           <textarea
             height={3}
             ref={(val: TextareaRenderable) => {
@@ -785,10 +1032,270 @@ function DialogWorkflowSave(props: { run: WorkflowRun; onClose: () => void }) {
             focusedTextColor={theme.text}
             cursorColor={theme.text}
           />
-          <text fg={theme.textMuted}>
-            Destination: [{target() === "project" ? "x" : " "}] project .opencode/workflows [
-            {target() === "global" ? "x" : " "}] global : [Tab] toggle, [Enter] save
+          <box flexDirection="column" gap={1} border={["top"]} borderColor={theme.borderSubtle} paddingTop={1} marginTop={1}>
+            <box flexDirection="row" gap={1}>
+              <text fg={target() === "project" ? theme.primary : theme.textMuted} attributes={TextAttributes.BOLD}>
+                [{target() === "project" ? "x" : " "}] Project
+              </text>
+              <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+                {Locale.truncate(targetsPreview().project, 60)}
+              </text>
+            </box>
+            <box flexDirection="row" gap={1}>
+              <text fg={target() === "global" ? theme.primary : theme.textMuted} attributes={TextAttributes.BOLD}>
+                [{target() === "global" ? "x" : " "}] Global
+              </text>
+              <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+                {Locale.truncate(targetsPreview().global, 60)}
+              </text>
+            </box>
+          </box>
+          <box flexDirection="row" gap={2} paddingTop={1}>
+            <text fg={theme.textMuted}>
+              <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Tab]</span> Toggle destination
+            </text>
+            <text fg={theme.textMuted}>
+              <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Enter]</span> Save
+            </text>
+            <text fg={theme.textMuted}>
+              <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Esc]</span> Cancel
+            </text>
+          </box>
+        </box>
+      </Show>
+    </box>
+  )
+}
+
+function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]; run: WorkflowRun; onClose: () => void; onOpenSession?: () => void }) {
+  const dialog = useDialog()
+  const { theme } = useTheme()
+  const sdk = useSDK()
+  const toast = useToast()
+  const dimensions = useTerminalDimensions()
+  let promptScroll: ScrollBoxRenderable | undefined
+  let outputScroll: ScrollBoxRenderable | undefined
+  let promptInputRef: any
+  const [copyNotice, setCopyNotice] = createSignal(false)
+  const [promptMode, setPromptMode] = createSignal(false)
+  const [promptText, setPromptText] = createSignal("")
+  let copyTimeout: ReturnType<typeof setTimeout> | undefined
+
+  onMount(() => {
+    dialog.setSize("xlarge")
+  })
+
+  onCleanup(() => {
+    if (copyTimeout) clearTimeout(copyTimeout)
+  })
+
+  function copyOutput() {
+    const text = props.agent.output ?? props.agent.prompt ?? ""
+    if (!text.trim()) return
+    void Clipboard.write(text).then(() => {
+      setCopyNotice(true)
+      if (copyTimeout) clearTimeout(copyTimeout)
+      copyTimeout = setTimeout(() => setCopyNotice(false), 1800)
+    })
+  }
+
+  function togglePrompt() {
+    setPromptMode(!promptMode())
+    if (promptMode()) {
+      setTimeout(() => {
+        if (promptInputRef && !promptInputRef.isDestroyed) promptInputRef.focus()
+      }, 1)
+    }
+  }
+
+  async function sendPrompt() {
+    const text = promptText().trim()
+    if (!text) return
+    const sessionId = (props.agent as any).session_id
+    if (!sessionId) {
+      toast.show({ message: "No session for this agent, open session instead", variant: "info" })
+      return
+    }
+    try {
+      // v2 API uses prompt: {text}, not parts directly
+      await sdk.client.session.prompt({
+        sessionID: sessionId,
+        prompt: { text },
+      } as any)
+      toast.show({ message: `Prompt sent to ${props.agent.label ?? "agent"}`, variant: "success" })
+      setPromptText("")
+      setPromptMode(false)
+    } catch (e) {
+      toast.show({ message: e instanceof Error ? e.message : "Failed to send prompt", variant: "error" })
+    }
+  }
+
+  useBindings(() => ({
+    bindings: [
+      { key: "b", desc: "Back", group: "Workflow", cmd: props.onClose },
+      { key: "escape", desc: "Back / cancel prompt", group: "Workflow", cmd: () => {
+        if (promptMode()) {
+          setPromptMode(false)
+          setPromptText("")
+        } else {
+          props.onClose()
+        }
+      }},
+      { key: "y", desc: "Copy output", group: "Workflow", cmd: () => { if (!promptMode()) copyOutput() } },
+      { key: "o", desc: "Open session", group: "Workflow", cmd: () => { if (!promptMode()) props.onOpenSession?.() } },
+      { key: "p", desc: "Prompt agent", group: "Workflow", cmd: () => { if (!promptMode()) togglePrompt() } },
+      { key: "j", desc: "Scroll down", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(3) } },
+      { key: "k", desc: "Scroll up", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(-3) } },
+      { key: "down", desc: "Scroll down", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(1) } },
+      { key: "up", desc: "Scroll up", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(-1) } },
+      { key: "pagedown,ctrl+f", desc: "Page down", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(outputScroll?.height ?? 10) } },
+      { key: "pageup,ctrl+b", desc: "Page up", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(-(outputScroll?.height ?? 10)) } },
+    ],
+  }))
+
+  const statusColor = createMemo(() => {
+    if (props.agent.status === "completed") return theme.success
+    if (props.agent.status === "failed") return theme.error
+    if (props.agent.status === "running") return theme.primary
+    return theme.textMuted
+  })
+
+  return (
+    <box width="100%" gap={1} paddingLeft={4} paddingRight={4} paddingBottom={1} flexDirection="column">
+      <box flexDirection="row" justifyContent="space-between" alignItems="center">
+        <box flexDirection="row" gap={2} alignItems="center">
+          <text fg={statusColor()} attributes={TextAttributes.BOLD}>
+            {agentIcon(props.agent.status)} {props.agent.label ?? props.agent.agent ?? `agent:${props.agent.id.slice(-4)}`}
           </text>
+          <Show when={(props.agent as any).cached}>
+            <text fg={theme.warning} attributes={TextAttributes.BOLD}>
+              cached
+            </text>
+          </Show>
+          <text fg={theme.textMuted}>{props.agent.phase ? `phase: ${props.agent.phase}` : ""}</text>
+        </box>
+        <text fg={theme.textMuted} onMouseUp={props.onClose}>
+          esc
+        </text>
+      </box>
+
+      <box flexDirection="row" gap={2} flexWrap="wrap" border={["bottom"]} borderColor={theme.borderSubtle} paddingBottom={1}>
+        <text fg={theme.textMuted}>
+          Model: <span style={{ fg: theme.text }}>{props.agent.model ? modelLabel(props.agent as any) : "default"}</span>
+        </text>
+        <text fg={theme.textMuted}>
+          Tokens: <span style={{ fg: theme.text }}>{formatTokens(agentTokens(props.agent as any) as any)}</span>
+        </text>
+        <text fg={theme.textMuted}>
+          Cost: <span style={{ fg: theme.text }}>{formatCost((props.agent as any).cost ?? 0)}</span>
+        </text>
+        <text fg={theme.textMuted}>
+          Duration: <span style={{ fg: theme.text }}>{formatShortElapsed(props.agent.started_at, (props.agent as any).completed_at)}</span>
+        </text>
+        <text fg={theme.textMuted}>
+          Status: <span style={{ fg: statusColor() }}>{props.agent.status}</span>
+        </text>
+      </box>
+
+      <box flexDirection="column" gap={1} flexGrow={1} minHeight={0}>
+        <text fg={theme.text} attributes={TextAttributes.BOLD}>
+          {sectionTitle("Prompt", dimensions().width - 10)}
+        </text>
+        <scrollbox
+          ref={(el: ScrollBoxRenderable) => (promptScroll = el)}
+          maxHeight={Math.floor(dimensions().height / 3)}
+          minHeight={0}
+          verticalScrollbarOptions={{ visible: true }}
+          scrollAcceleration={getScrollAcceleration()}
+          border={["left", "right", "top", "bottom"]}
+          borderColor={theme.borderSubtle}
+          paddingLeft={1}
+          paddingRight={1}
+          paddingTop={1}
+          paddingBottom={1}
+        >
+          <text fg={theme.textMuted} wrapMode="word">
+            {props.agent.prompt ?? "(no prompt)"}
+          </text>
+        </scrollbox>
+
+        <text fg={theme.text} attributes={TextAttributes.BOLD}>
+          {sectionTitle("Output", dimensions().width - 10)}
+        </text>
+        <scrollbox
+          ref={(el: ScrollBoxRenderable) => (outputScroll = el)}
+          flexGrow={1}
+          minHeight={0}
+          verticalScrollbarOptions={{ visible: true }}
+          scrollAcceleration={getScrollAcceleration()}
+          border={["left", "right", "top", "bottom"]}
+          borderColor={theme.border}
+          paddingLeft={1}
+          paddingRight={1}
+          paddingTop={1}
+          paddingBottom={1}
+        >
+          <Show when={props.agent.output} fallback={<text fg={theme.textMuted}>No output yet...</text>}>
+            <text fg={theme.text} wrapMode="word">
+              {props.agent.output}
+            </text>
+          </Show>
+          <Show when={props.agent.error}>
+            <box paddingTop={1}>
+              <text fg={theme.error} wrapMode="word">
+                Error: {props.agent.error}
+              </text>
+            </box>
+          </Show>
+        </scrollbox>
+
+        <Show when={promptMode()}>
+          <box flexDirection="column" gap={1} border={["top"]} borderColor={theme.borderActive} paddingTop={1}>
+            <text fg={theme.text} attributes={TextAttributes.BOLD}>Prompt this agent:</text>
+            <box flexDirection="row" gap={1}>
+              <input
+                ref={(r: any) => (promptInputRef = r)}
+                placeholder="Enter follow-up prompt for this subagent..."
+                placeholderColor={theme.textMuted}
+                textColor={theme.text}
+                focusedTextColor={theme.text}
+                cursorColor={theme.primary}
+                focusedBackgroundColor={theme.backgroundElement}
+                width={dimensions().width - 20}
+                onInput={(v: string) => setPromptText(v)}
+                onSubmit={() => void sendPrompt()}
+              />
+              <text fg={theme.textMuted} onMouseUp={() => void sendPrompt()}>
+                [Enter] Send
+              </text>
+            </box>
+          </box>
+        </Show>
+      </box>
+
+      <box flexDirection="row" justifyContent="space-between" border={["top"]} borderColor={theme.borderSubtle} paddingTop={1}>
+        <box flexDirection="row" gap={2} flexWrap="wrap">
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[J/K]</span> Scroll
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[P]</span> Prompt
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Y]</span> Copy
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[O]</span> Open session
+          </text>
+        </box>
+        <text fg={theme.textMuted}>
+          <span style={{ attributes: TextAttributes.BOLD }}>Esc/B</span> Back
+        </text>
+      </box>
+
+      <Show when={copyNotice()}>
+        <box position="absolute" right={4} bottom={3} paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1} backgroundColor={theme.backgroundPanel} border={["left","right"]} borderColor={theme.success}>
+          <text fg={theme.text}>Copied to clipboard</text>
         </box>
       </Show>
     </box>
@@ -837,22 +1344,33 @@ function DialogWorkflowRun(props: {
     selectedPhase: 0,
     selectedAgent: 0,
     resultOffset: 0,
+    agentFilter: "all" as "all" | "running" | "completed" | "failed",
+    focusedPanel: "phases" as "phases" | "agents",
   })
   const selectedPhase = createMemo(() => phases()[store.selectedPhase] ?? phases()[0])
-  // Item 19 (was N7): ctx.log entries are no longer a separate capped Logs box :
-  // phaseRows interleaves them chronologically as dimmed narrator rows between
-  // the agent rows of their phase, inside the scrolling agent panel.
-  const selectedPhaseRows = createMemo(() => phaseRows(current(), phases(), selectedPhase()))
+  const selectedPhaseRows = createMemo(() => {
+    const rows = phaseRows(current(), phases(), selectedPhase())
+    const filter = (store as any).agentFilter ?? "all"
+    if (filter === "all") return rows
+    return rows.filter((r) => {
+      if (r.type !== "agent") return true
+      return r.agent.status === filter
+    })
+  })
   const selectedRow = createMemo(() => selectedPhaseRows()[store.selectedAgent])
   const selectedResult = createMemo(() => selectedRow()?.type === "result" && current().result !== undefined)
-  const phasePanelWidth = createMemo(() => Math.min(44, Math.max(28, Math.floor((dimensions().width - 6) * 0.28))))
-  const agentPanelWidth = createMemo(() => Math.max(24, dimensions().width - phasePanelWidth() - 8))
+  const dialogContentWidth = createMemo(() => Math.max(40, Math.min(108, dimensions().width - 14)))
+  const phasePanelWidth = createMemo(() => Math.min(36, Math.max(24, Math.floor(dialogContentWidth() * 0.32))))
+  const agentPanelWidth = createMemo(() => Math.max(24, dialogContentWidth() - phasePanelWidth() - 1))
   const resultLines = createMemo(() => wrapResultText(current().result, agentPanelWidth() - 4))
   const resultBodyLines = createMemo(() => Math.max(1, dimensions().height - 14))
   const visibleResultLines = createMemo(() =>
     resultLines().slice(store.resultOffset, store.resultOffset + resultBodyLines()),
   )
-  const headerWidth = createMemo(() => Math.max(20, dimensions().width - 4))
+  const headerWidth = createMemo(() => dialogContentWidth())
+  const detailPhasePanelWidth = phasePanelWidth
+  const detailAgentPanelWidth = agentPanelWidth
+  const detailHeaderWidth = headerWidth
   const description = createMemo(() => {
     const summary = workflow()?.meta.description ?? `Run ${current().id.replace(/^job_/, "#")}`
     if (phases().length === 0) return summary
@@ -889,6 +1407,8 @@ function DialogWorkflowRun(props: {
         initialAgentIndex >= 0 ? initialAgentIndex : firstSelectableRow(phaseRows(current(), phases(), phases()[next])),
       )
       setStore("resultOffset", 0)
+      if (initialAgentIndex >= 0) setStore("focusedPanel", "agents")
+      else setStore("focusedPanel", "phases")
       return
     }
     if (store.selectedPhase >= phases().length) {
@@ -1022,10 +1542,12 @@ function DialogWorkflowRun(props: {
 
   function openAgentSession() {
     const row = selectedRow()
-    // Item 19: only an agent row has a session (result and narrator log rows no-op).
     if (row?.type !== "agent") return
     const sessionID = row.agent.session_id
-    if (!sessionID) return
+    if (!sessionID) {
+      toast.show({ message: "No session for this agent", variant: "info" })
+      return
+    }
     route.navigate({
       type: "session",
       sessionID,
@@ -1037,8 +1559,46 @@ function DialogWorkflowRun(props: {
     dialog.clear()
   }
 
+  function openAgentDetail() {
+    const row = selectedRow()
+    if (row?.type !== "agent") return
+    const agent = row.agent
+    const phase = selectedPhase()
+    const agentId = row.agent.id
+    const reopen = () => dialog.replace(() => <DialogWorkflowRun id={props.id} initial={current()} workflows={props.workflows} initialPhase={phase} initialAgentID={agentId} />)
+    dialog.replace(
+      () => <DialogWorkflowAgentDetail agent={agent as any} run={current() as any} onClose={reopen} onOpenSession={() => {
+        openAgentSession()
+      }} />,
+      () => {
+        reopen()
+        return false
+      },
+    )
+  }
+
+  function skipSelectedAgent() {
+    const row = selectedRow()
+    if (row?.type !== "agent") {
+      cancel()
+      return
+    }
+    if (row.agent.status !== "running") {
+      toast.show({ message: "Agent not running", variant: "info" })
+      return
+    }
+    void sdk.client.workflow
+      .skip({ id: current().id, agentId: row.agent.id })
+      .then(() => {
+        toast.show({ message: `Skipped agent ${row.agent.label ?? row.agent.id.slice(-4)}`, variant: "info" })
+        void refetch()
+      })
+      .catch(toast.error)
+  }
+
   function movePhase(direction: number) {
     if (phases().length === 0) return
+    setStore("focusedPanel", "phases")
     const next = Math.max(0, Math.min(phases().length - 1, store.selectedPhase + direction))
     setStore("selectedPhase", next)
     setStore("selectedAgent", firstSelectableRow(phaseRows(current(), phases(), phases()[next])))
@@ -1047,10 +1607,56 @@ function DialogWorkflowRun(props: {
 
   function moveAgent(direction: number) {
     if (selectedPhaseRows().length === 0) return
+    setStore("focusedPanel", "agents")
     // Item 19: narrator log rows are skipped : the cyclic step lands on the next
     // agent/result row (or stays put when the phase has only logs).
     setStore("selectedAgent", stepSelectableRow(selectedPhaseRows(), store.selectedAgent, direction < 0 ? -1 : 1))
     setStore("resultOffset", 0)
+  }
+
+  function focusPhases() {
+    setStore("focusedPanel", "phases")
+  }
+
+  function focusAgents() {
+    setStore("focusedPanel", "agents")
+  }
+
+  function switchFocus() {
+    if (store.focusedPanel === "phases") focusAgents()
+    else focusPhases()
+  }
+
+  function moveUp() {
+    if (store.focusedPanel === "agents") moveAgent(-1)
+    else movePhase(-1)
+  }
+
+  function moveDown() {
+    if (store.focusedPanel === "agents") moveAgent(1)
+    else movePhase(1)
+  }
+
+  function handleRight() {
+    if (store.focusedPanel === "phases") {
+      // Move focus to agents panel
+      focusAgents()
+    } else {
+      // In agents panel, drill into agent detail
+      const row = selectedRow()
+      if (row?.type === "agent") openAgentDetail()
+      else if (row?.type === "result") pageResult(resultBodyLines())
+    }
+  }
+
+  function handleLeft() {
+    if (store.focusedPanel === "agents") {
+      // Move focus back to phases
+      focusPhases()
+    } else {
+      // In phases panel, left goes back to dashboard
+      back()
+    }
   }
 
   function pageResult(direction: number) {
@@ -1105,22 +1711,45 @@ function DialogWorkflowRun(props: {
   useBindings(() => ({
     bindings: [
       { key: "b", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
-      { key: "escape", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
-      { key: "return,o", desc: "Open selected subagent", group: "Workflow", cmd: openAgentSession },
+      { key: "escape", desc: "Back / hide workflow", group: "Workflow", cmd: () => {
+        if (store.focusedPanel === "agents") focusPhases()
+        else dialog.clear()
+      }},
+      { key: "left", desc: "Focus phases / back to dashboard", group: "Workflow", cmd: handleLeft },
+      { key: "right", desc: "Focus agents / drill into agent", group: "Workflow", cmd: handleRight },
+      { key: "tab", desc: "Switch focus phases<>agents", group: "Workflow", cmd: switchFocus },
+      { key: "return", desc: "Drill into phase / agent detail", group: "Workflow", cmd: () => {
+        if (store.focusedPanel === "phases") {
+          focusAgents()
+        } else {
+          const row = selectedRow()
+          if (!row) return
+          if (row.type === "agent") openAgentDetail()
+          else if (row.type === "result") pageResult(resultBodyLines())
+        }
+      }},
+      { key: "o", desc: "Open agent session", group: "Workflow", cmd: openAgentSession },
       { key: "y", desc: "Copy selected response", group: "Workflow", cmd: copySelectedResponse },
       { key: "s", desc: "Save run as command", group: "Workflow", cmd: saveAsCommand },
-      { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancel },
-      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: pauseOrResume },
+      { key: "x", desc: "Stop agent / kill workflow", group: "Workflow", cmd: skipSelectedAgent },
+      { key: "X", desc: "Kill entire workflow", group: "Workflow", cmd: cancel },
+      { key: "p", desc: "Pause / resume run", group: "Workflow", cmd: pauseOrResume },
+      { key: "f", desc: "Filter agents by status", group: "Workflow", cmd: () => {
+        const current = (store as any).agentFilter ?? "all"
+        const next = current === "all" ? "running" : current === "running" ? "completed" : current === "completed" ? "failed" : "all"
+        setStore("agentFilter", next as any)
+        toast.show({ message: `Filter: ${next}`, variant: "info" })
+      }},
       {
         key: "r",
-        desc: "Resume, re-running the selected agent",
+        desc: "Restart selected agent",
         group: "Workflow",
         cmd: resumeInvalidatingSelectedAgent,
       },
-      { key: "up,k", desc: "Previous phase", group: "Workflow", cmd: () => movePhase(-1) },
-      { key: "down,j", desc: "Next phase", group: "Workflow", cmd: () => movePhase(1) },
-      { key: "left,h", desc: "Previous phase agent", group: "Workflow", cmd: () => moveAgent(-1) },
-      { key: "right,l", desc: "Next phase agent", group: "Workflow", cmd: () => moveAgent(1) },
+      { key: "up,k", desc: "Previous (phase/agent)", group: "Workflow", cmd: () => moveUp() },
+      { key: "down,j", desc: "Next (phase/agent)", group: "Workflow", cmd: () => moveDown() },
+      { key: "h", desc: "Previous agent", group: "Workflow", cmd: () => { focusAgents(); moveAgent(-1) } },
+      { key: "l", desc: "Next agent", group: "Workflow", cmd: () => { focusAgents(); moveAgent(1) } },
       {
         key: "pageup,ctrl+b",
         desc: "Page workflow details up",
@@ -1176,7 +1805,10 @@ function DialogWorkflowRun(props: {
         fg={active() ? theme.primary : color()}
         wrapMode="none"
         overflow="hidden"
-        onMouseDown={() => setStore("selectedAgent", props.index())}
+        onMouseDown={() => {
+          setStore("focusedPanel", "agents")
+          setStore("selectedAgent", props.index())
+        }}
       >
         {rowText()}
       </text>
@@ -1184,43 +1816,37 @@ function DialogWorkflowRun(props: {
   }
 
   return (
-    <box
-      width={dimensions().width}
-      height={dimensions().height - 1}
-      paddingLeft={2}
-      paddingRight={2}
-      paddingBottom={1}
-      gap={1}
-    >
-      <box height={2} flexShrink={0}>
-        <text fg={theme.primary} attributes={TextAttributes.BOLD} wrapMode="none" overflow="hidden">
-          {fitColumns(
-            workflow()?.meta.name ?? current().workflow,
-            `${agentProgress(current())} · ${formatShortDuration(current())}`,
-            headerWidth(),
-          )}
-        </text>
-        <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-          {fitColumns(description(), `${statusIcon(current().status)} ${statusLabel(current().status)}`, headerWidth())}
-        </text>
+    <box width="100%" gap={1} paddingLeft={4} paddingRight={4} paddingBottom={1} flexDirection="column">
+      <box flexDirection="column" gap={0} flexShrink={0} paddingBottom={1} border={["bottom"]} borderColor={theme.borderSubtle}>
+        <box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <text fg={theme.primary} attributes={TextAttributes.BOLD} wrapMode="none" overflow="hidden">
+            {Locale.truncate(workflow()?.meta.name ?? current().workflow, detailHeaderWidth() - 20)}
+          </text>
+          <text fg={theme.textMuted}>
+            {agentProgress(current())} · {formatShortDuration(current())}
+          </text>
+        </box>
+        <box flexDirection="row" justifyContent="space-between">
+          <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+            {Locale.truncate(description(), detailHeaderWidth() - 16)}
+          </text>
+          <box flexDirection="row" gap={1}>
+            <text fg={statusColor(current().status, theme)}>{statusIcon(current().status)}</text>
+            <text fg={theme.textMuted}>{statusLabel(current().status)}</text>
+          </box>
+        </box>
       </box>
 
-      <box
-        flexGrow={1}
-        minHeight={0}
-        flexDirection="row"
-        border={["top", "bottom", "left", "right"]}
-        borderColor={theme.border}
-      >
-        <box width={phasePanelWidth()} paddingLeft={1} paddingRight={1} minHeight={0}>
-          <text fg={theme.text} wrapMode="none">
-            {sectionTitle("Phases", phasePanelWidth() - 2)}
+      <box flexGrow={1} minHeight={0} flexDirection="row" border={["top", "bottom", "left", "right"]} borderColor={store.focusedPanel === "phases" ? theme.borderActive : theme.border}>
+        <box width={detailPhasePanelWidth()} paddingLeft={1} paddingRight={1} minHeight={0} border={store.focusedPanel === "phases" ? ["right"] : []} borderColor={store.focusedPanel === "phases" ? theme.primary : theme.borderSubtle}>
+          <text fg={store.focusedPanel === "phases" ? theme.primary : theme.text} attributes={store.focusedPanel === "phases" ? TextAttributes.BOLD : undefined} wrapMode="none">
+            {sectionTitle(store.focusedPanel === "phases" ? "› Phases" : "Phases", detailPhasePanelWidth() - 2)}
           </text>
           <scrollbox
             ref={(element: ScrollBoxRenderable) => (phaseScroll = element)}
             flexGrow={1}
             minHeight={0}
-            verticalScrollbarOptions={{ visible: false }}
+            verticalScrollbarOptions={{ visible: true }}
             horizontalScrollbarOptions={{ visible: false }}
             scrollAcceleration={getScrollAcceleration()}
           >
@@ -1246,6 +1872,7 @@ function DialogWorkflowRun(props: {
                     flexDirection="row"
                     width="100%"
                     onMouseDown={() => {
+                      setStore("focusedPanel", "phases")
                       setStore("selectedPhase", index())
                       setStore("selectedAgent", firstSelectableRow(phaseRows(current(), phases(), phase)))
                     }}
@@ -1279,10 +1906,9 @@ function DialogWorkflowRun(props: {
             </For>
           </scrollbox>
         </box>
-        <box width={1} border={["left"]} borderColor={theme.border} />
-        <box flexGrow={1} minWidth={0} paddingLeft={1} paddingRight={1} minHeight={0}>
-          <text fg={theme.text} wrapMode="none" overflow="hidden">
-            {sectionTitle(phaseRowTitle(selectedPhase(), selectedPhaseRows()), agentPanelWidth() - 2)}
+        <box flexGrow={1} minWidth={0} paddingLeft={1} paddingRight={1} minHeight={0} border={store.focusedPanel === "agents" ? ["left"] : []} borderColor={store.focusedPanel === "agents" ? theme.primary : theme.border}>
+          <text fg={store.focusedPanel === "agents" ? theme.primary : theme.text} attributes={store.focusedPanel === "agents" ? TextAttributes.BOLD : undefined} wrapMode="none" overflow="hidden">
+            {sectionTitle(store.focusedPanel === "agents" ? `› ${phaseRowTitle(selectedPhase(), selectedPhaseRows())}` : phaseRowTitle(selectedPhase(), selectedPhaseRows()), agentPanelWidth() - 2)}
           </text>
           <Show
             when={!selectedResult()}
@@ -1311,7 +1937,7 @@ function DialogWorkflowRun(props: {
               ref={(element: ScrollBoxRenderable) => (agentScroll = element)}
               flexGrow={1}
               minHeight={0}
-              verticalScrollbarOptions={{ visible: false }}
+              verticalScrollbarOptions={{ visible: true }}
               horizontalScrollbarOptions={{ visible: false }}
               scrollAcceleration={getScrollAcceleration()}
             >
@@ -1356,14 +1982,44 @@ function DialogWorkflowRun(props: {
         </box>
       </box>
 
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme.textMuted}>
-          [↑/↓] Phase | [←/→] Agent/result | [Y] Copy response | [S] Save as command | [Enter/O] Open agent | [X] Kill
-          run | [Esc/B] Back
-        </text>
-        <Show when={current().status === "running"}>
-          <text fg={theme.primary}>live</text>
-        </Show>
+      <box
+        flexDirection="row"
+        justifyContent="space-between"
+        border={["top"]}
+        borderColor={theme.borderSubtle}
+        paddingTop={1}
+        gap={2}
+      >
+        <box flexDirection="row" gap={2} flexWrap="wrap">
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[↑/↓]</span> Phase
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[←/→]</span> Agent
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Y]</span> Copy
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[S]</span> Save
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Enter]</span> Open
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[X]</span> Kill
+          </text>
+        </box>
+        <box flexDirection="row" gap={2} alignItems="center">
+          <Show when={current().status === "running"}>
+            <text fg={theme.primary} attributes={TextAttributes.BOLD}>
+              ● live
+            </text>
+          </Show>
+          <text fg={theme.textMuted}>
+            <span style={{ attributes: TextAttributes.BOLD }}>Esc</span> Back
+          </text>
+        </box>
       </box>
       <Show when={copyNotice()}>
         <box

@@ -69,6 +69,7 @@ export namespace ProviderTest {
             Effect.succeed({ hasPool: false as const, total: 0, available: 0, waitMs: 0 }),
           ),
           markRateLimited: Effect.fn("TestProvider.markRateLimited")(() => Effect.void),
+          removeKey: Effect.fn("TestProvider.removeKey")(() => Effect.void),
           closest: Effect.fn("TestProvider.closest")((providerID) =>
             Effect.succeed(providerID === row.id ? { providerID: row.id, modelID: mdl.id } : undefined),
           ),

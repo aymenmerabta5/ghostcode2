@@ -1073,71 +1073,146 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
-    } else if (inputText.startsWith("/workflow ") || inputText === "/workflow") {
-      move.startSubmit()
-      const parts = inputText.slice(1).split(/\s+/)
-      const wfName = parts[1]
-      if (!wfName) {
-        toast.show({ message: "Usage: /workflow <name> [args]", variant: "error" })
+    } else if (inputText.trimStart().startsWith("/")) {
+      const firstLine = inputText.split("\n")[0].trimStart()
+      // Handle /workflows and /workflow specially
+      if (firstLine === "/workflows" || firstLine.startsWith("/workflows ") || firstLine === "/workflow" || firstLine.startsWith("/workflow ") || firstLine.startsWith("/workflow\t")) {
+        const { parseWorkflowCommand } = await import("../dialog-workflow-helpers")
+        const { parseWorkflowArgs, extractReservedBudget } = await import("./workflow-autocomplete")
+        move.startSubmit()
+        const cmd = parseWorkflowCommand(firstLine)
+        if (!cmd || cmd.type === "dashboard") {
+          dialog.replace(() => <DialogWorkflow />)
+        } else {
+          try {
+            const workflows = await sdk.client.workflow.list().then((r) => r.data ?? []).catch(() => [] as any[])
+            const meta = workflows.find((w: any) => w.name === cmd.name)?.meta?.arguments as Record<string, { type?: string }> | undefined
+            const rawArgs = parseWorkflowArgs(cmd.args, meta ?? {})
+            const { args: coercedArgs, budget, error: budgetError } = extractReservedBudget(rawArgs, meta ?? {})
+            if (budgetError) {
+              toast.show({ message: budgetError, variant: "error" })
+            } else {
+              const payload: any = {}
+              if (Object.keys(coercedArgs).length > 0) payload.args = coercedArgs
+              if (budget !== undefined) payload.budget = budget
+              const result = await sdk.client.workflow.start({ name: cmd.name, workflowStartPayload: payload })
+              if (result.data) dialog.replace(() => <DialogWorkflow openRunID={result.data!.id} />)
+            }
+          } catch (err) {
+            toast.show({ message: err instanceof Error ? err.message : "Failed to start workflow", variant: "error" })
+          }
+        }
+      } else if (tuiSlashes().some((s) => s.display === firstLine.split(" ")[0])) {
+        move.startSubmit()
+        const entry = tuiSlashes().find((s) => s.display === firstLine.split(" ")[0])
+        if (entry) entry.onSelect()
       } else {
-        const argParts = parts.slice(2)
-        const args: Record<string, unknown> = {}
-        for (const arg of argParts) {
-          const eq = arg.indexOf("=")
-          if (eq > 0) {
-            const key = arg.slice(0, eq).replace(/^--?/, "")
-            const val = arg.slice(eq + 1)
-            args[key] = val
+        // Try direct workflow command /<name> (workflows become /<name> commands)
+        const { parseDirectWorkflowCommand } = await import("../dialog-workflow-helpers")
+        const { parseWorkflowArgs, extractReservedBudget } = await import("./workflow-autocomplete")
+        const direct = parseDirectWorkflowCommand(firstLine)
+        if (direct) {
+          const workflows = await sdk.client.workflow.list().then((r) => r.data ?? []).catch(() => [] as any[])
+          const exists = workflows.some((w: any) => w.name === direct.name)
+          const isReserved = tuiSlashes().some((s) => s.display === `/${direct.name}`)
+          const isServerCmd = sync.data.command.some((x) => x.name === direct.name)
+          if (exists && !isReserved && !isServerCmd) {
+            move.startSubmit()
+            try {
+              const meta = workflows.find((w: any) => w.name === direct.name)?.meta?.arguments as any
+              const rawArgs = parseWorkflowArgs(direct.args, meta ?? {})
+              const { args: coercedArgs, budget, error: budgetError } = extractReservedBudget(rawArgs, meta ?? {})
+              if (budgetError) toast.show({ message: budgetError, variant: "error" })
+              else {
+                const payload: any = {}
+                if (Object.keys(coercedArgs).length > 0) payload.args = coercedArgs
+                if (budget !== undefined) payload.budget = budget
+                const result = await sdk.client.workflow.start({ name: direct.name, workflowStartPayload: payload })
+                if (result.data) dialog.replace(() => <DialogWorkflow openRunID={result.data!.id} />)
+              }
+            } catch (err) {
+              toast.show({ message: err instanceof Error ? err.message : "Failed to start workflow", variant: "error" })
+            }
+          } else if (isServerCmd || sync.data.command.some((x) => x.name === firstLine.split(" ")[0].slice(1))) {
+            move.startSubmit()
+            const firstLineEnd = inputText.indexOf("\n")
+            const fl = firstLineEnd === -1 ? inputText : inputText.slice(0, firstLineEnd)
+            const [command, ...firstLineArgs] = fl.split(" ")
+            const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
+            const cmdArgs = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
+            void sdk.client.session.command({ sessionID, command: command.slice(1), arguments: cmdArgs || undefined }).catch((e) => toast.error(e))
+          } else if (tuiSlashes().some((s) => s.display === firstLine.split(" ")[0])) {
+            move.startSubmit()
+            const entry = tuiSlashes().find((s) => s.display === firstLine.split(" ")[0])
+            if (entry) entry.onSelect()
           } else {
-            args[arg.replace(/^--?/, "")] = true
+            // Check server commands again for multi-word?
+            const firstLineEnd = inputText.indexOf("\n")
+            const fl = firstLineEnd === -1 ? inputText : inputText.slice(0, firstLineEnd)
+            const cmdName = fl.split(" ")[0].slice(1)
+            if (sync.data.command.some((x) => x.name === cmdName)) {
+              move.startSubmit()
+              const [command, ...firstLineArgs] = fl.split(" ")
+              const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
+              const cmdArgs = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
+              void sdk.client.session.command({ sessionID, command: command.slice(1), arguments: cmdArgs || undefined }).catch((e) => toast.error(e))
+            } else {
+              // Not a known slash, treat as normal prompt (allow /<workflow> autocomplete to still work if workflow not yet discovered)
+              // Fall through to normal prompt handling
+              move.startSubmit()
+              sdk.client.session
+                .prompt({
+                  sessionID,
+                  ...selectedModel,
+                  agent: agent.name,
+                  model: selectedModel,
+                  variant,
+                  parts: [...editorParts, { type: "text", text: inputText }, ...nonTextParts],
+                })
+                .catch((error) => {
+                  toast.show({ message: errorMessage(error), variant: "error" })
+                })
+              // Skip the remaining else blocks by returning early from this synthetic branch
+              // We need to avoid double submit, so we jump to after the big if-else via a flag
+              // For simplicity, we will not enter the next else if
+            }
+          }
+        } else {
+          // Not a direct workflow, check server commands
+          const cmdName = firstLine.split(" ")[0].slice(1)
+          if (sync.data.command.some((x) => x.name === cmdName)) {
+            move.startSubmit()
+            const firstLineEnd = inputText.indexOf("\n")
+            const fl = firstLineEnd === -1 ? inputText : inputText.slice(0, firstLineEnd)
+            const [command, ...firstLineArgs] = fl.split(" ")
+            const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
+            const cmdArgs = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
+            void sdk.client.session.command({ sessionID, command: command.slice(1), arguments: cmdArgs || undefined }).catch((e) => toast.error(e))
+          } else {
+            // Check TUI slashes again (in case of alias)
+            const tuiMatch = tuiSlashes().find((s) => s.display === firstLine.split(" ")[0] || s.aliases?.includes(firstLine.split(" ")[0] as any))
+            if (tuiMatch) {
+              move.startSubmit()
+              tuiMatch.onSelect()
+            } else {
+              // Normal prompt
+              move.startSubmit()
+              sdk.client.session
+                .prompt({
+                  sessionID,
+                  ...selectedModel,
+                  agent: agent.name,
+                  model: selectedModel,
+                  variant,
+                  parts: [...editorParts, { type: "text", text: inputText }, ...nonTextParts],
+                })
+                .catch((error) => {
+                  toast.show({ message: errorMessage(error), variant: "error" })
+                })
+            }
           }
         }
-        try {
-          const result = await sdk.client.workflow.start({
-            name: wfName,
-            workflowStartPayload: Object.keys(args).length > 0 ? { args } : undefined,
-          })
-          if (result.data) {
-            dialog.replace(() => <DialogWorkflow openRunID={result.data!.id} />)
-          }
-        } catch (err) {
-          toast.show({
-            message: err instanceof Error ? err.message : "Failed to start workflow",
-            variant: "error",
-          })
-        }
       }
-    } else if (
-      inputText.startsWith("/") &&
-      tuiSlashes().some((s) => s.display === inputText.split("\n")[0].split(" ")[0])
-    ) {
-      move.startSubmit()
-      const cmdName = inputText.split("\n")[0].split(" ")[0]
-      const entry = tuiSlashes().find((s) => s.display === cmdName)
-      if (entry) {
-        entry.onSelect()
-      }
-    } else if (
-      inputText.startsWith("/") &&
-      sync.data.command.some((x) => x.name === inputText.split("\n")[0].split(" ")[0].slice(1))
-    ) {
-      move.startSubmit()
-      // Parse command from first line, preserve multi-line content in arguments
-      const firstLineEnd = inputText.indexOf("\n")
-      const firstLine = firstLineEnd === -1 ? inputText : inputText.slice(0, firstLineEnd)
-      const [command, ...firstLineArgs] = firstLine.split(" ")
-      const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
-      const args = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
-
-      void sdk.client.session.command({
-        sessionID,
-        command: command.slice(1),
-        arguments: args,
-        agent: agent.name,
-        model: `${selectedModel.providerID}/${selectedModel.modelID}`,
-        variant,
-        parts: nonTextParts.filter((x) => x.type === "file"),
-      })
     } else {
       move.startSubmit()
       sdk.client.session

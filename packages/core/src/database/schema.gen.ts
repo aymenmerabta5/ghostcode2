@@ -236,6 +236,46 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`
+        CREATE TABLE \`goal\` (
+          \`session_id\` text NOT NULL,
+          \`text\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`budget_tokens\` integer,
+          \`tokens_used\` integer NOT NULL DEFAULT 0,
+          \`time_ms\` integer NOT NULL DEFAULT 0,
+          \`started_at\` integer NOT NULL,
+          \`paused_at\` integer,
+          \`completed_at\` integer,
+          \`verification\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          PRIMARY KEY (\`session_id\`),
+          FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON UPDATE no action ON DELETE cascade
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`workflow_run\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text,
+          \`directory\` text DEFAULT '' NOT NULL,
+          \`workflow\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`started_at\` integer NOT NULL,
+          \`completed_at\` integer,
+          \`current_phase\` text,
+          \`args\` text,
+          \`definition\` text,
+          \`logs\` text NOT NULL,
+          \`agents\` text NOT NULL,
+          \`result\` text,
+          \`error\` text,
+          \`resume_of\` text,
+          \`pending_question\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(
@@ -269,6 +309,9 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`goal_session_idx\` ON \`goal\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`workflow_run_started_at_idx\` ON \`workflow_run\` (\`started_at\`);`)
+      yield* tx.run(`CREATE INDEX \`workflow_run_status_started_at_idx\` ON \`workflow_run\` (\`status\`,\`started_at\`);`)
     })
   },
 } satisfies Omit<DatabaseMigration.Migration, "id">

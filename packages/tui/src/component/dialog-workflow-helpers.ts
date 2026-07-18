@@ -365,6 +365,9 @@ export function sanitizeWorkflowFilename(name: string): string | undefined {
   if (!trimmed) return undefined
   if (trimmed === "." || trimmed === "..") return undefined
   if (/[\\/]/.test(trimmed)) return undefined
+  // Match server validation: alphanumeric, hyphen, underscore only (direct command charset)
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) return undefined
+  if (trimmed.length > 64) return undefined
   return trimmed
 }
 

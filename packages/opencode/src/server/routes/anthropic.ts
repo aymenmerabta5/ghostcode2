@@ -1,6 +1,6 @@
 import { Context, Effect, Stream } from "effect"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { generateText, jsonSchema, streamText, tool, type ToolSet } from "ai"
+import { generateText, jsonSchema, streamText, tool, wrapLanguageModel, type ToolSet } from "ai"
 import { z } from "zod"
 import { Provider, type Model } from "@/provider/provider"
 import { InstanceStore } from "@/project/instance-store"
@@ -9,8 +9,40 @@ import { Resume } from "@/session/resume"
 import { AppRuntime } from "@/effect/app-runtime"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderTransform } from "@/provider/transform"
+import { EffortUtil } from "@/util/effort"
+import { mergeDeep } from "remeda"
 
 const ROTATE_COOLDOWN_MS = 60_000
+const CONNECTION_COOLDOWN_MS = 5_000
+const STALL_TIMEOUT_MS = 120_000
+
+function deriveSessionID(
+  httpRequest: HttpServerRequest.HttpServerRequest,
+  providerID: string,
+  modelID: string,
+  _system: string,
+): string {
+  const headers = (httpRequest.headers ?? {}) as Record<string, string>
+  const getHeader = (name: string) => {
+    const lower = name.toLowerCase()
+    return headers[lower] ?? headers[name] ?? (headers as any)[lower.toLowerCase()]
+  }
+  // Only stable session-affinity headers — x-request-id is per-request and would bust cache.
+  // Keep order: explicit opencode session first, then generic session ids.
+  const candidates = [
+    getHeader("x-opencode-session"),
+    getHeader("x-session-id"),
+    getHeader("x-session-affinity"),
+    getHeader("x-parent-session-id"),
+    getHeader("anthropic-session-id"),
+    getHeader("session-id"),
+  ].filter(Boolean) as string[]
+  if (candidates.length > 0) return candidates[0]!
+  // Stable fallback per provider/model — system hash previously caused cache busts when
+  // system prompt had dynamic parts. For 1M context windows we want max cache reuse.
+  return `anthropic-${providerID}-${modelID}`
+}
 
 const messageParamSchema = z.object({
   role: z.enum(["user", "assistant", "system"]),
@@ -23,6 +55,12 @@ const thinkingSchema = z.object({
   type: z.enum(["enabled", "disabled", "adaptive"]).optional(),
   budget_tokens: z.number().optional(),
 })
+
+const outputConfigSchema = z
+  .object({
+    effort: z.string().optional(),
+  })
+  .passthrough()
 
 const messagesRequestSchema = z.object({
   model: z.string(),
@@ -37,6 +75,9 @@ const messagesRequestSchema = z.object({
   tools: z.array(z.any()).optional(),
   tool_choice: z.any().optional(),
   thinking: z.union([z.boolean(), thinkingSchema]).optional(),
+  output_config: outputConfigSchema.optional(),
+  // Some clients send effort top-level or inside output_config
+  effort: z.string().optional(),
 })
 
 function exposedModelID(providerID: string, modelID: string): string {
@@ -72,29 +113,60 @@ function toModelMessages(input: MessageParam[]): any[] {
     }
   }
 
-  return input.flatMap((m): any[] => {
-    const role = m.role === "system" ? "system" : m.role
-    if (typeof m.content === "string") {
-      return [{ role, content: m.content }]
+  const result = input.flatMap((m): any[] => {
+    const isSystem = m.role === "system"
+    // System messages should have been merged upstream, but handle defensively
+    if (isSystem) {
+      const text = typeof m.content === "string" ? m.content : m.content.map((p: any) => p.text ?? p.thinking ?? "").join("\n")
+      if (!text.trim()) return []
+      // Return as system with string content (AI SDK requires string for system)
+      return [{ role: "system", content: text }]
     }
-    const parts = m.content.map((part: any): any => {
-      if (part.type === "text") return { type: "text", text: part.text }
-      if (part.type === "image") {
-        return { type: "image", image: part.source.data, mimeType: part.source.media_type }
-      }
-      if (part.type === "tool_use") {
-        return { type: "tool-call", toolCallId: part.id, toolName: part.name, input: part.input ?? {} }
-      }
-      if (part.type === "tool_result") {
-        return {
-          type: "tool-result",
-          toolCallId: part.tool_use_id,
-          toolName: toolNameById.get(part.tool_use_id) ?? "",
-          output: toolResultOutput(part),
+    const role = m.role as any
+    if (typeof m.content === "string") {
+      // Ensure non-empty
+      return [{ role, content: m.content || " " }]
+    }
+    const parts = m.content
+      .map((part: any): any => {
+        if (part.type === "text") return { type: "text", text: part.text ?? "" }
+        if (part.type === "image") {
+          return { type: "image", image: part.source.data, mimeType: part.source.media_type }
         }
-      }
-      return { type: "text", text: "" }
-    })
+        if (part.type === "tool_use") {
+          return { type: "tool-call", toolCallId: part.id, toolName: part.name || "unknown_tool", input: part.input ?? {} }
+        }
+        if (part.type === "tool_result") {
+          const resolvedName = toolNameById.get(part.tool_use_id) || (part as any).name || part.tool_use_id || "unknown_tool"
+          let output: any
+          try {
+            const raw = toolResultOutput(part)
+            if (raw.type === "text" || raw.type === "error-text") {
+              output = { type: "text", value: raw.value || " " }
+            } else if (raw.type === "content") {
+              const text = raw.value
+                .map((b: any) => (b.type === "text" ? b.text : b.type === "media" ? "[media]" : ""))
+                .join("\n")
+              output = { type: "text", value: text || " " }
+            } else {
+              output = { type: "text", value: String(raw.value ?? " ") }
+            }
+          } catch {
+            output = { type: "text", value: " " }
+          }
+          return {
+            type: "tool-result",
+            toolCallId: part.tool_use_id || `tool_${Math.random().toString(36).slice(2)}`,
+            toolName: resolvedName,
+            output,
+          }
+        }
+        return null
+      })
+      .filter(Boolean)
+
+    if (parts.length === 0) return []
+
     if (m.role === "user" && parts.some((p: any) => p.type === "tool-result")) {
       const toolResults = parts.filter((p: any) => p.type === "tool-result")
       const rest = parts.filter((p: any) => p.type !== "tool-result")
@@ -102,8 +174,22 @@ function toModelMessages(input: MessageParam[]): any[] {
       if (rest.length > 0) messages.push({ role: "user", content: rest })
       return messages
     }
+
+    if (parts.length === 0 && role === "assistant") {
+      return [{ role, content: [{ type: "text", text: "" }] }]
+    }
+
     return [{ role, content: parts }]
   })
+
+  // Reorder: system messages must be first for AI SDK validation
+  const systemMsgs = result.filter((m: any) => m.role === "system")
+  const nonSystem = result.filter((m: any) => m.role !== "system")
+  if (systemMsgs.length > 0) {
+    const mergedSystem = systemMsgs.map((m: any) => (typeof m.content === "string" ? m.content : m.content.map((p: any) => p.text).join("\n"))).join("\n\n")
+    return [{ role: "system", content: mergedSystem }, ...nonSystem]
+  }
+  return result
 }
 
 function parseModelID(raw: string): { providerID: string; modelID: string } | undefined {
@@ -122,14 +208,22 @@ function toAnthropicToolChoice(input: any): any {
   return undefined
 }
 
-function toAITools(input: any[] | undefined): ToolSet | undefined {
+function toAITools(input: any[] | undefined, model?: Model): ToolSet | undefined {
   if (!input || input.length === 0) return undefined
   const result: ToolSet = {}
-  for (const item of input) {
-    result[item.name] = tool({
+  const isOpenAIResponses =
+    model?.api.npm === "@ai-sdk/openai" ||
+    model?.api.npm === "@ai-sdk/azure" ||
+    model?.api.npm === "@ai-sdk/amazon-bedrock/mantle"
+  const sorted = [...input].toSorted((a, b) => (a.name ?? "").localeCompare(b.name ?? ""))
+  for (const item of sorted) {
+    const t = tool({
       description: item.description,
       inputSchema: jsonSchema(item.input_schema as any),
-    })
+    }) as any
+    // Parity with TUI request.ts:149-158 - OpenAI Responses family hardcodes strict:false
+    if (isOpenAIResponses) t.strict = false
+    result[item.name] = t
   }
   return result
 }
@@ -156,6 +250,74 @@ function estimateTokens(messages: MessageParam[], system?: string | any[]): numb
   return Math.ceil(text.length / 4)
 }
 
+function parseRequestedEffort(body: z.infer<typeof messagesRequestSchema>): string | undefined {
+  const oc = (body as any).output_config?.effort
+  if (typeof oc === "string" && oc.trim() !== "") return oc.trim().toLowerCase()
+  const direct = (body as any).effort
+  if (typeof direct === "string" && direct.trim() !== "") return direct.trim().toLowerCase()
+  const thinking = body.thinking
+  if (thinking && typeof thinking === "object") {
+    // If thinking is adaptive with no explicit effort, default to high when enabled?
+    // For now we don't infer from budget_tokens, let Claude's effort param handle it.
+    // But if thinking is disabled, we should return "none" to disable reasoning.
+    const t = thinking as any
+    if (t.type === "disabled") return "none"
+  }
+  if (thinking === false) return "none"
+  return undefined
+}
+
+function resolveModelEffort(requested: string | undefined, model: Model): string | undefined {
+  if (!requested) return undefined
+  const variants = model.variants ? Object.keys(model.variants) : []
+  if (variants.length === 0) return undefined
+  // Use shared util that does flexible mapping: exact match, then next stronger, then fallback to strongest.
+  const resolved = EffortUtil.resolveEffort(requested, variants)
+  if (resolved) return resolved
+  // Additional flexible fallback for xhigh<->max mapping when util returns undefined due to unknown rank
+  // Our EffortUtil already handles known ranks, but handle edge case where requested is unknown string.
+  const lower = requested.toLowerCase()
+  if (variants.includes(lower)) return lower
+  // If requested is max and model has xhigh, map max->xhigh
+  if (lower === "max" && variants.includes("xhigh")) return "xhigh"
+  // If requested is xhigh and model has max but not xhigh, map xhigh->max (e.g. glm-5.2)
+  if (lower === "xhigh" && variants.includes("max")) return "max"
+  return undefined
+}
+
+function buildProviderOptions(
+  model: Model,
+  effortVariant: string | undefined,
+  sessionID: string,
+): { raw: Record<string, any>; wrapped: Record<string, any> } {
+  const base = ProviderTransform.options({
+    model,
+    sessionID,
+    providerOptions: {},
+  })
+  const mergedBase = mergeDeep(mergeDeep(base, model.options ?? {}), effortVariant && model.variants?.[effortVariant] ? model.variants[effortVariant] : {}) as Record<string, any>
+
+  // Ensure prompt caching works for all providers, including cloudflare-workers-ai.
+  // TUI core runner sets { openai: { promptCacheKey } } universally for native runtime.
+  // For AI SDK path, we need promptCacheKey in raw options so providerOptions mapping emits it
+  // under the correct provider key (openai, cloudflare-workers-ai, etc).
+  const withCache = {
+    ...mergedBase,
+    promptCacheKey: (mergedBase as any).promptCacheKey ?? sessionID,
+    prompt_cache_key: (mergedBase as any).prompt_cache_key ?? sessionID,
+  } as Record<string, any>
+
+  // For gateway / openrouter compatibility, keep both forms
+  if (model.providerID === "openrouter" || model.api.npm === "@openrouter/ai-sdk-provider") {
+    withCache.prompt_cache_key = sessionID
+  }
+
+  return {
+    raw: withCache,
+    wrapped: ProviderTransform.providerOptions(model, withCache),
+  }
+}
+
 function toAnthropicStopReason(finishReason: string | undefined): string {
   switch (finishReason) {
     case "stop":
@@ -169,7 +331,7 @@ function toAnthropicStopReason(finishReason: string | undefined): string {
   }
 }
 
-type RouteErrorKind = "ratelimit" | "exhausted"
+type RouteErrorKind = "ratelimit" | "exhausted" | "connection" | "invalid"
 type RouteError = { kind: RouteErrorKind; retryAfterMs?: number }
 
 function apiErrorDetails(error: unknown): {
@@ -241,6 +403,9 @@ export function classifyRouteError(error: unknown): RouteError | undefined {
   const lowerMessage = message.toLowerCase()
   const lowerBody = body.toLowerCase()
   const retryAfterMs = parseRetryAfterMs(headers)
+  if (lowerBody.includes("billing verification failed") || lowerMessage.includes("billing verification failed")) {
+    return { kind: "invalid", retryAfterMs }
+  }
   if (lowerBody.includes("used up your") || lowerMessage.includes("used up your")) {
     return { kind: "exhausted", retryAfterMs }
   }
@@ -259,16 +424,22 @@ export function classifyRouteError(error: unknown): RouteError | undefined {
     return { kind: "ratelimit", retryAfterMs }
   }
   if (isConnectionLevelFailure(error)) {
-    return { kind: "ratelimit" }
+    return { kind: "connection", retryAfterMs: CONNECTION_COOLDOWN_MS }
   }
   return undefined
 }
 
 function routeCooldownOpts(cls: RouteError): { retryAfterMs?: number; exhausted?: boolean } {
+  if (cls.kind === "invalid") {
+    return { retryAfterMs: 0 }
+  }
   if (cls.kind === "exhausted") {
     const now = new Date()
     const midnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0))
     return { retryAfterMs: midnight.getTime() - now.getTime() }
+  }
+  if (cls.kind === "connection") {
+    return { retryAfterMs: Math.max(cls.retryAfterMs ?? 0, CONNECTION_COOLDOWN_MS) }
   }
   return { retryAfterMs: Math.max(cls.retryAfterMs ?? 0, ROTATE_COOLDOWN_MS) }
 }
@@ -331,7 +502,19 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
   return Effect.gen(function* () {
     const ctx = yield* InstanceStore.use.load({ directory })
     return yield* Effect.gen(function* () {
-      const body = messagesRequestSchema.parse(yield* request.json)
+      const raw = yield* request.json
+      // Log incoming request for debugging effort levels
+      try {
+        const maybeEffort = (raw as any).output_config?.effort ?? (raw as any).effort
+        if (maybeEffort) {
+          console.log("[anthropic-api] incoming effort", { model: (raw as any).model, effort: maybeEffort })
+        }
+        const maybeThinking = (raw as any).thinking
+        if (maybeThinking) {
+          console.log("[anthropic-api] incoming thinking", { model: (raw as any).model, thinking: maybeThinking })
+        }
+      } catch {}
+      const body = messagesRequestSchema.parse(raw)
       const parsed = parseModelID(body.model)
       if (!parsed) {
         return HttpServerResponse.jsonUnsafe(
@@ -341,12 +524,49 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
       }
       const providerID = ProviderV2.ID.make(parsed.providerID)
       const modelObj = yield* Provider.use.getModel(providerID, ModelV2.ID.make(parsed.modelID))
-      const system = systemText(body.system)
-      const coreMessages = toModelMessages(body.messages)
-      if (body.stream) {
-        return yield* handleStream(body, modelObj, providerID, system, coreMessages)
+      // Merge any messages with role "system" into top-level system string
+      // AI SDK requires system messages to be first and string content only - having system after user causes
+      // "Invalid prompt: The messages do not match the ModelMessage[] schema."
+      let system = systemText(body.system)
+      const systemFromMessages = body.messages
+        .filter((m: any) => m.role === "system")
+        .map((m: any) => {
+          if (typeof m.content === "string") return m.content
+          return m.content.map((p: any) => p.text ?? p.thinking ?? "").join("\n")
+        })
+        .join("\n\n")
+      if (systemFromMessages) {
+        system = system ? system + "\n\n" + systemFromMessages : systemFromMessages
       }
-      return yield* handleNonStream(body, modelObj, providerID, system, coreMessages)
+      const nonSystemMessages = body.messages.filter((m: any) => m.role !== "system")
+      const coreMessages = toModelMessages(nonSystemMessages)
+
+      const requestedEffort = parseRequestedEffort(body)
+      const resolvedEffort = resolveModelEffort(requestedEffort, modelObj)
+      if (requestedEffort) {
+        console.log("[anthropic-api] effort mapping", {
+          model: body.model,
+          requested: requestedEffort,
+          resolved: resolvedEffort ?? "none",
+          available: Object.keys(modelObj.variants ?? {}),
+        })
+      }
+      const sessionID = deriveSessionID(request, parsed.providerID, parsed.modelID, system)
+      const providerOptions = buildProviderOptions(modelObj, resolvedEffort, sessionID)
+
+      if (body.stream) {
+        return yield* handleStream(
+          body,
+          modelObj,
+          providerID,
+          system,
+          coreMessages,
+          providerOptions,
+          resolvedEffort,
+          request,
+        )
+      }
+      return yield* handleNonStream(body, modelObj, providerID, system, coreMessages, providerOptions, resolvedEffort, request)
     }).pipe(Effect.provideService(InstanceRef, ctx))
   })
 }
@@ -357,6 +577,9 @@ function handleStream(
   providerID: ProviderV2.ID,
   system: string,
   coreMessages: any[],
+  providerOptions: { raw: Record<string, any>; wrapped: Record<string, any> },
+  resolvedEffort: string | undefined,
+  httpRequest: HttpServerRequest.HttpServerRequest,
 ) {
   return Effect.gen(function* () {
     const context = yield* Effect.context()
@@ -365,6 +588,9 @@ function handleStream(
     const messageId = `msg_${crypto.randomUUID()}`
     const abortController = new AbortController()
     let clientGone = false
+    let heartbeatInterval: ReturnType<typeof setInterval> | undefined
+    let stallTimer: ReturnType<typeof setTimeout> | undefined
+    const estimatedInputTokens = estimateTokens(body.messages, body.system)
 
     const readableStream = new ReadableStream({
       async start(controller: ReadableStreamDefaultController) {
@@ -380,6 +606,7 @@ function handleStream(
         let partialText = ""
         let dedupChecked = false
 
+
         const send = (s: string) => {
           if (clientGone) return
           try {
@@ -388,11 +615,27 @@ function handleStream(
             clientGone = true
           }
         }
+        const sendHeartbeat = () => {
+          if (clientGone) return
+          try {
+            controller.enqueue(encoder.encode(`: keepalive ${Date.now()}\n\n`))
+          } catch {
+            clientGone = true
+            if (heartbeatInterval) clearInterval(heartbeatInterval)
+          }
+        }
         const safeClose = () => {
+          if (heartbeatInterval) clearInterval(heartbeatInterval)
+          if (stallTimer) clearTimeout(stallTimer)
           try {
             controller.close()
           } catch {}
         }
+
+        // Send SSE comment ping every 15s to keep connection alive through
+        // proxies and prevent client-side idle timeouts during long thinking
+        // or large context processing (fixes "The operation timed out" in Claude Code)
+        heartbeatInterval = setInterval(sendHeartbeat, 15000)
 
         const startMessage = () => {
           if (messageStarted) return
@@ -408,7 +651,7 @@ function handleStream(
                 content: [],
                 stop_reason: null,
                 stop_sequence: null,
-                usage: { input_tokens: 0, output_tokens: 1 },
+                usage: { input_tokens: estimatedInputTokens, output_tokens: 0 },
               },
             })}\n\n`,
           )
@@ -489,6 +732,28 @@ function handleStream(
                 keyIndex = index
               }),
             )
+            // Parity with TUI llm.ts: wrapLanguageModel with ProviderTransform.message middleware
+            // This ensures surrogate sanitization, reasoning filtering, tool-id scrubbing, etc.
+            const wrappedLanguage = wrapLanguageModel({
+              model: language,
+              middleware: [
+                {
+                  specificationVersion: "v3" as const,
+                  async transformParams(args) {
+                    if (args.type === "stream") {
+                      try {
+                        args.params.prompt = ProviderTransform.message(
+                          args.params.prompt as any,
+                          modelObj,
+                          providerOptions.raw,
+                        ) as any
+                      } catch {}
+                    }
+                    return args.params
+                  },
+                },
+              ],
+            })
 
             let streamError: unknown
             partialReasoning = ""
@@ -502,45 +767,91 @@ function handleStream(
                 keyIndex,
               })
             }
-            const result = streamText({
-              model: language,
-              system,
-              messages,
-              temperature: body.temperature,
-              maxOutputTokens: body.max_tokens,
-              topP: body.top_p,
-              topK: body.top_k,
-              stopSequences: body.stop_sequences,
-              tools: toAITools(body.tools),
-              toolChoice: toAnthropicToolChoice(body.tool_choice),
-              abortSignal: abortController.signal,
-              maxRetries: 0,
-              onError(error: any) {
-                streamError = error.error
-                console.error("[anthropic-api] streamText error", {
-                  keyIndex,
-                  message: error.error instanceof Error ? error.error.message : String(error.error),
-                })
-              },
-            })
+            let result: ReturnType<typeof streamText>
+            try {
+              result = streamText({
+                model: wrappedLanguage,
+                system,
+                messages,
+                temperature: body.temperature,
+                maxOutputTokens: body.max_tokens,
+                topP: body.top_p,
+                topK: body.top_k,
+                stopSequences: body.stop_sequences,
+                tools: toAITools(body.tools, modelObj),
+                toolChoice: toAnthropicToolChoice(body.tool_choice),
+                providerOptions: providerOptions.wrapped as any,
+                abortSignal: abortController.signal,
+                maxRetries: 0,
+                onError(error: any) {
+                  streamError = error.error
+                  console.error("[anthropic-api] streamText error", {
+                    keyIndex,
+                    message: error.error instanceof Error ? error.error.message : String(error.error),
+                  })
+                },
+              })
+            } catch (e) {
+              console.error("[anthropic-api] streamText SYNC error - messages dump", {
+                keyIndex,
+                error: e instanceof Error ? e.message : String(e),
+                stack: e instanceof Error ? e.stack?.slice(0, 2000) : undefined,
+                systemLen: system.length,
+                messagesLen: messages.length,
+                messagesSample: JSON.stringify(messages.slice(-5), null, 2).slice(0, 8000),
+                coreMessagesSample: JSON.stringify(coreMessages.slice(-5), null, 2).slice(0, 8000),
+                allMessages: JSON.stringify(messages, null, 2).slice(0, 20000),
+              })
+              throw e
+            }
 
             const attemptStart = Date.now()
             let gotFirstContent = false
-            console.log("[anthropic-api] streamText start", { keyIndex, attempt, resumeChars: resumeContent.length })
+            if (stallTimer) clearTimeout(stallTimer)
+            stallTimer = setTimeout(() => {
+              if (!gotFirstContent) {
+                console.error("[anthropic-api] STALL timeout - no content after 120s", { keyIndex, attempt })
+                abortController.abort(new Error("SSE stalled - no content after 120s"))
+              }
+            }, STALL_TIMEOUT_MS)
+            console.log("[anthropic-api] streamText start", {
+              keyIndex,
+              attempt,
+              resumeChars: resumeContent.length,
+              requestedEffort: (body as any).output_config?.effort ?? (body as any).effort,
+              resolvedEffort,
+              providerOptionsKeys: Object.keys(providerOptions.wrapped),
+              providerOptionsRawKeys: Object.keys(providerOptions.raw),
+              inputTokens: estimatedInputTokens,
+              sessionID: (providerOptions.raw as any).promptCacheKey,
+            })
 
             try {
               startMessage()
               finishReason = undefined
               hadToolCall = false
               dedupChecked = false
+              // Incremental tool streaming state - parity with TUI ai-sdk.ts tool-input-delta handling
+              const toolBlocks = new Map<string, { blockIndex: number; toolName: string; hasDelta: boolean }>()
 
               for await (const part of result.fullStream) {
                 if (clientGone) break
+                // TTFT for any first content including tool calls - fixes missing TTFT logs
                 if (
                   !gotFirstContent &&
-                  (part.type === "text-delta" || part.type === "reasoning-start" || part.type === "reasoning-delta")
+                  (part.type === "text-delta" ||
+                    part.type === "text-start" ||
+                    part.type === "reasoning-start" ||
+                    part.type === "reasoning-delta" ||
+                    part.type === "tool-input-start" ||
+                    part.type === "tool-call" ||
+                    part.type === "tool-input-delta")
                 ) {
                   gotFirstContent = true
+                  if (stallTimer) {
+                    clearTimeout(stallTimer)
+                    stallTimer = undefined
+                  }
                   console.log("[anthropic-api] TTFT", {
                     keyIndex,
                     attempt,
@@ -548,7 +859,10 @@ function handleStream(
                     partType: part.type,
                   })
                 }
-                if (part.type === "text-delta") {
+                if (part.type === "text-start") {
+                  contentStarted = true
+                  openTextBlock()
+                } else if (part.type === "text-delta") {
                   contentStarted = true
                   let text = (part as any).text
                   if (resumeContent && !dedupChecked) {
@@ -558,10 +872,13 @@ function handleStream(
                   }
                   partialText += text
                   emitTextDelta(text)
+                } else if (part.type === "text-end") {
+                  closeBlock()
                 } else if (part.type === "reasoning-start") {
                   contentStarted = true
                   openThinkingBlock()
                 } else if (part.type === "reasoning-delta") {
+                  contentStarted = true
                   const reasoning = (part as any).text ?? (part as any).delta ?? (part as any).reasoning ?? ""
                   partialReasoning += reasoning
                   emitThinkingDelta(reasoning)
@@ -572,8 +889,79 @@ function handleStream(
                 } else if (part.type === "error") {
                   closeBlock()
                   throw (part as any).error
+                } else if (part.type === "tool-input-start") {
+                  // Incremental tool streaming - TUI parity: emit block start immediately
+                  hadToolCall = true
+                  contentStarted = true
+                  const toolCallId = (part as any).id
+                  const toolName = (part as any).toolName
+                  closeBlock()
+                  send(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: "content_block_start",
+                      index: blockIndex,
+                      content_block: {
+                        type: "tool_use",
+                        id: toolCallId,
+                        name: toolName,
+                        input: {},
+                      },
+                    })}\n\n`,
+                  )
+                  blockType = "tool_use" as any
+                  toolBlocks.set(toolCallId, { blockIndex, toolName, hasDelta: false })
+                  // blockIndex will be incremented on close
+                } else if (part.type === "tool-input-delta") {
+                  const toolCallId = (part as any).id
+                  const delta = (part as any).delta ?? (part as any).inputTextDelta ?? ""
+                  if (!delta) continue
+                  let state = toolBlocks.get(toolCallId)
+                  if (!state) {
+                    // Fallback if start was missed - open block
+                    closeBlock()
+                    const toolName = (part as any).toolName ?? toolBlocks.get(toolCallId)?.toolName ?? "unknown"
+                    send(
+                      `event: content_block_start\ndata: ${JSON.stringify({
+                        type: "content_block_start",
+                        index: blockIndex,
+                        content_block: {
+                          type: "tool_use",
+                          id: toolCallId,
+                          name: toolName,
+                          input: {},
+                        },
+                      })}\n\n`,
+                    )
+                    blockType = "tool_use" as any
+                    state = { blockIndex, toolName, hasDelta: false }
+                    toolBlocks.set(toolCallId, state)
+                  }
+                  state.hasDelta = true
+                  send(
+                    `event: content_block_delta\ndata: ${JSON.stringify({
+                      type: "content_block_delta",
+                      index: state.blockIndex,
+                      delta: { type: "input_json_delta", partial_json: delta },
+                    })}\n\n`,
+                  )
+                } else if (part.type === "tool-input-end") {
+                  const toolCallId = (part as any).id
+                  const state = toolBlocks.get(toolCallId)
+                  if (state && blockType === "tool_use") {
+                    closeBlock()
+                  }
                 } else if (part.type === "tool-call") {
                   hadToolCall = true
+                  contentStarted = true
+                  const toolCallId = (part as any).toolCallId
+                  const toolName = (part as any).toolName
+                  const state = toolBlocks.get(toolCallId)
+                  if (state?.hasDelta) {
+                    // Already streamed incrementally - just ensure block is closed
+                    if (blockType) closeBlock()
+                    continue
+                  }
+                  // Fallback: no incremental deltas - emit whole JSON as one delta (old behavior)
                   closeBlock()
                   const input = JSON.stringify(toolInput(part))
                   send(
@@ -582,8 +970,8 @@ function handleStream(
                       index: blockIndex,
                       content_block: {
                         type: "tool_use",
-                        id: (part as any).toolCallId,
-                        name: (part as any).toolName,
+                        id: toolCallId,
+                        name: toolName,
                         input: {},
                       },
                     })}\n\n`,
@@ -614,6 +1002,10 @@ function handleStream(
                 return
               }
 
+              if (stallTimer) {
+                clearTimeout(stallTimer)
+                stallTimer = undefined
+              }
               console.log("[anthropic-api] streamText success", {
                 keyIndex,
                 attempt,
@@ -662,9 +1054,13 @@ function handleStream(
                 durationMs: Date.now() - attemptStart,
               })
               if (cls && rotation) {
-                await run(
-                  Provider.use.markRateLimited(providerID, keyIndex, routeCooldownOpts(cls)),
-                ).catch(() => undefined)
+                if (cls.kind === "invalid") {
+                  await run(Provider.use.removeKey(providerID, keyIndex)).catch(() => undefined)
+                } else {
+                  await run(
+                    Provider.use.markRateLimited(providerID, keyIndex, routeCooldownOpts(cls)),
+                  ).catch(() => undefined)
+                }
                 if (contentStarted) {
                   const chunk = partialReasoning + (partialText ? "\n\n" + partialText : "")
                   if (chunk)
@@ -714,6 +1110,8 @@ function handleStream(
       },
       cancel() {
         clientGone = true
+        if (heartbeatInterval) clearInterval(heartbeatInterval)
+        if (stallTimer) clearTimeout(stallTimer)
         abortController.abort()
       },
     })
@@ -722,8 +1120,9 @@ function handleStream(
     return HttpServerResponse.stream(stream, {
       headers: {
         "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       },
     })
   })
@@ -735,6 +1134,9 @@ function handleNonStream(
   providerID: ProviderV2.ID,
   system: string,
   coreMessages: any[],
+  providerOptions: { raw: Record<string, any>; wrapped: Record<string, any> },
+  resolvedEffort: string | undefined,
+  _httpRequest: HttpServerRequest.HttpServerRequest,
 ) {
   return Effect.gen(function* () {
     const context = yield* Effect.context()
@@ -757,10 +1159,39 @@ function handleNonStream(
               keyIndex = index
             }),
           )
+          const wrappedLanguage = wrapLanguageModel({
+            model: language,
+            middleware: [
+              {
+                specificationVersion: "v3" as const,
+                async transformParams(args) {
+                  if (args.type === "generate") {
+                    try {
+                      args.params.prompt = ProviderTransform.message(
+                        args.params.prompt as any,
+                        modelObj,
+                        providerOptions.raw,
+                      ) as any
+                    } catch {}
+                  }
+                  return args.params
+                },
+              },
+            ],
+          })
 
           try {
+            console.log("[anthropic-api] generateText start", {
+              model: body.model,
+              requestedEffort: (body as any).output_config?.effort ?? (body as any).effort,
+              resolvedEffort,
+              providerOptionsKeys: Object.keys(providerOptions.wrapped),
+              messagesLen: coreMessages.length,
+              systemLen: system.length,
+              sessionID: (providerOptions.raw as any).promptCacheKey,
+            })
             const result = await generateText({
-              model: language,
+              model: wrappedLanguage,
               system,
               messages: coreMessages,
               temperature: body.temperature,
@@ -768,8 +1199,9 @@ function handleNonStream(
               topP: body.top_p,
               topK: body.top_k,
               stopSequences: body.stop_sequences,
-              tools: toAITools(body.tools),
+              tools: toAITools(body.tools, modelObj),
               toolChoice: toAnthropicToolChoice(body.tool_choice),
+              providerOptions: providerOptions.wrapped as any,
               maxRetries: 0,
             })
 
@@ -794,9 +1226,18 @@ function handleNonStream(
               },
             })
           } catch (error) {
+            console.error("[anthropic-api] generateText error - dump", {
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack?.slice(0, 3000) : undefined,
+              messagesSample: JSON.stringify(coreMessages.slice(-3), null, 2).slice(0, 10000),
+            })
             const cls = classifyRouteError(error)
             if (cls && rotation) {
-              await run(Provider.use.markRateLimited(providerID, keyIndex, routeCooldownOpts(cls)))
+              if (cls.kind === "invalid") {
+                await run(Provider.use.removeKey(providerID, keyIndex)).catch(() => undefined)
+              } else {
+                await run(Provider.use.markRateLimited(providerID, keyIndex, routeCooldownOpts(cls)))
+              }
               continue
             }
             return HttpServerResponse.jsonUnsafe(
@@ -813,6 +1254,10 @@ function handleNonStream(
           { status: 500 },
         )
       } catch (error) {
+        console.error("[anthropic-api] outer error", {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack?.slice(0, 3000) : undefined,
+        })
         return HttpServerResponse.jsonUnsafe(
           { type: "error", error: { type: "api_error", message: error instanceof Error ? error.message : String(error) } },
           { status: 500 },
@@ -825,16 +1270,22 @@ function handleNonStream(
 export function anthropicRoute(directory: string) {
   return HttpRouter.use((router) =>
     Effect.gen(function* () {
-      yield* router.add("GET", "/api/anthropic/v1/models", () => handleModels(directory))
-      yield* router.add(
-        "POST",
-        "/api/anthropic/v1/messages",
-        (request: HttpServerRequest.HttpServerRequest) => handleMessages(directory, request),
+      const instanceStore = yield* InstanceStore.Service
+      const providerService = yield* Provider.Service
+      const withServices = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(
+          Effect.provideService(InstanceStore.Service, instanceStore),
+          Effect.provideService(Provider.Service, providerService),
+        )
+
+      yield* router.add("GET", "/api/anthropic/v1/models", () => withServices(handleModels(directory)))
+      yield* router.add("POST", "/api/anthropic/v1/messages", (request: HttpServerRequest.HttpServerRequest) =>
+        withServices(handleMessages(directory, request)),
       )
       yield* router.add(
         "POST",
         "/api/anthropic/v1/messages/count_tokens",
-        (request: HttpServerRequest.HttpServerRequest) => handleCountTokens(directory, request),
+        (request: HttpServerRequest.HttpServerRequest) => withServices(handleCountTokens(directory, request)),
       )
     }),
   )

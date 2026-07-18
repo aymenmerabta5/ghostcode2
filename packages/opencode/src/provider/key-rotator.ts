@@ -52,6 +52,7 @@ export interface Interface {
     index: number,
     opts?: { retryAfterMs?: number; exhausted?: boolean },
   ) => Effect.Effect<void>
+  readonly removeKey: (providerID: string, index: number) => Effect.Effect<void>
   readonly hasPool: (providerID: string) => boolean
   readonly getPoolSize: (providerID: string) => number
   readonly hasAvailableKeys: (providerID: string) => Effect.Effect<boolean>
@@ -179,6 +180,44 @@ export const layer = Layer.effect(
           }
 
           yield* writeCooldownsFile(now)
+        })
+      },
+
+      removeKey(providerID, index) {
+        return Effect.gen(function* () {
+          const pool = pools.get(providerID)
+          if (!pool) return
+          if (index < 0 || index >= pool.keys.length) return
+
+          pool.keys.splice(index, 1)
+
+          const newCooldowns = new Map<number, CooldownEntry>()
+          for (const [i, cd] of pool.cooldowns.entries()) {
+            if (i === index) continue
+            const newIndex = i > index ? i - 1 : i
+            newCooldowns.set(newIndex, cd)
+          }
+          pool.cooldowns = newCooldowns
+
+          if (pool.keys.length === 0) {
+            pool.current = 0
+          } else if (pool.current > index) {
+            pool.current--
+          } else if (pool.current >= pool.keys.length) {
+            pool.current = 0
+          }
+
+          const now = yield* Clock.currentTimeMillis
+          yield* writeCooldownsFile(now)
+
+          yield* Effect.tryPromise({
+            try: async () => {
+              const filePath = path.join(Global.Path.data, "providers", providerID, "apiKeys.json")
+              await fs.promises.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {})
+              await fs.promises.writeFile(filePath, JSON.stringify(pool.keys, null, 2))
+            },
+            catch: () => undefined,
+          }).pipe(Effect.ignore)
         })
       },
 

@@ -18,7 +18,13 @@ export type Retryable = {
   message: string
   isRateLimit: boolean
   isExhaustion?: boolean
+  isInvalid?: boolean
   retryAfterMs?: number
+}
+
+function isBillingVerificationFailed(text: string): boolean {
+  const lower = text.toLowerCase()
+  return lower.includes("billing verification failed")
 }
 
 function parseRetryAfter(headers: Record<string, string> | undefined): number | undefined {
@@ -48,6 +54,10 @@ export function retryable(error: Err): Retryable | undefined {
     const lowerBody = body.toLowerCase()
     const lowerMsg = msg.toLowerCase()
     const retryAfterMs = parseRetryAfter(data.responseHeaders as Record<string, string> | undefined)
+
+    if (isBillingVerificationFailed(body) || isBillingVerificationFailed(msg)) {
+      return { message: msg || body || "Billing verification failed", isRateLimit: false, isInvalid: true, retryAfterMs }
+    }
 
     if (lowerBody.includes("used up your") || lowerMsg.includes("used up your")) {
       return { message: msg || "Key exhausted", isRateLimit: false, isExhaustion: true, retryAfterMs }
@@ -99,6 +109,9 @@ export function retryable(error: Err): Retryable | undefined {
       const firstError = (json as any).errors[0]
       if (typeof firstError.message === "string") {
         const errMsg = firstError.message.toLowerCase()
+        if (isBillingVerificationFailed(firstError.message)) {
+          return { message: firstError.message, isRateLimit: false, isInvalid: true }
+        }
         if (errMsg.includes("used up your")) {
           return { message: firstError.message, isRateLimit: false, isExhaustion: true }
         }
@@ -112,6 +125,9 @@ export function retryable(error: Err): Retryable | undefined {
   const msg = (error.data as any)?.message
   if (typeof msg === "string") {
     const lower = msg.toLowerCase()
+    if (isBillingVerificationFailed(msg)) {
+      return { message: msg, isRateLimit: false, isInvalid: true }
+    }
     if (lower.includes("used up your")) {
       return { message: msg, isRateLimit: false, isExhaustion: true }
     }
@@ -159,6 +175,7 @@ export function policy(opts: {
   set: (input: { attempt: number; message: string; next: number; isRateLimit: boolean }) => Effect.Effect<void>
   onRateLimited?: (info: { retryAfterMs?: number }) => void | Effect.Effect<void>
   onKeyExhausted?: (info: { exhausted?: boolean }) => void | Effect.Effect<void>
+  onInvalidKey?: () => void | Effect.Effect<void>
   canRotateKey?: () => Effect.Effect<boolean>
   delay?: (input: { attempt: number; isRateLimit: boolean }) => Effect.Effect<Duration.Duration>
   shouldContinue?: (input: { attempt: number; isRateLimit: boolean }) => Effect.Effect<boolean>
@@ -173,7 +190,7 @@ export function policy(opts: {
       return Effect.gen(function* () {
         const canRotate = opts.canRotateKey ? yield* opts.canRotateKey() : false
         const rotateTrigger = canRotate && isRotateTrigger(error)
-        const treatAsRateLimit = result.isRateLimit || result.isExhaustion || rotateTrigger
+        const treatAsRateLimit = result.isRateLimit || result.isExhaustion || result.isInvalid || rotateTrigger
         const maxRetries = treatAsRateLimit ? MAX_RETRIES_RATE_LIMIT : MAX_RETRIES
         if (meta.attempt > maxRetries) {
           const shouldContinue = opts.shouldContinue
@@ -185,7 +202,10 @@ export function policy(opts: {
         }
         const now = yield* Clock.currentTimeMillis
         if (treatAsRateLimit) {
-          if (result.isExhaustion) {
+          if (result.isInvalid) {
+            const effect = opts.onInvalidKey?.()
+            if (effect && Effect.isEffect(effect)) yield* effect
+          } else if (result.isExhaustion) {
             const effect = opts.onKeyExhausted?.({ exhausted: true })
             if (effect && Effect.isEffect(effect)) yield* effect
           } else {

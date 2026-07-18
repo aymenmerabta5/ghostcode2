@@ -681,6 +681,10 @@ const layer = Layer.effect(
                   keyIndex.current !== undefined
                     ? rotator.markRateLimited(input.model.providerID, keyIndex.current, { exhausted: true })
                     : Effect.void,
+                onInvalidKey: () =>
+                  keyIndex.current !== undefined
+                    ? rotator.removeKey(input.model.providerID, keyIndex.current)
+                    : Effect.void,
                 canRotateKey: () => rotator.hasAvailableKeys(input.model.providerID),
                 delay: ({ isRateLimit }) =>
                   Effect.gen(function* () {
