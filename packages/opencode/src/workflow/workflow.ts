@@ -7,6 +7,7 @@ import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../plugin"
 import * as Truncate from "@/tool/truncate"
@@ -14,7 +15,6 @@ import { Worktree } from "@/worktree"
 import { InstanceStore } from "@/project/instance-store"
 import { Instruction } from "@/session/instruction"
 import { LSP } from "@/lsp/lsp"
-import { Permission as PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { SessionID, MessageID } from "@/session/schema"
@@ -2202,8 +2202,8 @@ const layer = Layer.effect(
                       // Resolve Info effect then Def via Tool.init
                       const info = await run(maybeInfo as any)
                       const { Tool } = await import("@/tool/tool")
-                      const def = await run(Tool.init(info as any) as any)
-                      if (def && def.id) defs[def.id] = def
+                      const def = await run(Tool.init(info as any) as any) as any
+                      if (def && (def as any).id) defs[(def as any).id] = def
                     } catch {
                       // ignore failures (e.g., missing deps)
                     }

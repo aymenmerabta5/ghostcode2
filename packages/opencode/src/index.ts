@@ -149,8 +149,9 @@ if (args.includes("--workflow")) {
               process.exit(1)
             }
             for (const ag of worktreeAgents) {
-              if (!ag.branch.includes("wf/")) {
-                console.error(`Branch should contain wf/: ${ag.branch}`)
+              const br = (ag as any).branch as string | undefined
+              if (!br || !br.includes("wf/")) {
+                console.error(`Branch should contain wf/: ${br}`)
                 process.exit(1)
               }
             }
