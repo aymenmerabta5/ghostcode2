@@ -438,7 +438,6 @@ export const node = LayerNode.make({
       Question.node,
       Todo.node,
       Goal.node,
-      Workflow.node,
       Agent.node,
     Skill.node,
     Session.node,

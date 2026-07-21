@@ -144,50 +144,53 @@ const AUDIT_AUTH = `export default {
   },
   async run(args, ctx) {
     const dir = String(args.dir ?? "src/routes")
-    ctx.setPhase("discover")
+    ctx.setPhase("discover", { dir })
     const found = await ctx.agent({
       prompt: \`List every .ts file under \${dir} that looks like a route handler. Return {files: string[]}\`,
       schema: { type: "object", required: ["files"], properties: { files: { type: "array", items: { type: "string" } } } },
-      label: "discover"
+      label: "discover",
+      effort: "max"
     })
-    if (!found) throw new Error("audit-auth: discover agent failed to return result")
-    const files = (found.data as any)?.files
-    if (!Array.isArray(files)) throw new Error("audit-auth: discover returned invalid data, expected {files: string[]}")
+    if (!found) throw new Error("audit-auth: discover failed")
+    const files = (found.data as any)?.files ?? []
+    if (!Array.isArray(files)) throw new Error("audit-auth: invalid files")
 
-    ctx.setPhase("audit")
+    ctx.setPhase("audit", { fileCount: files.length, dir })
     const auditsRaw = await ctx.parallel(
       files.map((file) => {
         const safeFile = String(file ?? "unknown")
         return () =>
           ctx.agent({
-            prompt: \`Audit \${safeFile} for missing authentication checks. Look for handlers without auth middleware, missing permission checks. Return {file, issues: string[]}\`,
+            prompt: \`Audit \${safeFile} for missing authentication checks. Return {file, issues: string[]}\`,
             schema: { type: "object", required: ["file","issues"], properties: { file:{type:"string"}, issues:{type:"array",items:{type:"string"}} } },
-            label: safeFile
+            label: \`audit:\${safeFile}\`,
+            effort: "max"
           })
       }),
       { concurrencyLimit: 8 }
     )
     const audits = (auditsRaw as any[]).filter(Boolean)
-    if (audits.length === 0 && files.length > 0) ctx.log("audit-auth: all audit agents failed or returned null")
 
     const flattened = audits.flatMap(a => {
       const data = (a.data as any) ?? {}
-      const f = String(data.file ?? data?.file ?? "unknown")
+      const f = String(data.file ?? "unknown")
       const issues = Array.isArray(data.issues) ? data.issues : []
       return issues.filter((iss: any) => typeof iss === "string").map((iss: string) => ({ file: f, issue: iss }))
     })
 
-    ctx.setPhase("verify")
+    const discoverData = ctx.getPhase("discover")
+    ctx.setPhase("verify", { issueCount: flattened.length, discover: discoverData })
     const verifiedRaw = await ctx.parallel(
-      flattened.map(item => {
+      flattened.map((item, idx) => {
         const safeFile = String(item.file ?? "unknown")
         const safeIssue = String(item.issue ?? "")
         return () =>
           ctx.agent({
-            prompt: \`Adversarially verify: Does \${safeFile} really have issue "\${safeIssue}"? Read the file, check auth. Reply {supported:boolean, reason:string}\`,
+            prompt: \`Adversarially verify: Does \${safeFile} really have issue "\${safeIssue}"? Reply {supported:boolean, reason:string}\`,
             schema: { type: "object", required: ["supported","reason"], properties: { supported:{type:"boolean"}, reason:{type:"string"} } },
-            label: \`verify:\${safeFile}\`
-          }).then(v => v ? ({ ...item, file: safeFile, issue: safeIssue, verdict: v.data }) : null)
+            label: \`verify:\${idx}:\${safeFile}\`,
+            effort: "max"
+          }).then(v => v ? ({ ...item, verdict: v.data }) : null)
       }),
       { concurrencyLimit: 8 }
     )
@@ -195,12 +198,13 @@ const AUDIT_AUTH = `export default {
     const surviving = verified.filter(v => v.verdict?.supported)
     const rejected = verified.filter(v => !v.verdict?.supported)
 
-    ctx.setPhase("report")
+    ctx.setPhase("report", { verified: surviving.length, rejected: rejected.length, files: files.length })
     const report = await ctx.agent({
-      prompt: \`Write ranked security report from verified findings: \${JSON.stringify(surviving)}. Briefly list rejected as false positives: \${JSON.stringify(rejected)}. Group by severity.\`,
-      label: "report"
+      prompt: \`Write ranked security report from verified findings: \${JSON.stringify(surviving)}. Rejected: \${JSON.stringify(rejected)}. Group by severity.\`,
+      label: "report",
+      effort: "max"
     })
-    if (!report) throw new Error("audit-auth: report agent failed")
+    if (!report) throw new Error("audit-auth: report failed")
 
     return { report: report.text, verified: surviving.length, rejected: rejected.length, files: files.length }
   }
@@ -220,47 +224,49 @@ const FIX_TYPECHECK = `export default {
     let lastErrorCount = Infinity
 
     while (attempts < maxAttempts) {
-      ctx.setPhase("check")
+      ctx.setPhase("check", { attempt: attempts, lastCount: lastErrorCount })
       const check = await ctx.agent({
         prompt: "Run npx tsc --noEmit or bun typecheck and report errors. Return {errors: string[], count: number}",
         schema: { type: "object", required: ["errors","count"], properties: { errors:{type:"array",items:{type:"string"}}, count:{type:"number"} } },
-        label: \`check:\${attempts}\`
+        label: \`check:\${attempts}\`,
+        effort: "max"
       })
       if (!check) {
-        ctx.log(\`check agent \${attempts} returned null, retrying\`)
+        ctx.log(\`check \${attempts} null\`)
         attempts++
         continue
       }
       const count = (check.data as any)?.count
       const errors = (check.data as any)?.errors
-      if (typeof count !== "number") throw new Error("fix-typecheck: check returned invalid data")
+      if (typeof count !== "number") throw new Error("fix-typecheck: invalid count")
       if (count === 0) {
         return { success: true, attempts, message: "Typecheck passes" }
       }
-
       if (count >= lastErrorCount) {
-        ctx.log(\`No progress: \${count} errors vs \${lastErrorCount} previous\`)
+        ctx.log(\`No progress: \${count} vs \${lastErrorCount}\`)
         if (attempts >= 2) break
       }
       lastErrorCount = count
 
-      ctx.setPhase("fix")
+      ctx.setPhase("fix", { attempt: attempts, errorCount: count, sample: Array.isArray(errors) ? errors.slice(0,3) : [] })
       const safeErrors = Array.isArray(errors) ? errors : []
       const fixRes = await ctx.agent({
         prompt: \`Fix these type errors: \${JSON.stringify(safeErrors.slice(0,10))}. Edit files to resolve.\`,
-        label: \`fix:\${attempts}\`
+        label: \`fix:\${attempts}\`,
+        effort: "max"
       })
-      if (!fixRes) ctx.log(\`fix agent \${attempts} returned null\`)
+      if (!fixRes) ctx.log(\`fix \${attempts} null\`)
 
       attempts++
     }
 
-    ctx.setPhase("verify")
+    ctx.setPhase("verify", { attempts, lastErrorCount })
     const final = await ctx.agent({
       prompt: "Run typecheck one more time and summarize remaining errors",
-      label: "final-check"
+      label: "final-check",
+      effort: "max"
     })
-    if (!final) throw new Error("fix-typecheck: final check agent failed")
+    if (!final) throw new Error("fix-typecheck: final failed")
 
     return { success: false, attempts, final: final.text }
   }
@@ -275,53 +281,58 @@ const REVIEW_PR = `export default {
     whenToUse: "When reviewing PR changed files"
   },
   async run(args, ctx) {
-    ctx.setPhase("discover")
+    ctx.setPhase("discover", { start: true })
     const changed = await ctx.agent({
       prompt: "List files changed in this branch vs main. Use git diff --name-only origin/main...HEAD. Return {files: string[]}",
       schema: { type: "object", required: ["files"], properties: { files:{type:"array",items:{type:"string"}} } },
-      label: "discover-changed"
+      label: "discover-changed",
+      effort: "max"
     })
-    if (!changed) throw new Error("review-pr: discover agent failed")
+    if (!changed) throw new Error("review-pr: discover failed")
     const changedFiles = (changed.data as any)?.files
-    if (!Array.isArray(changedFiles)) throw new Error("review-pr: discover returned invalid data")
+    if (!Array.isArray(changedFiles)) throw new Error("review-pr: invalid files")
 
-    ctx.setPhase("review")
+    ctx.setPhase("review", { changedCount: changedFiles.length })
     const reviewsRaw = await ctx.parallel(
       changedFiles.map(file => {
         const safeFile = String(file ?? "unknown")
         return () =>
           ctx.agent({
-            prompt: \`Review \${safeFile} for correctness issues, security, logic errors. Return {file, issues: [{severity:"low|medium|high", description:string}]}\`,
+            prompt: \`Review \${safeFile} for correctness issues. Return {file, issues: [{severity:"low|medium|high", description:string}]}\`,
             schema: { type: "object", required:["file","issues"], properties:{ file:{type:"string"}, issues:{type:"array",items:{type:"object",required:["severity","description"],properties:{severity:{type:"string"},description:{type:"string"}}}} } },
-            label: safeFile
+            label: \`review:\${safeFile}\`,
+            effort: "max"
           })
       }),
       { concurrencyLimit: 8 }
     )
     const reviews = (reviewsRaw as any[]).filter(Boolean)
 
-    ctx.setPhase("dedupe")
     const allIssues = reviews.flatMap(r => {
       const data = (r.data as any) ?? {}
-      const file = String(data.file ?? data?.file ?? "unknown")
+      const file = String(data.file ?? "unknown")
       const issues = Array.isArray(data.issues) ? data.issues : []
       return issues.map((i: any) => ({ ...i, file }))
     })
+    const discoverData = ctx.getPhase("discover")
+    ctx.setPhase("dedupe", { issueCount: allIssues.length, discover: discoverData })
     const deduped = await ctx.agent({
-      prompt: \`Deduplicate and rank these issues by severity and impact: \${JSON.stringify(allIssues)}. Return {issues: same shape sorted high->low}\`,
+      prompt: \`Deduplicate and rank these issues by severity: \${JSON.stringify(allIssues)}. Return {issues: same shape sorted high->low}\`,
       schema: { type: "object", required:["issues"], properties:{ issues:{type:"array",items:{type:"object",required:["severity","description","file"],properties:{severity:{type:"string"},description:{type:"string"},file:{type:"string"}}}} } },
-      label: "dedupe-rank"
+      label: "dedupe-rank",
+      effort: "max"
     })
-    if (!deduped) throw new Error("review-pr: dedupe agent failed")
-    const dedupedIssues = (deduped.data as any)?.issues
-    if (!Array.isArray(dedupedIssues)) throw new Error("review-pr: dedupe returned invalid data")
+    if (!deduped) throw new Error("review-pr: dedupe failed")
+    const dedupedIssues = (deduped.data as any)?.issues ?? []
+    if (!Array.isArray(dedupedIssues)) throw new Error("review-pr: invalid deduped")
 
-    ctx.setPhase("report")
+    ctx.setPhase("report", { finalIssueCount: dedupedIssues.length, files: changedFiles.length })
     const report = await ctx.agent({
       prompt: \`Write one ranked summary from: \${JSON.stringify(dedupedIssues)}. Group by severity, cite files.\`,
-      label: "report"
+      label: "report",
+      effort: "max"
     })
-    if (!report) throw new Error("review-pr: report agent failed")
+    if (!report) throw new Error("review-pr: report failed")
 
     return { report: report.text, files: changedFiles.length, issues: dedupedIssues.length }
   }

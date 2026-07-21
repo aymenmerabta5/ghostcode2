@@ -45,13 +45,12 @@ type Metadata = {
 export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Workflow.Service>(
   "workflow",
   Effect.gen(function* () {
-    const workflows = yield* Workflow.Service
-
     return {
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
+          const workflows = yield* Workflow.Service
           if (params.action === "list") {
             const items = yield* workflows.list()
             const valid = items.filter((w) => w.valid)
@@ -110,12 +109,56 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Workflow.Se
               id: params.id as Workflow.RunID,
               timeout: params.timeout ? params.timeout * 1000 : undefined,
             })
+            if (!result.run) {
+              return {
+                title: result.timedOut ? "timeout" : "not found",
+                output: "Run not found",
+                metadata: {},
+              } satisfies Tool.ExecuteResult<Metadata>
+            }
+            const run = result.run
+            const completed = run.agents.filter((a) => a.status === "completed").length
+            const failed = run.agents.filter((a) => a.status === "failed").length
+            let resultSection = ""
+            if (run.result !== undefined) {
+              const res: unknown = run.result
+              if (typeof res === "string") {
+                const cap = 100_000
+                resultSection = `\nResult (string, ${res.length} chars):\n${res.slice(0, cap)}${res.length > cap ? `\n... truncated ${res.length - cap} chars ...` : ""}\n`
+              } else if (res !== null && typeof res === "object" && !Array.isArray(res)) {
+                const obj = res as Record<string, unknown>
+                const finalReport = [obj.finalReport, obj.report, obj.summary].find(
+                  (v): v is string => typeof v === "string" && v.length > 0,
+                )
+                if (finalReport) {
+                  const cap = 100_000
+                  resultSection = `\nFinal Report (${finalReport.length} chars):\n${finalReport.slice(0, cap)}${finalReport.length > cap ? `\n... truncated ${finalReport.length - cap} chars ...` : ""}\n`
+                  const otherKeys = Object.keys(obj).filter((k) => !["finalReport", "report", "summary"].includes(k))
+                  if (otherKeys.length > 0) {
+                    const other = Object.fromEntries(otherKeys.map((k) => [k, obj[k]]))
+                    const j = JSON.stringify(other, null, 2)
+                    resultSection += `\nOther fields: ${j.slice(0, 5000)}${j.length > 5000 ? " ... truncated" : ""}\n`
+                  }
+                } else {
+                  const json = JSON.stringify(res, null, 2)
+                  resultSection = `\nResult: ${json.slice(0, 15000)}${json.length > 15000 ? `\n... truncated ${json.length - 15000} chars ...` : ""}`
+                }
+              } else {
+                const json = JSON.stringify(res, null, 2)
+                resultSection = `\nResult: ${json.slice(0, 15000)}${json.length > 15000 ? `\n... truncated ${json.length - 15000} chars ...` : ""}`
+              }
+            }
+            // List agents to help debugging when result is large
+            const agentList = run.agents
+              .map((a: any) => {
+                const err = a.error ? ` err:${a.error.slice(0, 120)}` : ""
+                return `- ${a.label ?? a.id.slice(-6)} [${a.status}] ${a.output ? `(${a.output.length} chars)` : ""}${err}`
+              })
+              .join("\n")
             return {
-              title: result.timedOut ? "timeout" : (result.run?.status ?? "unknown"),
-              output: result.run
-                ? `Run ${result.run.id}: ${result.run.status}\nWorkflow: ${result.run.workflow}\nPhase: ${result.run.current_phase ?? "(none)"}\nAgents: ${result.run.agents.length} (${result.run.agents.filter((a) => a.status === "completed").length} completed, ${result.run.agents.filter((a) => a.status === "failed").length} failed)\n${result.run.error ? `Error: ${result.run.error}` : ""}${result.run.result !== undefined ? `\nResult: ${JSON.stringify(result.run.result, null, 2)}` : ""}`
-                : "Run not found",
-              metadata: { runID: result.run?.id, status: result.run?.status },
+              title: result.timedOut ? "timeout" : (run.status ?? "unknown"),
+              output: `Run ${run.id}: ${run.status}\nWorkflow: ${run.workflow}\nPhase: ${run.current_phase ?? "(none)"}\nAgents: ${run.agents.length} (${completed} completed, ${failed} failed)\n${run.error ? `Error: ${run.error}\n` : ""}${agentList ? `\nAgents:\n${agentList}\n` : ""}${resultSection}${result.timedOut ? "\nTimed out waiting for completion" : ""}`,
+              metadata: { runID: run.id, status: run.status },
             } satisfies Tool.ExecuteResult<Metadata>
           }
 
