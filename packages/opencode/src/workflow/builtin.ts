@@ -24,6 +24,7 @@ const DEEP_RESEARCH = `export default {
     description: "Research a question across angles with adversarial claim verification",
     phases: ["plan", "research", "verify", "synthesize"],
     arguments: { question: { type: "string", description: "Research question" } },
+    guide: { maxLines: 30 },
     whenToUse: "When you need to research a question across many sources with cross-checked citations"
   },
   async run(args, ctx) {
@@ -51,7 +52,7 @@ const DEEP_RESEARCH = `export default {
         const safeAngle = String(angle ?? "")
         return () =>
           ctx.agent({
-            prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "no_web_tools": true} via the schema. Angle: \${safeAngle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
+            prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "surprises": [], "no_web_tools": true} via the schema. Angle: \${safeAngle}\\nFull question: \${question}\\nReturn findings with source URLs and any surprising learnings about the domain via surprises array.\`,
             schema: {
               type: "object",
               required: ["claims"],
@@ -67,6 +68,7 @@ const DEEP_RESEARCH = `export default {
                     },
                   },
                 },
+                surprises: { type: "array", items: { type: "string" } },
                 no_web_tools: { type: "boolean" },
               },
             },
@@ -80,30 +82,81 @@ const DEEP_RESEARCH = `export default {
     if (findings.some((f) => (f.data as { no_web_tools?: boolean })?.no_web_tools))
       throw new Error("deep-research requires web/search tools to be available to agents")
 
+    // Field Guide: workers report surprises; script appends non-empty via ctx.guide.append()
+    for (const f of findings) {
+      const surprises = (f.data as any)?.surprises
+      if (Array.isArray(surprises)) {
+        for (const s of surprises) {
+          if (typeof s === "string" && s.trim()) {
+            try { ctx.guide.append(s) } catch {}
+          }
+        }
+      }
+    }
+    if (ctx.guide.lines().length >= 20) {
+      const curated = await ctx.agent({
+        prompt: \`Compact this field guide from \${ctx.guide.lines().length} to 10 lines, preserving most important learnings. Guide: \${JSON.stringify(ctx.guide.lines())}. Return {lines: string[]}\`,
+        schema: { type: "object", required: ["lines"], properties: { lines: { type: "array", items: { type: "string" } } } },
+        label: "curate-guide",
+        effort: "max"
+      })
+      if (curated) {
+        const nl = (curated.data as any)?.lines
+        if (Array.isArray(nl)) {
+          try { ctx.guide.set(nl) } catch {}
+        }
+      }
+    }
+
     const claims = findings.flatMap((f) => {
       const c = (f.data as any)?.claims
       return Array.isArray(c) ? c.filter((x: any) => x && typeof x.claim === "string") : []
     })
 
-    ctx.setPhase("verify", { claims: claims.length })
-    // Adversarial verify with 3 lenses per claim, survive on >=2 support
+    ctx.setPhase("verify", { claims: claims.length, guide: ctx.guide.lines().length })
+    // Decorrelated review lenses per pattern 1: >=3 lenses that differ in INPUT, not just persona
+    // Lens 1 sees finding + actual artifact/file, Lens 2 sees worker's output ONLY (no source), Lens 3 uses different model/adversarial persona. Survive on >=2.
     const verifiedRaw = await ctx.parallel(
       claims.map((c, claimIdx) => {
         const claimStr = String((c as any)?.claim ?? "")
         const sourcesArr = Array.isArray((c as any)?.sources) ? (c as any).sources : []
         return () =>
-          ctx.parallel([0,1,2].map(lens => () =>
-            ctx.agent({
-              prompt: \`Adversarially verify (lens \${lens}: \${["correctness","exploitability","reproduction"][lens]}): does claim "\${claimStr}" hold against sources \${sourcesArr.join(", ")}? Try to REFUTE it. Reply {supported:boolean, reason:string}\`,
+          ctx.parallel([
+            // Lens 1: finding + actual artifact/file
+            () => ctx.agent({
+              prompt: \`Lens 1 (correctness, sees artifact): Verify claim "\${claimStr}" against actual sources \${sourcesArr.join(", ")}. Fetch and read the source artifact/file content if possible, then check if claim is supported. Reply {supported:boolean, reason:string}\`,
               schema: {
                 type: "object",
                 required: ["supported", "reason"],
                 properties: { supported: { type: "boolean" }, reason: { type: "string" } },
               },
-              label: \`verify:\${claimIdx}:\${lens}\`,
+              label: \`verify:\${claimIdx}:lens1:artifact\`,
               effort: "max"
-            })
-          )).then(votes => {
+            }),
+            // Lens 2: worker's output ONLY, no source context
+            () => ctx.agent({
+              prompt: \`Lens 2 (output-only, no source context): Evaluate this research claim on its own, without seeing sources: "\${claimStr}". Is this claim plausible and well-formed as a research finding? Reply {supported:boolean, reason:string}\`,
+              schema: {
+                type: "object",
+                required: ["supported", "reason"],
+                properties: { supported: { type: "boolean" }, reason: { type: "string" } },
+              },
+              label: \`verify:\${claimIdx}:lens2:output-only\`,
+              effort: "max"
+            }),
+            // Lens 3: different model + adversarial persona
+            () => ctx.agent({
+              prompt: \`Lens 3 (adversarial persona, different model): Try to REFUTE claim "\${claimStr}". Be adversarial, find flaws, alternative interpretations, missing evidence. Sources provided were \${sourcesArr.join(", ")} but challenge them. Reply {supported:boolean, reason:string}\`,
+              schema: {
+                type: "object",
+                required: ["supported", "reason"],
+                properties: { supported: { type: "boolean" }, reason: { type: "string" } },
+              },
+              label: \`verify:\${claimIdx}:lens3:adversarial\`,
+              model: "anthropic/claude-3-5-sonnet",
+              effort: "max"
+            }),
+          ]).then(votes => {
             const validVotes = votes.filter(Boolean).map((v: any) => v.data)
             const supportedCount = validVotes.filter((v: any) => v.supported).length
             return { ...c, votes: validVotes, supported: supportedCount >= 2 }
@@ -115,7 +168,7 @@ const DEEP_RESEARCH = `export default {
     const surviving = verified.filter((c: any) => c.supported)
     const rejected = verified.filter((c: any) => !c.supported)
 
-    ctx.setPhase("synthesize", { verified: surviving.length, rejected: rejected.length })
+    ctx.setPhase("synthesize", { verified: surviving.length, rejected: rejected.length, guide: ctx.guide.lines().length })
     const critic = await ctx.agent({
       prompt: \`Completeness critic: for question "\${question}" and verified claims \${JSON.stringify(surviving.slice(0,5))}, what is MISSING? What did the research likely overlook?\`,
       label: "completeness-critic",
@@ -123,13 +176,13 @@ const DEEP_RESEARCH = `export default {
     })
     const planData = ctx.getPhase("plan")
     const report = await ctx.agent({
-      prompt: \`Write a cited research report answering: \${question}\\nPlan was: \${JSON.stringify(planData)}\\nUse ONLY these verified claims (cite their sources inline): \${JSON.stringify(surviving)}\\nGaps from critic: \${critic?.text ?? "none"}\\nList rejected claims briefly at the end: \${JSON.stringify(rejected.map((r: any) => ({ claim: r.claim, reason: r.votes?.[0]?.reason })))}\`,
+      prompt: \`Write a cited research report answering: \${question}\\nPlan was: \${JSON.stringify(planData)}\\nUse ONLY these verified claims (cite their sources inline): \${JSON.stringify(surviving)}\\nGuidance from field guide: \${JSON.stringify(ctx.guide.lines())}\\nGaps from critic: \${critic?.text ?? "none"}\\nList rejected claims briefly at the end: \${JSON.stringify(rejected.map((r: any) => ({ claim: r.claim, reason: r.votes?.[0]?.reason })))}\`,
       label: "synthesize",
       effort: "max"
     })
     if (!report) throw new Error("deep-research: synthesize agent failed")
 
-    return { report: report.text, claims: { verified: surviving.length, rejected: rejected.length } }
+    return { report: report.text, claims: { verified: surviving.length, rejected: rejected.length }, guide: ctx.guide.lines() }
   },
 }
 `
@@ -138,8 +191,9 @@ const AUDIT_AUTH = `export default {
   meta: {
     name: "audit-auth",
     description: "Audit route handlers for missing authentication checks with adversarial verification",
-    phases: ["discover", "audit", "verify", "report"],
+    phases: ["discover", "audit", "retry", "verify", "report"],
     arguments: { dir: { type: "string", default: "src/routes", description: "Directory to audit" } },
+    guide: { maxLines: 20 },
     whenToUse: "When auditing API endpoints for missing auth"
   },
   async run(args, ctx) {
@@ -155,21 +209,83 @@ const AUDIT_AUTH = `export default {
     const files = (found.data as any)?.files ?? []
     if (!Array.isArray(files)) throw new Error("audit-auth: invalid files")
 
-    ctx.setPhase("audit", { fileCount: files.length, dir })
-    const auditsRaw = await ctx.parallel(
+    ctx.setPhase("audit", { fileCount: files.length, dir, guide: ctx.guide.lines().length })
+    // Second-chance sweep: onError null + collect nulls + retry pass
+    const auditsRawFirst = await ctx.parallel(
       files.map((file) => {
         const safeFile = String(file ?? "unknown")
         return () =>
           ctx.agent({
-            prompt: \`Audit \${safeFile} for missing authentication checks. Return {file, issues: string[]}\`,
-            schema: { type: "object", required: ["file","issues"], properties: { file:{type:"string"}, issues:{type:"array",items:{type:"string"}} } },
+            prompt: \`Audit \${safeFile} for missing authentication checks. Return {file, issues: string[], surprises: string[]}. Surprises are learnings about codebase that future agents should know.\`,
+            schema: { type: "object", required: ["file","issues","surprises"], properties: { file:{type:"string"}, issues:{type:"array",items:{type:"string"}}, surprises:{type:"array",items:{type:"string"}} } },
             label: \`audit:\${safeFile}\`,
-            effort: "max"
+            effort: "max",
+            onError: "null"
           })
       }),
       { concurrencyLimit: 8 }
     )
-    const audits = (auditsRaw as any[]).filter(Boolean)
+    // Field Guide usage: append non-empty surprises
+    for (const a of auditsRawFirst) {
+      if (!a) continue
+      const surprises = (a.data as any)?.surprises
+      if (Array.isArray(surprises)) {
+        for (const s of surprises) {
+          if (typeof s === "string" && s.trim()) {
+            try { ctx.guide.append(s) } catch {}
+          }
+        }
+      }
+    }
+    // Curation when near maxLines
+    if (ctx.guide.lines().length >= 15) {
+      const curated = await ctx.agent({
+        prompt: \`Compact field guide from \${ctx.guide.lines().length} to 8 lines. Guide: \${JSON.stringify(ctx.guide.lines())}. Return {lines: string[]}\`,
+        schema: { type: "object", required: ["lines"], properties: { lines:{type:"array",items:{type:"string"}} } },
+        label: "curate-guide",
+        effort: "max"
+      })
+      if (curated) {
+        const nl = (curated.data as any)?.lines
+        if (Array.isArray(nl)) { try { ctx.guide.set(nl) } catch {} }
+      }
+    }
+
+    const succeededFirst = auditsRawFirst.filter(Boolean) as any[]
+    const failedFiles = files.filter((_: string, idx: number) => auditsRawFirst[idx] === null)
+
+    ctx.setPhase("retry", { failed: failedFiles.length, succeeded: succeededFirst.length })
+    let secondPass: any[] = []
+    let stillFailed: string[] = []
+    if (failedFiles.length > 0) {
+      const retryRaw = await ctx.parallel(
+        failedFiles.map((file: string) => {
+          const safeFile = String(file ?? "unknown")
+          return () =>
+            ctx.agent({
+              prompt: \`Retry audit \${safeFile} for missing authentication checks. Return {file, issues: string[], surprises: string[]}\`,
+              schema: { type: "object", required: ["file","issues","surprises"], properties: { file:{type:"string"}, issues:{type:"array",items:{type:"string"}}, surprises:{type:"array",items:{type:"string"}} } },
+              label: \`audit:\${safeFile}\`,
+              effort: "max",
+              onError: "null"
+            })
+        }),
+        { concurrencyLimit: 8 }
+      )
+      secondPass = retryRaw.filter(Boolean) as any[]
+      stillFailed = failedFiles.filter((_: string, idx: number) => retryRaw[idx] === null)
+      // Also append surprises from retry
+      for (const a of secondPass) {
+        const surprises = (a.data as any)?.surprises
+        if (Array.isArray(surprises)) {
+          for (const s of surprises) {
+            if (typeof s === "string" && s.trim()) { try { ctx.guide.append(s) } catch {} }
+          }
+        }
+      }
+    }
+
+    const audits = [...succeededFirst, ...secondPass]
 
     const flattened = audits.flatMap(a => {
       const data = (a.data as any) ?? {}
@@ -179,14 +295,14 @@ const AUDIT_AUTH = `export default {
     })
 
     const discoverData = ctx.getPhase("discover")
-    ctx.setPhase("verify", { issueCount: flattened.length, discover: discoverData })
+    ctx.setPhase("verify", { issueCount: flattened.length, discover: discoverData, guide: ctx.guide.lines().length, failedTwice: stillFailed.length })
     const verifiedRaw = await ctx.parallel(
       flattened.map((item, idx) => {
         const safeFile = String(item.file ?? "unknown")
         const safeIssue = String(item.issue ?? "")
         return () =>
           ctx.agent({
-            prompt: \`Adversarially verify: Does \${safeFile} really have issue "\${safeIssue}"? Reply {supported:boolean, reason:string}\`,
+            prompt: \`Adversarially verify: Does \${safeFile} really have issue "\${safeIssue}"? Field guide: \${JSON.stringify(ctx.guide.lines().slice(0,5))}. Reply {supported:boolean, reason:string}\`,
             schema: { type: "object", required: ["supported","reason"], properties: { supported:{type:"boolean"}, reason:{type:"string"} } },
             label: \`verify:\${idx}:\${safeFile}\`,
             effort: "max"
@@ -198,15 +314,15 @@ const AUDIT_AUTH = `export default {
     const surviving = verified.filter(v => v.verdict?.supported)
     const rejected = verified.filter(v => !v.verdict?.supported)
 
-    ctx.setPhase("report", { verified: surviving.length, rejected: rejected.length, files: files.length })
+    ctx.setPhase("report", { verified: surviving.length, rejected: rejected.length, files: files.length, guide: ctx.guide.lines().length, failedTwice: stillFailed })
     const report = await ctx.agent({
-      prompt: \`Write ranked security report from verified findings: \${JSON.stringify(surviving)}. Rejected: \${JSON.stringify(rejected)}. Group by severity.\`,
+      prompt: \`Write ranked security report from verified findings: \${JSON.stringify(surviving)}. Rejected: \${JSON.stringify(rejected)}. Still failed after retry: \${JSON.stringify(stillFailed)}. Field guide: \${JSON.stringify(ctx.guide.lines())}. Group by severity.\`,
       label: "report",
       effort: "max"
     })
     if (!report) throw new Error("audit-auth: report failed")
 
-    return { report: report.text, verified: surviving.length, rejected: rejected.length, files: files.length }
+    return { report: report.text, verified: surviving.length, rejected: rejected.length, files: files.length, guide: ctx.guide.lines(), failedTwice: stillFailed }
   }
 }
 `
