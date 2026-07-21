@@ -13,6 +13,7 @@ export type WorkflowDefinitionRow = {
     phaseValidation?: "strict" | "warn"
     allowNondeterminism?: boolean
     tools?: string[]
+    guide?: { maxLines?: number }
   }
   source?: string
   temporary?: boolean
@@ -49,7 +50,7 @@ export type WorkflowAgentRow = {
   }
   error?: string
   cached?: boolean
-  kind?: "agent" | "question" | "tool"
+  kind?: "agent" | "question" | "tool" | "guide:append" | "guide:set"
   answer?: string
   cache_key?: string
   child?: { run: string; workflow: string }
@@ -85,6 +86,7 @@ export const WorkflowRunTable = sqliteTable(
     }>(),
     phase_data: text({ mode: "json" }).$type<Record<string, unknown>>(),
     state: text({ mode: "json" }).$type<Record<string, unknown>>(),
+    guide: text({ mode: "json" }).$type<string[]>(),
     ...Timestamps,
   },
   (table) => [

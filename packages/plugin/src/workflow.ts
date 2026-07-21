@@ -109,6 +109,11 @@ export type WorkflowContext = {
     entries(): [string, unknown][]
     toObject(): Record<string, unknown>
   }
+  readonly guide: {
+    append(line: string): number
+    lines(): readonly string[]
+    set(lines: string[]): number
+  }
   log(message: string): void
   parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<(T | null)[]>
   pipeline: WorkflowPipelineFn
@@ -119,7 +124,10 @@ export type WorkflowContext = {
   question(input: { question: string; options?: readonly string[]; timeout?: number }): Promise<{ answer: string }>
   waitForAgents(options?: { timeout?: number; failOnTimeout?: boolean }): Promise<void>
   getPhaseData?(name: string): unknown
-  mergeWorktree?(agentResult: { branch?: string; changedFiles?: string[] } | WorkflowAgentResult): Promise<{ merged: boolean; branch: string }>
+  mergeWorktree?(
+    agentResult: { branch?: string; changedFiles?: string[] } | WorkflowAgentResult,
+    opts?: { onConflict?: "error" | "agent"; model?: string },
+  ): Promise<{ merged: boolean; branch: string }>
   invalidatePhase?(name: string): void
 }
 
@@ -137,6 +145,7 @@ export type WorkflowDefinition<
     phaseValidation?: "strict" | "warn"
     allowNondeterminism?: boolean
     tools?: string[]
+    guide?: { maxLines?: number }
   }
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
 }
@@ -150,6 +159,7 @@ export function workflow<const Args extends WorkflowArguments | undefined = unde
   phaseValidation?: "strict" | "warn"
   allowNondeterminism?: boolean
   tools?: string[]
+  guide?: { maxLines?: number }
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
 }): WorkflowDefinition<Args> {
   return {
@@ -162,6 +172,7 @@ export function workflow<const Args extends WorkflowArguments | undefined = unde
       phaseValidation: input.phaseValidation,
       allowNondeterminism: input.allowNondeterminism,
       tools: input.tools,
+      guide: input.guide,
     },
     run: input.run,
   }

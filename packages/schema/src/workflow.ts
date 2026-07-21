@@ -49,6 +49,11 @@ const Phases = Schema.Array(PhaseEntry).pipe(
   }),
 )
 
+export const GuideMeta = Schema.Struct({
+  maxLines: Schema.optional(Schema.Finite),
+}).annotate({ identifier: "WorkflowGuideMeta" })
+export interface GuideMeta extends Schema.Schema.Type<typeof GuideMeta> {}
+
 export const Meta = Schema.Struct({
   name: Schema.String,
   description: optional(Schema.String),
@@ -58,6 +63,7 @@ export const Meta = Schema.Struct({
   phaseValidation: optional(Schema.Literals(["strict", "warn"])),
   allowNondeterminism: optional(Schema.Boolean),
   tools: optional(Schema.Array(Schema.String)),
+  guide: optional(GuideMeta),
 }).annotate({ identifier: "WorkflowMeta" })
 export interface Meta extends Schema.Schema.Type<typeof Meta> {}
 
@@ -144,7 +150,7 @@ export const AgentRun = Schema.Struct({
   ),
   error: optional(Schema.String),
   cached: optional(Schema.Boolean),
-  kind: optional(Schema.Literals(["agent", "question", "tool"])),
+  kind: optional(Schema.Literals(["agent", "question", "tool", "guide:append", "guide:set"])),
   answer: optional(Schema.String),
   cache_key: optional(Schema.String),
   child: optional(ChildRef),
@@ -178,6 +184,7 @@ export const Run = Schema.Struct({
   ),
   phase_data: optional(Schema.Record(Schema.String, Schema.Unknown)),
   state: optional(Schema.Record(Schema.String, Schema.Unknown)),
+  guide: optional(Schema.Array(Schema.String)),
 }).annotate({ identifier: "WorkflowRun" })
 export interface Run extends Schema.Schema.Type<typeof Run> {}
 

@@ -48,3 +48,15 @@ export class CancelledError extends Error {
     this.name = "WorkflowCancelledError"
   }
 }
+
+export class GuideFullError extends Schema.TaggedErrorClass<GuideFullError>()("WorkflowGuideFullError", {
+  message: Schema.String,
+  maxLines: Schema.Number,
+  currentLines: Schema.Number,
+}) {}
+
+export class MergeConflictError extends Schema.TaggedErrorClass<MergeConflictError>()("WorkflowMergeConflictError", {
+  message: Schema.String,
+  branch: Schema.String,
+  files: Schema.Array(Schema.String),
+}) {}

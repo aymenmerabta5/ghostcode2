@@ -272,6 +272,7 @@ export default {
           \`error\` text,
           \`resume_of\` text,
           \`pending_question\` text,
+          \`guide\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL
         );

@@ -84,6 +84,7 @@ export type AgentInput = {
   isolation?: "worktree"
   onError?: "fail" | "null"
   effort?: "low" | "medium" | "high" | "xhigh" | "max"
+  thinking?: "low" | "medium" | "high" | "xhigh" | "max"
   agentType?: string
   maxRepairs?: number
 }
@@ -138,9 +139,17 @@ export type ContextApi = {
     timeout?: number
   }) => Promise<{ answer: string }>
   readonly waitForAgents: (options?: { timeout?: number; failOnTimeout?: boolean }) => Promise<void>
-  readonly mergeWorktree: (input: { branch?: string; changedFiles?: string[] } | { data: unknown; text: string } | any) => Promise<{ merged: boolean; branch: string }>
+  readonly mergeWorktree: (
+    input: { branch?: string; changedFiles?: string[] } | { data: unknown; text: string } | any,
+    opts?: { onConflict?: "error" | "agent"; model?: string },
+  ) => Promise<{ merged: boolean; branch: string }>
   readonly invalidatePhase: (name: string) => void
   readonly getPhaseData?: (name: string) => unknown
+  readonly guide: {
+    append(line: string): number
+    lines(): readonly string[]
+    set(lines: string[]): number
+  }
 }
 
 type _ContextApiSatisfiesWorkflowContext = ContextApi extends WorkflowContext ? true : never
