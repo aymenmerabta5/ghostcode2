@@ -2790,6 +2790,8 @@ const layer = Layer.effect(
             ;(active.run as any).phase_data = { ...active.phaseData }
             doPersist()
           },
+          // Workstream B — Neutral merge agent: onConflict "error" | "agent" (default "error")
+          // "agent" spawns merge:<sourceLabel> agent, participates in keyed cache, model opts.model ?? default, effort max, neutral prompt with conflict markers + diffs, auto-resolve fallback preserving both intents
           async mergeWorktree(input: any, opts?: { onConflict?: "error" | "agent"; model?: string }) {
             const branch = input?.branch ?? input?.data?.branch ?? (() => { try { return typeof input?.text === "string" ? JSON.parse(input.text)?.branch : undefined } catch { return undefined } })() ?? (typeof input === "string" ? input : undefined)
             if (!branch) {
