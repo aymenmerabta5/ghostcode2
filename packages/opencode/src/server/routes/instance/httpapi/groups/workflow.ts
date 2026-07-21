@@ -5,8 +5,9 @@ import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiError, OpenApi } from "e
 import { ApiNotFoundError, ConflictError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
-import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
+import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery, WorkspaceRoutingQueryFields } from "../middleware/workspace-routing"
 import { described } from "./metadata"
+import { QueryBoolean } from "./query"
 
 const root = "/workflow"
 
@@ -63,6 +64,12 @@ export const WorkflowPaths = {
   export: `${root}/run/:id/export`,
   remove: `${root}/run/:id`,
 } as const
+
+export const ExportQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  markdown: Schema.optional(QueryBoolean),
+}).annotate({ identifier: "WorkflowExportQuery" })
+export type ExportQuery = Schema.Schema.Type<typeof ExportQuery>
 
 export const ExportResult = Schema.Struct({
   path: Schema.String,
@@ -194,14 +201,14 @@ export const WorkflowApi = HttpApi.make("workflow")
         ),
         HttpApiEndpoint.post("export", WorkflowPaths.export, {
           params: { id: Workflow.RunID },
-          query: WorkspaceRoutingQuery,
+          query: ExportQuery,
           success: described(ExportResult, "Workflow run transcripts exported"),
           error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "workflow.export",
             summary: "Export workflow run transcripts",
-            description: "Export a run's transcripts as JSONL files.",
+            description: "Export a run's transcripts as JSON bundle plus optional markdown rendering (markdown=true).",
           }),
         ),
         HttpApiEndpoint.delete("remove", WorkflowPaths.remove, {

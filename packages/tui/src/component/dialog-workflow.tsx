@@ -1,5 +1,5 @@
-import { TextAttributes, type ScrollBoxRenderable, type TextareaRenderable } from "@opentui/core"
-import { useTerminalDimensions } from "@opentui/solid"
+import { TextAttributes, type InputRenderable, type ScrollBoxRenderable, type TextareaRenderable } from "@opentui/core"
+import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import { Locale } from "../util/locale"
 import { Global } from "@opencode-ai/core/global"
@@ -32,6 +32,7 @@ import {
   resultPhase,
   sanitizeWorkflowFilename,
   saveTargets,
+  SETUP_PHASE,
   spentThisMonth,
   statusIcon,
   stepSelectableRow,
@@ -212,12 +213,14 @@ function phaseRowIcon(run: WorkflowRun, row: SelectablePhaseRow) {
   return agentIcon(agentEffectiveStatus(run, row.agent))
 }
 
-function phaseRowTitle(phase: string | undefined, rows: readonly WorkflowPhaseRow[]) {
+function phaseRowTitle(phase: string | undefined, rows: readonly WorkflowPhaseRow[], phases?: readonly string[], selectedIdx?: number) {
   const agents = rows.filter((row) => row.type === "agent").length
   const result = rows.some((row) => row.type === "result")
-  if (!result) return `${phase ?? "Phase"} · ${agents} agents`
-  if (agents === 0) return `${phase ?? "Phase"} · result`
-  return `${phase ?? "Phase"} · ${agents} agents + result`
+  const nn = phases && selectedIdx !== undefined && phase ? `[${selectedIdx + 1}/${phases.length}] ` : ""
+  const base = `${nn}${phase ?? "Phase"}`
+  if (!result) return `${base} · ${agents} agents`
+  if (agents === 0) return `${base} · result`
+  return `${base} · ${agents} agents + result`
 }
 
 function workflowResultText(result: unknown) {
@@ -364,6 +367,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
+  const renderer = useRenderer()
   dialog.setSize("xlarge")
 
   // Selection is anchored on a run.id, not an index: the runs list re-sorts on
@@ -631,33 +635,128 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   }
 
   useBindings(() => ({
+    priority: 1,
+    enabled: () => !filterMode(),
     bindings: [
-      { key: "up,k", desc: "Previous workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : move(-1)) },
-      { key: "down,j", desc: "Next workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : move(1)) },
-      { key: "return", desc: "View workflow details", group: "Workflow", cmd: () => (filterMode() ? undefined : openSelected()) },
-      { key: "f", desc: "Filter workflow runs", group: "Workflow", cmd: toggleFilter },
-      { key: "escape", desc: "Clear filter / exit", group: "Workflow", cmd: () => {
-        if (filterMode()) {
+      {
+        key: "up,k",
+        desc: "Previous workflow run",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()?.getSelectedText()) return undefined
+          move(-1)
+        },
+      },
+      {
+        key: "down,j",
+        desc: "Next workflow run",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()?.getSelectedText()) return undefined
+          move(1)
+        },
+      },
+      {
+        key: "return",
+        desc: "View workflow details",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()?.getSelectedText()) {
+            renderer.clearSelection()
+            return
+          }
+          openSelected()
+        },
+      },
+      { key: "f", desc: "Filter workflow runs", group: "Workflow", cmd: () => {
+        if (renderer.getSelection()?.getSelectedText()) {
+          renderer.clearSelection()
+          return
+        }
+        toggleFilter()
+      }},
+      {
+        key: "escape",
+        desc: "Clear filter / exit",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          dialog.clear()
+        },
+      },
+      { key: "r", desc: "Restart workflow run", group: "Workflow", cmd: () => {
+        if (renderer.getSelection()?.getSelectedText()) return undefined
+        restartSelected()
+      }},
+      {
+        key: "R",
+        desc: "Refresh workflow definitions",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()?.getSelectedText()) return undefined
+          void refetchWorkflows()
+        },
+      },
+      { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: () => {
+        if (renderer.getSelection()?.getSelectedText()) return undefined
+        cancelSelected()
+      }},
+      { key: "a", desc: "Answer pending question", group: "Workflow", cmd: () => {
+        if (renderer.getSelection()?.getSelectedText()) return undefined
+        void answerSelected()
+      }},
+      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: () => {
+        if (renderer.getSelection()?.getSelectedText()) return undefined
+        pauseOrResumeSelected()
+      }},
+      { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => {
+        if (renderer.getSelection()?.getSelectedText()) return undefined
+        void deleteSelected()
+      }},
+      {
+        key: "b",
+        desc: "Exit workflows dashboard",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          dialog.clear()
+        },
+      },
+      {
+        key: "q",
+        desc: "Hide workflows to see subagent",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          dialog.clear()
+        },
+      },
+    ],
+  }))
+
+  useBindings(() => ({
+    priority: 2,
+    enabled: () => filterMode(),
+    bindings: [
+      { key: "return", desc: "Apply workflow filter", group: "Workflow", cmd: () => setFilterMode(false) },
+      {
+        key: "escape",
+        desc: "Clear workflow filter",
+        group: "Workflow",
+        cmd: () => {
           setFilter("")
           setFilterMode(false)
-        } else {
-          dialog.clear()
-        }
-      }},
-      { key: "r", desc: "Restart workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : restartSelected()) },
-      { key: "R", desc: "Refresh workflow definitions", group: "Workflow", cmd: () => void refetchWorkflows() },
-      { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: () => (filterMode() ? undefined : cancelSelected()) },
-      { key: "a", desc: "Answer pending question", group: "Workflow", cmd: () => (filterMode() ? undefined : void answerSelected()) },
-      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: () => (filterMode() ? undefined : pauseOrResumeSelected()) },
-      { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => (filterMode() ? undefined : void deleteSelected()) },
-      { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => {
-        if (filterMode()) {
-          setFilter("")
-          setFilterMode(false)
-        } else {
-          dialog.clear()
-        }
-      }},
+        },
+      },
     ],
   }))
 
@@ -1072,17 +1171,47 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
   const { theme } = useTheme()
   const sdk = useSDK()
   const toast = useToast()
+  const events = useEvent()
   const dimensions = useTerminalDimensions()
+  const renderer = useRenderer()
   let promptScroll: ScrollBoxRenderable | undefined
   let outputScroll: ScrollBoxRenderable | undefined
-  let promptInputRef: any
+  let promptInputRef: InputRenderable | undefined
   const [copyNotice, setCopyNotice] = createSignal(false)
   const [promptMode, setPromptMode] = createSignal(false)
   const [promptText, setPromptText] = createSignal("")
   let copyTimeout: ReturnType<typeof setTimeout> | undefined
 
+  // Live-updating run so a running agent's output/status refreshes while this
+  // modal is open. Falls back to the initial props when the fetch hasn't landed.
+  const [liveRun, { refetch }] = createResource(async () => {
+    const result = await sdk.client.workflow.get({ id: props.run.id })
+    return result.data ?? props.run
+  })
+  const currentRun = createMemo(() => liveRun() ?? props.run)
+  const currentAgent = createMemo(() => {
+    const found = currentRun().agents.find((a) => a.id === props.agent.id)
+    return found ?? props.agent
+  })
+
   onMount(() => {
     dialog.setSize("xlarge")
+  })
+
+  onMount(() => {
+    const off = events.subscribe((evt) => {
+      const wf = asWorkflowRunEvent(evt)
+      if (!wf || wf.run.id !== props.run.id) return
+      void refetch()
+    })
+    onCleanup(off)
+  })
+
+  onMount(() => {
+    const interval = setInterval(() => {
+      if (currentRun().status === "running" || currentAgent().status === "running") void refetch()
+    }, 1000)
+    onCleanup(() => clearInterval(interval))
   })
 
   onCleanup(() => {
@@ -1090,7 +1219,7 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
   })
 
   function copyOutput() {
-    const text = props.agent.output ?? props.agent.prompt ?? ""
+    const text = currentAgent().output ?? currentAgent().prompt ?? ""
     if (!text.trim()) return
     void Clipboard.write(text).then(() => {
       setCopyNotice(true)
@@ -1111,7 +1240,7 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
   async function sendPrompt() {
     const text = promptText().trim()
     if (!text) return
-    const sessionId = (props.agent as any).session_id
+    const sessionId = (currentAgent() as any).session_id
     if (!sessionId) {
       toast.show({ message: "No session for this agent, open session instead", variant: "info" })
       return
@@ -1122,7 +1251,7 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
         sessionID: sessionId,
         prompt: { text },
       } as any)
-      toast.show({ message: `Prompt sent to ${props.agent.label ?? "agent"}`, variant: "success" })
+      toast.show({ message: `Prompt sent to ${currentAgent().label ?? "agent"}`, variant: "success" })
       setPromptText("")
       setPromptMode(false)
     } catch (e) {
@@ -1130,33 +1259,87 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
     }
   }
 
+  function hide() {
+    dialog.clear()
+  }
+
   useBindings(() => ({
+    priority: 1,
+    enabled: () => !promptMode(),
     bindings: [
-      { key: "b", desc: "Back", group: "Workflow", cmd: props.onClose },
-      { key: "escape", desc: "Back / cancel prompt", group: "Workflow", cmd: () => {
-        if (promptMode()) {
+      {
+        key: "b",
+        desc: "Back",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          props.onClose()
+        },
+      },
+      {
+        key: "escape",
+        desc: "Back",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          props.onClose()
+        },
+      },
+      {
+        key: "q",
+        desc: "Hide to see subagent",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          hide()
+        },
+      },
+      { key: "y", desc: "Copy output", group: "Workflow", cmd: () => copyOutput() },
+      { key: "o", desc: "Open session", group: "Workflow", cmd: () => props.onOpenSession?.() },
+      { key: "p", desc: "Prompt agent", group: "Workflow", cmd: () => togglePrompt() },
+      { key: "j", desc: "Scroll down", group: "Workflow", cmd: () => outputScroll?.scrollBy(3) },
+      { key: "k", desc: "Scroll up", group: "Workflow", cmd: () => outputScroll?.scrollBy(-3) },
+      { key: "down", desc: "Scroll down", group: "Workflow", cmd: () => outputScroll?.scrollBy(1) },
+      { key: "up", desc: "Scroll up", group: "Workflow", cmd: () => outputScroll?.scrollBy(-1) },
+      { key: "pagedown,ctrl+f", desc: "Page down", group: "Workflow", cmd: () => outputScroll?.scrollBy(outputScroll?.height ?? 10) },
+      { key: "pageup,ctrl+b", desc: "Page up", group: "Workflow", cmd: () => outputScroll?.scrollBy(-(outputScroll?.height ?? 10)) },
+    ],
+  }))
+
+  useBindings(() => ({
+    priority: 2,
+    enabled: () => promptMode(),
+    bindings: [
+      {
+        key: "escape",
+        desc: "Cancel prompt",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
           setPromptMode(false)
           setPromptText("")
-        } else {
-          props.onClose()
-        }
-      }},
-      { key: "y", desc: "Copy output", group: "Workflow", cmd: () => { if (!promptMode()) copyOutput() } },
-      { key: "o", desc: "Open session", group: "Workflow", cmd: () => { if (!promptMode()) props.onOpenSession?.() } },
-      { key: "p", desc: "Prompt agent", group: "Workflow", cmd: () => { if (!promptMode()) togglePrompt() } },
-      { key: "j", desc: "Scroll down", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(3) } },
-      { key: "k", desc: "Scroll up", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(-3) } },
-      { key: "down", desc: "Scroll down", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(1) } },
-      { key: "up", desc: "Scroll up", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(-1) } },
-      { key: "pagedown,ctrl+f", desc: "Page down", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(outputScroll?.height ?? 10) } },
-      { key: "pageup,ctrl+b", desc: "Page up", group: "Workflow", cmd: () => { if (!promptMode()) outputScroll?.scrollBy(-(outputScroll?.height ?? 10)) } },
+        },
+      },
     ],
   }))
 
   const statusColor = createMemo(() => {
-    if (props.agent.status === "completed") return theme.success
-    if (props.agent.status === "failed") return theme.error
-    if (props.agent.status === "running") return theme.primary
+    const s = currentAgent().status
+    if (s === "completed") return theme.success
+    if (s === "failed") return theme.error
+    if (s === "running") return theme.primary
     return theme.textMuted
   })
 
@@ -1165,35 +1348,45 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
       <box flexDirection="row" justifyContent="space-between" alignItems="center">
         <box flexDirection="row" gap={2} alignItems="center">
           <text fg={statusColor()} attributes={TextAttributes.BOLD}>
-            {agentIcon(props.agent.status)} {props.agent.label ?? props.agent.agent ?? `agent:${props.agent.id.slice(-4)}`}
+            {agentIcon(currentAgent().status)} {currentAgent().label ?? currentAgent().agent ?? `agent:${currentAgent().id.slice(-4)}`}
           </text>
-          <Show when={(props.agent as any).cached}>
+          <Show when={(currentAgent() as any).cached}>
             <text fg={theme.warning} attributes={TextAttributes.BOLD}>
               cached
             </text>
           </Show>
-          <text fg={theme.textMuted}>{props.agent.phase ? `phase: ${props.agent.phase}` : ""}</text>
+          <text fg={theme.textMuted}>{currentAgent().phase ? `phase: ${currentAgent().phase}` : ""}</text>
+          <Show when={currentAgent().status === "running"}>
+            <text fg={theme.primary} attributes={TextAttributes.BOLD}>
+              ● live
+            </text>
+          </Show>
         </box>
-        <text fg={theme.textMuted} onMouseUp={props.onClose}>
-          esc
-        </text>
+        <box flexDirection="row" gap={2} alignItems="center">
+          <text fg={theme.textMuted} onMouseUp={props.onClose}>
+            esc
+          </text>
+          <text fg={theme.textMuted} onMouseUp={() => hide()}>
+            hide
+          </text>
+        </box>
       </box>
 
       <box flexDirection="row" gap={2} flexWrap="wrap" border={["bottom"]} borderColor={theme.borderSubtle} paddingBottom={1}>
         <text fg={theme.textMuted}>
-          Model: <span style={{ fg: theme.text }}>{props.agent.model ? modelLabel(props.agent as any) : "default"}</span>
+          Model: <span style={{ fg: theme.text }}>{currentAgent().model ? modelLabel(currentAgent() as any) : "default"}</span>
         </text>
         <text fg={theme.textMuted}>
-          Tokens: <span style={{ fg: theme.text }}>{formatTokens(agentTokens(props.agent as any) as any)}</span>
+          Tokens: <span style={{ fg: theme.text }}>{formatTokens(agentTokens(currentAgent() as any) as any)}</span>
         </text>
         <text fg={theme.textMuted}>
-          Cost: <span style={{ fg: theme.text }}>{formatCost((props.agent as any).cost ?? 0)}</span>
+          Cost: <span style={{ fg: theme.text }}>{formatCost((currentAgent() as any).cost ?? 0)}</span>
         </text>
         <text fg={theme.textMuted}>
-          Duration: <span style={{ fg: theme.text }}>{formatShortElapsed(props.agent.started_at, (props.agent as any).completed_at)}</span>
+          Duration: <span style={{ fg: theme.text }}>{formatShortElapsed(currentAgent().started_at, (currentAgent() as any).completed_at)}</span>
         </text>
         <text fg={theme.textMuted}>
-          Status: <span style={{ fg: statusColor() }}>{props.agent.status}</span>
+          Status: <span style={{ fg: statusColor() }}>{currentAgent().status}</span>
         </text>
       </box>
 
@@ -1215,7 +1408,7 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
           paddingBottom={1}
         >
           <text fg={theme.textMuted} wrapMode="word">
-            {props.agent.prompt ?? "(no prompt)"}
+            {currentAgent().prompt ?? "(no prompt)"}
           </text>
         </scrollbox>
 
@@ -1235,15 +1428,27 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
           paddingTop={1}
           paddingBottom={1}
         >
-          <Show when={props.agent.output} fallback={<text fg={theme.textMuted}>No output yet...</text>}>
+          <Show
+            when={currentAgent().output}
+            fallback={
+              <box flexDirection="column" gap={1}>
+                <text fg={theme.textMuted}>
+                  {currentAgent().status === "running" ? "Agent is running — output will appear when it completes." : "No output yet..."}
+                </text>
+                <Show when={currentAgent().status === "running" && (currentAgent() as any).session_id}>
+                  <text fg={theme.primary}>Press [O] to open live session and watch it work.</text>
+                </Show>
+              </box>
+            }
+          >
             <text fg={theme.text} wrapMode="word">
-              {props.agent.output}
+              {currentAgent().output}
             </text>
           </Show>
-          <Show when={props.agent.error}>
+          <Show when={currentAgent().error}>
             <box paddingTop={1}>
               <text fg={theme.error} wrapMode="word">
-                Error: {props.agent.error}
+                Error: {currentAgent().error}
               </text>
             </box>
           </Show>
@@ -1254,7 +1459,7 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
             <text fg={theme.text} attributes={TextAttributes.BOLD}>Prompt this agent:</text>
             <box flexDirection="row" gap={1}>
               <input
-                ref={(r: any) => (promptInputRef = r)}
+                ref={(r: InputRenderable) => (promptInputRef = r)}
                 placeholder="Enter follow-up prompt for this subagent..."
                 placeholderColor={theme.textMuted}
                 textColor={theme.text}
@@ -1288,9 +1493,14 @@ function DialogWorkflowAgentDetail(props: { agent: WorkflowRun["agents"][number]
             <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[O]</span> Open session
           </text>
         </box>
-        <text fg={theme.textMuted}>
-          <span style={{ attributes: TextAttributes.BOLD }}>Esc/B</span> Back
-        </text>
+        <box flexDirection="row" gap={2} alignItems="center">
+          <text fg={theme.textMuted}>
+            <span style={{ attributes: TextAttributes.BOLD }}>Esc/B</span> Back
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ attributes: TextAttributes.BOLD }}>Q</span> Hide
+          </text>
+        </box>
       </box>
 
       <Show when={copyNotice()}>
@@ -1316,6 +1526,7 @@ function DialogWorkflowRun(props: {
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
+  const renderer = useRenderer()
   const [copyNotice, setCopyNotice] = createSignal(false)
   dialog.setSize("xlarge")
   let phaseScroll: ScrollBoxRenderable | undefined
@@ -1348,6 +1559,16 @@ function DialogWorkflowRun(props: {
     focusedPanel: "phases" as "phases" | "agents",
   })
   const selectedPhase = createMemo(() => phases()[store.selectedPhase] ?? phases()[0])
+  const phaseDataPreview = createMemo(() => {
+    const pd = (current() as any).phase_data?.[selectedPhase() ?? ""]
+    if (pd === undefined) return undefined
+    try {
+      const str = JSON.stringify(pd, null, 2)
+      return str.length > 500 ? str.slice(0, 500) + "… (truncated)" : str
+    } catch {
+      return String(pd).slice(0, 500)
+    }
+  })
   const selectedPhaseRows = createMemo(() => {
     const rows = phaseRows(current(), phases(), selectedPhase())
     const filter = (store as any).agentFilter ?? "all"
@@ -1477,6 +1698,7 @@ function DialogWorkflowRun(props: {
   })
 
   const back = () => dialog.replace(() => <DialogWorkflow />)
+  const hide = () => dialog.clear()
   const cancel = () => {
     if (current().status !== "running") return
     void sdk.client.workflow
@@ -1637,15 +1859,34 @@ function DialogWorkflowRun(props: {
     else movePhase(1)
   }
 
+  function openSelectedAgentRow() {
+    const row = selectedRow()
+    if (!row) return
+    if (row.type === "agent") {
+      // Any agent with a session_id can be inspected live via its subagent
+      // session. Open the session directly so the user can see its work and
+      // talk to it, regardless of running/completed status. This fixes "still
+      // cant access to the subagent from the workflow".
+      if (row.agent.session_id) {
+        openAgentSession()
+        return
+      }
+      openAgentDetail()
+      return
+    }
+    if (row.type === "result") pageResult(resultBodyLines())
+  }
+
   function handleRight() {
     if (store.focusedPanel === "phases") {
       // Move focus to agents panel
       focusAgents()
     } else {
-      // In agents panel, drill into agent detail
+      // Right is light inspect: show agent detail output
       const row = selectedRow()
-      if (row?.type === "agent") openAgentDetail()
-      else if (row?.type === "result") pageResult(resultBodyLines())
+      if (!row) return
+      if (row.type === "agent") openAgentDetail()
+      else if (row.type === "result") pageResult(resultBodyLines())
     }
   }
 
@@ -1709,24 +1950,58 @@ function DialogWorkflowRun(props: {
   }
 
   useBindings(() => ({
+    priority: 1,
     bindings: [
-      { key: "b", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
-      { key: "escape", desc: "Back / hide workflow", group: "Workflow", cmd: () => {
-        if (store.focusedPanel === "agents") focusPhases()
-        else dialog.clear()
-      }},
+      {
+        key: "b",
+        desc: "Back to workflow dashboard",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          back()
+        },
+      },
+      {
+        key: "escape",
+        desc: "Back to dashboard (Esc)",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          back()
+        },
+      },
+      {
+        key: "q",
+        desc: "Hide workflow to see subagent",
+        group: "Workflow",
+        cmd: () => {
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          hide()
+        },
+      },
       { key: "left", desc: "Focus phases / back to dashboard", group: "Workflow", cmd: handleLeft },
-      { key: "right", desc: "Focus agents / drill into agent", group: "Workflow", cmd: handleRight },
+      { key: "right", desc: "Inspect agent detail", group: "Workflow", cmd: handleRight },
       { key: "tab", desc: "Switch focus phases<>agents", group: "Workflow", cmd: switchFocus },
-      { key: "return", desc: "Drill into phase / agent detail", group: "Workflow", cmd: () => {
+      { key: "return", desc: "Open agent session", group: "Workflow", cmd: () => {
         if (store.focusedPanel === "phases") {
           focusAgents()
         } else {
-          const row = selectedRow()
-          if (!row) return
-          if (row.type === "agent") openAgentDetail()
-          else if (row.type === "result") pageResult(resultBodyLines())
+          openSelectedAgentRow()
         }
+      }},
+      { key: "i", desc: "Inspect agent detail", group: "Workflow", cmd: () => {
+        const row = selectedRow()
+        if (row?.type === "agent") openAgentDetail()
+        else if (row?.type === "result") pageResult(resultBodyLines())
       }},
       { key: "o", desc: "Open agent session", group: "Workflow", cmd: openAgentSession },
       { key: "y", desc: "Copy selected response", group: "Workflow", cmd: copySelectedResponse },
@@ -1792,13 +2067,14 @@ function DialogWorkflowRun(props: {
       return theme.textMuted
     })
     const labelWidth = createMemo(() => Math.min(30, Math.max(14, Math.floor(agentPanelWidth() * 0.32))))
-    const rowText = createMemo(() =>
-      fitColumns(
-        `${active() ? "›" : phaseRowIcon(current(), row)} ${Locale.truncate(phaseRowLabel(row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(row)}`,
+    const rowText = createMemo(() => {
+      const cached = row.type === "agent" && (row.agent as any).cached ? "♻ " : ""
+      return fitColumns(
+        `${active() ? "›" : phaseRowIcon(current(), row)} ${cached}${Locale.truncate(phaseRowLabel(row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(row)}`,
         phaseRowMetrics(current(), row),
         agentPanelWidth() - 2,
-      ),
-    )
+      )
+    })
 
     return (
       <text
@@ -1820,11 +2096,16 @@ function DialogWorkflowRun(props: {
       <box flexDirection="column" gap={0} flexShrink={0} paddingBottom={1} border={["bottom"]} borderColor={theme.borderSubtle}>
         <box flexDirection="row" justifyContent="space-between" alignItems="center">
           <text fg={theme.primary} attributes={TextAttributes.BOLD} wrapMode="none" overflow="hidden">
-            {Locale.truncate(workflow()?.meta.name ?? current().workflow, detailHeaderWidth() - 20)}
+            {Locale.truncate(workflow()?.meta.name ?? current().workflow, detailHeaderWidth() - 32)}
           </text>
-          <text fg={theme.textMuted}>
-            {agentProgress(current())} · {formatShortDuration(current())}
-          </text>
+          <box flexDirection="row" gap={2} alignItems="center">
+            <text fg={theme.textMuted}>
+              {agentProgress(current())} · {formatShortDuration(current())}
+            </text>
+            <text fg={theme.textMuted} onMouseUp={() => back()}>
+              esc back
+            </text>
+          </box>
         </box>
         <box flexDirection="row" justifyContent="space-between">
           <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
@@ -1834,6 +2115,24 @@ function DialogWorkflowRun(props: {
             <text fg={statusColor(current().status, theme)}>{statusIcon(current().status)}</text>
             <text fg={theme.textMuted}>{statusLabel(current().status)}</text>
           </box>
+        </box>
+        <box flexDirection="row" gap={2} marginTop={1}>
+          <text fg={theme.textMuted}>
+            Budget: <span style={{ fg: theme.text }}>{formatCost(runUsage(current()).cost)}</span>
+            <Show when={current().agents.filter((a: any) => a.status === "running").length > 0}>
+              <span style={{ fg: theme.textMuted }}>
+                {" "}
+                (+
+                {(() => {
+                  const running = current().agents.filter((a: any) => a.status === "running").length
+                  const completed = current().agents.filter((a: any) => a.status === "completed")
+                  const avg = completed.length > 0 ? completed.reduce((s: number, a: any) => s + (a.cost ?? 0), 0) / completed.length : 0.001
+                  return formatCost(running * avg)
+                })()}{" "}
+                reserved)
+              </span>
+            </Show>
+          </text>
         </box>
       </box>
 
@@ -1854,6 +2153,7 @@ function DialogWorkflowRun(props: {
               {(phase, index) => {
                 const status = createMemo(() => phaseStatus(current(), phases(), phase))
                 const active = createMemo(() => index() === store.selectedPhase)
+                const isSetup = createMemo(() => phase === SETUP_PHASE)
                 // Item 14: a child-workflow phase reads as a nested step : '↳'
                 // instead of the number/status icon when inactive (active keeps
                 // the '›' selection arrow) plus a 2-space title indent.
@@ -1862,6 +2162,7 @@ function DialogWorkflowRun(props: {
                   active() ? "›" : child() ? "↳" : status() === "pending" ? `${index() + 1}` : phaseIcon(status()),
                 )
                 const color = createMemo(() => {
+                  if (isSetup()) return theme.textMuted
                   if (active()) return theme.primary
                   if (status() === "completed") return theme.text
                   if (status() === "failed" || status() === "interrupted") return theme.error
@@ -1908,8 +2209,14 @@ function DialogWorkflowRun(props: {
         </box>
         <box flexGrow={1} minWidth={0} paddingLeft={1} paddingRight={1} minHeight={0} border={store.focusedPanel === "agents" ? ["left"] : []} borderColor={store.focusedPanel === "agents" ? theme.primary : theme.border}>
           <text fg={store.focusedPanel === "agents" ? theme.primary : theme.text} attributes={store.focusedPanel === "agents" ? TextAttributes.BOLD : undefined} wrapMode="none" overflow="hidden">
-            {sectionTitle(store.focusedPanel === "agents" ? `› ${phaseRowTitle(selectedPhase(), selectedPhaseRows())}` : phaseRowTitle(selectedPhase(), selectedPhaseRows()), agentPanelWidth() - 2)}
+            {sectionTitle(store.focusedPanel === "agents" ? `› ${phaseRowTitle(selectedPhase(), selectedPhaseRows(), phases(), store.selectedPhase)}` : phaseRowTitle(selectedPhase(), selectedPhaseRows(), phases(), store.selectedPhase), agentPanelWidth() - 2)}
           </text>
+          <Show when={phaseDataPreview()}>
+            <box border={["left"]} borderColor={theme.borderSubtle} paddingLeft={1} marginBottom={1} flexDirection="column">
+              <text fg={theme.textMuted} attributes={TextAttributes.BOLD}>phase_data:</text>
+              <text fg={theme.textMuted} wrapMode="none" overflow="hidden">{phaseDataPreview()}</text>
+            </box>
+          </Show>
           <Show
             when={!selectedResult()}
             fallback={
@@ -1995,16 +2302,19 @@ function DialogWorkflowRun(props: {
             <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[↑/↓]</span> Phase
           </text>
           <text fg={theme.textMuted}>
-            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[←/→]</span> Agent
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[←/→]</span> Detail
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Enter]</span> Session
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[I]</span> Detail
           </text>
           <text fg={theme.textMuted}>
             <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Y]</span> Copy
           </text>
           <text fg={theme.textMuted}>
             <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[S]</span> Save
-          </text>
-          <text fg={theme.textMuted}>
-            <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[Enter]</span> Open
           </text>
           <text fg={theme.textMuted}>
             <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>[X]</span> Kill
@@ -2018,6 +2328,9 @@ function DialogWorkflowRun(props: {
           </Show>
           <text fg={theme.textMuted}>
             <span style={{ attributes: TextAttributes.BOLD }}>Esc</span> Back
+          </text>
+          <text fg={theme.textMuted}>
+            <span style={{ attributes: TextAttributes.BOLD }}>Q</span> Hide
           </text>
         </box>
       </box>

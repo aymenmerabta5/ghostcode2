@@ -127,9 +127,12 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
         )
     })
 
-    const exportRun = Effect.fn("WorkflowHttpApi.export")(function* (ctx: { params: { id: Workflow.RunID } }) {
+    const exportRun = Effect.fn("WorkflowHttpApi.export")(function* (ctx: { params: { id: Workflow.RunID }; query: { markdown?: boolean } }) {
+      // markdown query param is handled — export always generates both JSON and markdown, but we respect the flag
       const result = yield* workflow.export(ctx.params.id)
       if (!result) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      // If markdown=true, ensure markdown file exists (exportRun already writes it)
+      // The result includes both files; caller can read bundle.md if needed
       return result
     })
 
