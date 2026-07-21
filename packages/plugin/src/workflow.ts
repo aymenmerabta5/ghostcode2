@@ -32,6 +32,9 @@ export type WorkflowAgentInput = {
   label?: string
   isolation?: "worktree"
   onError?: "fail" | "null"
+  effort?: "low" | "medium" | "high" | "xhigh" | "max"
+  agentType?: string
+  maxRepairs?: number
 }
 
 export type WorkflowAgentResult = { data: unknown; text: string }
@@ -95,7 +98,17 @@ export type WorkflowContext = {
     tokensSpent(): number
     tokensRemaining(): number
   }
-  setPhase(phase: string): void
+  setPhase(phase: string, data?: unknown): unknown
+  getPhase(name: string): unknown
+  getAllPhases(): Record<string, unknown>
+  readonly state: {
+    get(key: string): unknown
+    set(key: string, value: unknown): void
+    has(key: string): boolean
+    delete(key: string): boolean
+    entries(): [string, unknown][]
+    toObject(): Record<string, unknown>
+  }
   log(message: string): void
   parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<(T | null)[]>
   pipeline: WorkflowPipelineFn
@@ -104,9 +117,13 @@ export type WorkflowContext = {
   shell(command: string, opts?: { timeout?: number; cwd?: string }): Promise<{ output: string; exitCode: number }>
   workflow(name: string, args?: Record<string, unknown>): Promise<unknown>
   question(input: { question: string; options?: readonly string[]; timeout?: number }): Promise<{ answer: string }>
+  waitForAgents(options?: { timeout?: number; failOnTimeout?: boolean }): Promise<void>
+  getPhaseData?(name: string): unknown
+  mergeWorktree?(agentResult: { branch?: string; changedFiles?: string[] } | WorkflowAgentResult): Promise<{ merged: boolean; branch: string }>
+  invalidatePhase?(name: string): void
 }
 
-export type WorkflowPhase = string | { title: string; detail?: string; model?: string }
+export type WorkflowPhase = string | { title: string; detail?: string; model?: string; budget?: number | { usd?: number; tokens?: number } }
 
 export type WorkflowDefinition<
   Args extends WorkflowArguments | undefined = WorkflowArguments | undefined,
@@ -117,6 +134,9 @@ export type WorkflowDefinition<
     whenToUse?: string
     phases?: readonly WorkflowPhase[]
     arguments?: Args
+    phaseValidation?: "strict" | "warn"
+    allowNondeterminism?: boolean
+    tools?: string[]
   }
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
 }
@@ -127,6 +147,9 @@ export function workflow<const Args extends WorkflowArguments | undefined = unde
   whenToUse?: string
   phases?: readonly WorkflowPhase[]
   arguments?: Args
+  phaseValidation?: "strict" | "warn"
+  allowNondeterminism?: boolean
+  tools?: string[]
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
 }): WorkflowDefinition<Args> {
   return {
@@ -136,6 +159,9 @@ export function workflow<const Args extends WorkflowArguments | undefined = unde
       whenToUse: input.whenToUse,
       phases: input.phases,
       arguments: input.arguments,
+      phaseValidation: input.phaseValidation,
+      allowNondeterminism: input.allowNondeterminism,
+      tools: input.tools,
     },
     run: input.run,
   }

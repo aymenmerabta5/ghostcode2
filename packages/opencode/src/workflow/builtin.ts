@@ -40,64 +40,79 @@ const DEEP_RESEARCH = `export default {
       },
       label: "plan"
     })
+    if (!plan) throw new Error("deep-research: plan agent failed to return result (check previous agent logs for parse errors)")
+    const angles = (plan.data as any)?.angles
+    if (!Array.isArray(angles) || angles.length === 0) throw new Error("deep-research: plan returned invalid data, expected {angles: string[]}")
 
     ctx.setPhase("research")
-    const findings = (await ctx.parallel(
-      plan.data.angles.map((angle) => () =>
-        ctx.agent({
-          prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "no_web_tools": true} via the schema. Angle: \${angle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
-          schema: {
-            type: "object",
-            required: ["claims"],
-            properties: {
-              claims: {
-                type: "array",
-                items: {
-                  type: "object",
-                  required: ["claim", "sources"],
-                  properties: {
-                    claim: { type: "string" },
-                    sources: { type: "array", items: { type: "string" } },
-                  },
-                },
-              },
-              no_web_tools: { type: "boolean" },
-            },
-          },
-          label: \`research:\${angle.slice(0,30)}\`
-        }),
-      ),
-    )).filter((f) => f !== null)
-    if (findings.some((f) => (f.data as { no_web_tools?: boolean }).no_web_tools))
-      throw new Error("deep-research requires web/search tools to be available to agents")
-
-    const claims = findings.flatMap((f) => f.data.claims)
-
-    ctx.setPhase("verify")
-    const verified = (await ctx.parallel(
-      claims.map((c) => () =>
-        ctx
-          .agent({
-            prompt: \`Adversarially verify this claim against its sources (fetch them). Claim: \${c.claim}\\nSources: \${c.sources.join(", ")}\\nReply via schema: supported=true only if the sources actually back the claim.\`,
+    const findingsRaw = await ctx.parallel(
+      angles.map((angle) => {
+        const safeAngle = String(angle ?? "")
+        return () =>
+          ctx.agent({
+            prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "no_web_tools": true} via the schema. Angle: \${safeAngle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
             schema: {
               type: "object",
-              required: ["supported", "reason"],
-              properties: { supported: { type: "boolean" }, reason: { type: "string" } },
+              required: ["claims"],
+              properties: {
+                claims: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["claim", "sources"],
+                    properties: {
+                      claim: { type: "string" },
+                      sources: { type: "array", items: { type: "string" } },
+                    },
+                  },
+                },
+                no_web_tools: { type: "boolean" },
+              },
             },
-            label: \`verify:\${c.claim.slice(0,30)}\`
+            label: \`research:\${safeAngle.slice(0,30)}\`
           })
-          .then((v) => ({ ...c, verdict: v.data })),
-      ),
+      }),
+    )
+    const findings = (findingsRaw as any[]).filter((f) => f !== null)
+    if (findings.length === 0) throw new Error("deep-research: all research agents failed")
+    if (findings.some((f) => (f.data as { no_web_tools?: boolean })?.no_web_tools))
+      throw new Error("deep-research requires web/search tools to be available to agents")
+
+    const claims = findings.flatMap((f) => {
+      const c = (f.data as any)?.claims
+      return Array.isArray(c) ? c.filter((x: any) => x && typeof x.claim === "string") : []
+    })
+
+    ctx.setPhase("verify")
+    const verifiedRaw = await ctx.parallel(
+      claims.map((c) => {
+        const claimStr = String((c as any)?.claim ?? "")
+        const sourcesArr = Array.isArray((c as any)?.sources) ? (c as any).sources : []
+        return () =>
+          ctx
+            .agent({
+              prompt: \`Adversarially verify this claim against its sources (fetch them). Claim: \${claimStr}\\nSources: \${sourcesArr.join(", ")}\\nReply via schema: supported=true only if the sources actually back the claim.\`,
+              schema: {
+                type: "object",
+                required: ["supported", "reason"],
+                properties: { supported: { type: "boolean" }, reason: { type: "string" } },
+              },
+              label: \`verify:\${claimStr.slice(0,30)}\`
+            })
+            .then((v) => v ? ({ ...c, verdict: v.data }) : null)
+      }),
       { concurrencyLimit: 8 },
-    )).filter((v) => v !== null)
-    const surviving = verified.filter((c) => c.verdict.supported)
-    const rejected = verified.filter((c) => !c.verdict.supported)
+    )
+    const verified = (verifiedRaw as any[]).filter((v) => v !== null)
+    const surviving = verified.filter((c) => c.verdict?.supported)
+    const rejected = verified.filter((c) => !c.verdict?.supported)
 
     ctx.setPhase("synthesize")
     const report = await ctx.agent({
-      prompt: \`Write a cited research report answering: \${question}\\nUse ONLY these verified claims (cite their sources inline): \${JSON.stringify(surviving)}\\nList rejected claims briefly at the end: \${JSON.stringify(rejected.map((r) => ({ claim: r.claim, reason: r.verdict.reason })))}\`,
+      prompt: \`Write a cited research report answering: \${question}\\nUse ONLY these verified claims (cite their sources inline): \${JSON.stringify(surviving)}\\nList rejected claims briefly at the end: \${JSON.stringify(rejected.map((r) => ({ claim: r.claim, reason: r.verdict?.reason })))}\`,
       label: "synthesize"
     })
+    if (!report) throw new Error("deep-research: synthesize agent failed")
 
     return { report: report.text, claims: { verified: surviving.length, rejected: rejected.length } }
   },
@@ -120,43 +135,59 @@ const AUDIT_AUTH = `export default {
       schema: { type: "object", required: ["files"], properties: { files: { type: "array", items: { type: "string" } } } },
       label: "discover"
     })
+    if (!found) throw new Error("audit-auth: discover agent failed to return result")
+    const files = (found.data as any)?.files
+    if (!Array.isArray(files)) throw new Error("audit-auth: discover returned invalid data, expected {files: string[]}")
 
     ctx.setPhase("audit")
-    const audits = (await ctx.parallel(
-      found.data.files.map((file) => () =>
-        ctx.agent({
-          prompt: \`Audit \${file} for missing authentication checks. Look for handlers without auth middleware, missing permission checks. Return {file, issues: string[]}\`,
-          schema: { type: "object", required: ["file","issues"], properties: { file:{type:"string"}, issues:{type:"array",items:{type:"string"}} } },
-          label: file
-        })
-      ),
+    const auditsRaw = await ctx.parallel(
+      files.map((file) => {
+        const safeFile = String(file ?? "unknown")
+        return () =>
+          ctx.agent({
+            prompt: \`Audit \${safeFile} for missing authentication checks. Look for handlers without auth middleware, missing permission checks. Return {file, issues: string[]}\`,
+            schema: { type: "object", required: ["file","issues"], properties: { file:{type:"string"}, issues:{type:"array",items:{type:"string"}} } },
+            label: safeFile
+          })
+      }),
       { concurrencyLimit: 8 }
-    )).filter(Boolean)
+    )
+    const audits = (auditsRaw as any[]).filter(Boolean)
+    if (audits.length === 0 && files.length > 0) ctx.log("audit-auth: all audit agents failed or returned null")
 
-    const flattened = audits.flatMap(a => a.data.issues.map(iss => ({ file: a.data.file, issue: iss })))
+    const flattened = audits.flatMap(a => {
+      const data = (a.data as any) ?? {}
+      const f = String(data.file ?? data?.file ?? "unknown")
+      const issues = Array.isArray(data.issues) ? data.issues : []
+      return issues.filter((iss: any) => typeof iss === "string").map((iss: string) => ({ file: f, issue: iss }))
+    })
 
     ctx.setPhase("verify")
-    const verified = (await ctx.parallel(
-      flattened.map(item => () =>
-        ctx.agent({
-          prompt: \`Adversarially verify: Does \${item.file} really have issue "\${item.issue}"? Read the file, check auth. Reply {supported:boolean, reason:string}\`,
-          schema: { type: "object", required: ["supported","reason"], properties: { supported:{type:"boolean"}, reason:{type:"string"} } },
-          label: \`verify:\${item.file}\`
-        }).then(v => ({ ...item, verdict: v.data }))
-      ),
+    const verifiedRaw = await ctx.parallel(
+      flattened.map(item => {
+        const safeFile = String(item.file ?? "unknown")
+        const safeIssue = String(item.issue ?? "")
+        return () =>
+          ctx.agent({
+            prompt: \`Adversarially verify: Does \${safeFile} really have issue "\${safeIssue}"? Read the file, check auth. Reply {supported:boolean, reason:string}\`,
+            schema: { type: "object", required: ["supported","reason"], properties: { supported:{type:"boolean"}, reason:{type:"string"} } },
+            label: \`verify:\${safeFile}\`
+          }).then(v => v ? ({ ...item, file: safeFile, issue: safeIssue, verdict: v.data }) : null)
+      }),
       { concurrencyLimit: 8 }
-    )).filter(Boolean)
-
-    const surviving = verified.filter(v => v.verdict.supported)
-    const rejected = verified.filter(v => !v.verdict.supported)
+    )
+    const verified = (verifiedRaw as any[]).filter(Boolean)
+    const surviving = verified.filter(v => v.verdict?.supported)
+    const rejected = verified.filter(v => !v.verdict?.supported)
 
     ctx.setPhase("report")
     const report = await ctx.agent({
       prompt: \`Write ranked security report from verified findings: \${JSON.stringify(surviving)}. Briefly list rejected as false positives: \${JSON.stringify(rejected)}. Group by severity.\`,
       label: "report"
     })
+    if (!report) throw new Error("audit-auth: report agent failed")
 
-    return { report: report.text, verified: surviving.length, rejected: rejected.length, files: found.data.files.length }
+    return { report: report.text, verified: surviving.length, rejected: rejected.length, files: files.length }
   }
 }
 `
@@ -180,22 +211,31 @@ const FIX_TYPECHECK = `export default {
         schema: { type: "object", required: ["errors","count"], properties: { errors:{type:"array",items:{type:"string"}}, count:{type:"number"} } },
         label: \`check:\${attempts}\`
       })
-
-      if (check.data.count === 0) {
+      if (!check) {
+        ctx.log(\`check agent \${attempts} returned null, retrying\`)
+        attempts++
+        continue
+      }
+      const count = (check.data as any)?.count
+      const errors = (check.data as any)?.errors
+      if (typeof count !== "number") throw new Error("fix-typecheck: check returned invalid data")
+      if (count === 0) {
         return { success: true, attempts, message: "Typecheck passes" }
       }
 
-      if (check.data.count >= lastErrorCount) {
-        ctx.log(\`No progress: \${check.data.count} errors vs \${lastErrorCount} previous\`)
+      if (count >= lastErrorCount) {
+        ctx.log(\`No progress: \${count} errors vs \${lastErrorCount} previous\`)
         if (attempts >= 2) break
       }
-      lastErrorCount = check.data.count
+      lastErrorCount = count
 
       ctx.setPhase("fix")
-      await ctx.agent({
-        prompt: \`Fix these type errors: \${JSON.stringify(check.data.errors.slice(0,10))}. Edit files to resolve.\`,
+      const safeErrors = Array.isArray(errors) ? errors : []
+      const fixRes = await ctx.agent({
+        prompt: \`Fix these type errors: \${JSON.stringify(safeErrors.slice(0,10))}. Edit files to resolve.\`,
         label: \`fix:\${attempts}\`
       })
+      if (!fixRes) ctx.log(\`fix agent \${attempts} returned null\`)
 
       attempts++
     }
@@ -205,6 +245,7 @@ const FIX_TYPECHECK = `export default {
       prompt: "Run typecheck one more time and summarize remaining errors",
       label: "final-check"
     })
+    if (!final) throw new Error("fix-typecheck: final check agent failed")
 
     return { success: false, attempts, final: final.text }
   }
@@ -225,34 +266,49 @@ const REVIEW_PR = `export default {
       schema: { type: "object", required: ["files"], properties: { files:{type:"array",items:{type:"string"}} } },
       label: "discover-changed"
     })
+    if (!changed) throw new Error("review-pr: discover agent failed")
+    const changedFiles = (changed.data as any)?.files
+    if (!Array.isArray(changedFiles)) throw new Error("review-pr: discover returned invalid data")
 
     ctx.setPhase("review")
-    const reviews = (await ctx.parallel(
-      changed.data.files.map(file => () =>
-        ctx.agent({
-          prompt: \`Review \${file} for correctness issues, security, logic errors. Return {file, issues: [{severity:"low|medium|high", description:string}]}\`,
-          schema: { type: "object", required:["file","issues"], properties:{ file:{type:"string"}, issues:{type:"array",items:{type:"object",required:["severity","description"],properties:{severity:{type:"string"},description:{type:"string"}}}} } },
-          label: file
-        })
-      ),
+    const reviewsRaw = await ctx.parallel(
+      changedFiles.map(file => {
+        const safeFile = String(file ?? "unknown")
+        return () =>
+          ctx.agent({
+            prompt: \`Review \${safeFile} for correctness issues, security, logic errors. Return {file, issues: [{severity:"low|medium|high", description:string}]}\`,
+            schema: { type: "object", required:["file","issues"], properties:{ file:{type:"string"}, issues:{type:"array",items:{type:"object",required:["severity","description"],properties:{severity:{type:"string"},description:{type:"string"}}}} } },
+            label: safeFile
+          })
+      }),
       { concurrencyLimit: 8 }
-    )).filter(Boolean)
+    )
+    const reviews = (reviewsRaw as any[]).filter(Boolean)
 
     ctx.setPhase("dedupe")
-    const allIssues = reviews.flatMap(r => r.data.issues.map(i => ({ ...i, file: r.data.file })))
+    const allIssues = reviews.flatMap(r => {
+      const data = (r.data as any) ?? {}
+      const file = String(data.file ?? data?.file ?? "unknown")
+      const issues = Array.isArray(data.issues) ? data.issues : []
+      return issues.map((i: any) => ({ ...i, file }))
+    })
     const deduped = await ctx.agent({
       prompt: \`Deduplicate and rank these issues by severity and impact: \${JSON.stringify(allIssues)}. Return {issues: same shape sorted high->low}\`,
       schema: { type: "object", required:["issues"], properties:{ issues:{type:"array",items:{type:"object",required:["severity","description","file"],properties:{severity:{type:"string"},description:{type:"string"},file:{type:"string"}}}} } },
       label: "dedupe-rank"
     })
+    if (!deduped) throw new Error("review-pr: dedupe agent failed")
+    const dedupedIssues = (deduped.data as any)?.issues
+    if (!Array.isArray(dedupedIssues)) throw new Error("review-pr: dedupe returned invalid data")
 
     ctx.setPhase("report")
     const report = await ctx.agent({
-      prompt: \`Write one ranked summary from: \${JSON.stringify(deduped.data.issues)}. Group by severity, cite files.\`,
+      prompt: \`Write one ranked summary from: \${JSON.stringify(dedupedIssues)}. Group by severity, cite files.\`,
       label: "report"
     })
+    if (!report) throw new Error("review-pr: report agent failed")
 
-    return { report: report.text, files: changed.data.files.length, issues: deduped.data.issues.length }
+    return { report: report.text, files: changedFiles.length, issues: dedupedIssues.length }
   }
 }
 `

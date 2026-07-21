@@ -49,7 +49,8 @@ export type StartOptions = StartInput & {
   caller_model?: { providerID: string; modelID: string }
   resume_of?: RunID
   replay?: "prefix" | "keyed"
-  invalidate_agents?: number[]
+  invalidate_agents?: (number | string)[]
+  invalidate_phases?: string[]
   questionAnswers?: Record<string, string>
 }
 
@@ -82,6 +83,9 @@ export type AgentInput = {
   label?: string
   isolation?: "worktree"
   onError?: "fail" | "null"
+  effort?: "low" | "medium" | "high" | "xhigh" | "max"
+  agentType?: string
+  maxRepairs?: number
 }
 
 export type ToolInput = {
@@ -104,7 +108,17 @@ export type ContextApi = {
     tokensSpent(): number
     tokensRemaining(): number
   }
-  readonly setPhase: (phase: string) => void
+  readonly setPhase: (phase: string, data?: unknown) => unknown
+  readonly getPhase: (name: string) => unknown
+  readonly getAllPhases: () => Record<string, unknown>
+  readonly state: {
+    get(key: string): unknown
+    set(key: string, value: unknown): void
+    has(key: string): boolean
+    delete(key: string): boolean
+    entries(): [string, unknown][]
+    toObject(): Record<string, unknown>
+  }
   readonly log: (message: string) => void
   readonly parallel: <T>(
     tasks: readonly (() => Promise<T>)[],
@@ -123,6 +137,10 @@ export type ContextApi = {
     options?: readonly string[]
     timeout?: number
   }) => Promise<{ answer: string }>
+  readonly waitForAgents: (options?: { timeout?: number; failOnTimeout?: boolean }) => Promise<void>
+  readonly mergeWorktree: (input: { branch?: string; changedFiles?: string[] } | { data: unknown; text: string } | any) => Promise<{ merged: boolean; branch: string }>
+  readonly invalidatePhase: (name: string) => void
+  readonly getPhaseData?: (name: string) => unknown
 }
 
 type _ContextApiSatisfiesWorkflowContext = ContextApi extends WorkflowContext ? true : never

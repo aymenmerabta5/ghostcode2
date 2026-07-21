@@ -8,8 +8,11 @@ export type WorkflowDefinitionRow = {
     name: string
     description?: string
     whenToUse?: string
-    phases?: { title: string; detail?: string; model?: string }[]
+    phases?: { title: string; detail?: string; model?: string; budget?: number | { usd?: number; tokens?: number } }[]
     arguments?: Record<string, { type?: string; default?: unknown; description?: string }>
+    phaseValidation?: "strict" | "warn"
+    allowNondeterminism?: boolean
+    tools?: string[]
   }
   source?: string
   temporary?: boolean
@@ -19,6 +22,7 @@ export type WorkflowLogRow = {
   time: number
   phase?: string
   message: string
+  child?: { run: string; workflow: string }
 }
 
 export type WorkflowAgentRow = {
@@ -45,8 +49,13 @@ export type WorkflowAgentRow = {
   }
   error?: string
   cached?: boolean
-  kind?: "agent" | "question"
+  kind?: "agent" | "question" | "tool"
   answer?: string
+  cache_key?: string
+  child?: { run: string; workflow: string }
+  branch?: string
+  effort?: string
+  agentType?: string
 }
 
 export const WorkflowRunTable = sqliteTable(
@@ -74,6 +83,8 @@ export const WorkflowRunTable = sqliteTable(
       options?: string[]
       asked_at: number
     }>(),
+    phase_data: text({ mode: "json" }).$type<Record<string, unknown>>(),
+    state: text({ mode: "json" }).$type<Record<string, unknown>>(),
     ...Timestamps,
   },
   (table) => [

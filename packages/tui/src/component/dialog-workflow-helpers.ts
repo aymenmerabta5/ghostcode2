@@ -126,12 +126,18 @@ export type WorkflowPhaseRow =
   | { type: "log"; entry: WorkflowRun["logs"][number] }
   | { type: "result" }
 
-// Item 19: phase membership for agents AND logs. The engine writes both with
-// `phase: undefined` before the first setPhase, so phase-less items belong to the
-// FIRST phase group. Previously phase-less agents were invisible in every phase
-// filter and phase-less logs were duplicated under EVERY phase — both fixed here.
+export const SETUP_PHASE = "Setup"
+
+// Workflows v2: implicit Setup pseudo-phase for logs/agents before first setPhase.
+// Before first setPhase, engine now writes phase="Setup" explicitly, but we also
+// handle legacy undefined for backward compat. Never force into first declared phase,
+// never duplicate under every phase.
 export function belongsToPhase(itemPhase: string | undefined, phase: string, phases: readonly string[]) {
-  return itemPhase === phase || (itemPhase == null && phase === phases[0])
+  const normalizedItem = itemPhase ?? SETUP_PHASE
+  if (phase === SETUP_PHASE) {
+    return normalizedItem === SETUP_PHASE
+  }
+  return normalizedItem === phase
 }
 
 export function phaseAgents(run: WorkflowRun, phases: readonly string[], phase?: string) {
@@ -141,8 +147,12 @@ export function phaseAgents(run: WorkflowRun, phases: readonly string[], phase?:
 
 // The phase the run's final result row renders under: the current phase when it
 // is part of the list, else the last phase.
+// Guard: result must only be pulled when the workflow fully finished (terminal).
+// If the engine ever produced a result while still running (unawaited agents),
+// we hide it until terminal so the operator never sees premature results.
 export function resultPhase(run: WorkflowRun, phases: readonly string[]) {
   if (run.result === undefined) return
+  if (run.status === "running" || run.status === "paused") return
   if (run.current_phase && phases.includes(run.current_phase)) return run.current_phase
   return phases.at(-1)
 }
@@ -270,34 +280,25 @@ export function phaseTitles(phases: readonly (string | { title: string })[] | un
   return (phases ?? []).map((phase) => (typeof phase === "string" ? phase : phase.title))
 }
 
-// Item 14: a phase entry in the detail view's phase panel — `child: true` marks
-// a phase observed from a nested ctx.workflow child (rendered indented with '↳').
+// v2: structured child attribution via child field on log/agent rows.
+// DELETE the /^.+?: ./ heuristic; mergeObservedPhases reads the field.
+// "Deploy: prod" must no longer be misclassified as child.
 export type RunPhaseEntry = { title: string; child: boolean }
 
-// Item 14: the engine attributes ctx.workflow children purely by prefixing their
-// current_phase/log/agent phases with '<child-name>: ' (engine logPrefix), so a
-// title matching /^.+?: ./ reads as a child phase. HEURISTIC until the engine
-// persists a structured child field on LogEntry/AgentNode (the engine half of
-// roadmap item 14) — switch to that field once it lands. Known limit: a parent
-// setPhase containing ': ' (e.g. 'Deploy: prod') is also rendered as a child;
-// that only affects the '↳'+indent optics, never behavior.
-export function isChildPhaseTitle(title: string): boolean {
-  return /^.+?: ./.test(title)
+// Deprecated heuristic removed - kept for backward compat but always returns false for v2 runs with structured child.
+// For legacy runs without child field, we treat no title as child to avoid misclassifying "Deploy: prod".
+export function isChildPhaseTitle(_title: string): boolean {
+  return false
 }
 
-// Item 14 (BUG): the detail view used to build its phase list ONLY from the
-// declared meta.phases, but observed phases — child-workflow phases ('<name>: x')
-// and undeclared parent setPhase titles — never match a declared title, so their
-// agents/logs were completely invisible. Merge them in:
-//   - declared phases stay in DECLARED order (the canonical plan, never re-sorted)
-//     and are always child:false;
-//   - every observed-but-undeclared phase ("extra") is inserted chronologically by
-//     its first observation: behind the last declared phase whose own first
-//     observation is <= the extra's (and behind earlier extras of that anchor);
-//     without such an anchor it is appended at the end;
-//   - run.current_phase with no log/agent observation yet sorts last (+Infinity);
-//   - declared == [] degrades to all observed phases in chronological order
-//     (covers the old no-declaration branch).
+function hasChildFieldForPhase(run: WorkflowRun, phaseTitle: string): boolean {
+  // Check if any log or agent with this phase has a child field set
+  return (
+    run.logs.some((l: any) => l.phase === phaseTitle && (l as any).child) ||
+    run.agents.some((a: any) => a.phase === phaseTitle && (a as any).child)
+  )
+}
+
 export function mergeObservedPhases(declared: readonly string[], run: WorkflowRun): RunPhaseEntry[] {
   // First observation per exact phase string; the minimum over logs and agents wins.
   const firstSeen = new Map<string, number>()
@@ -313,30 +314,59 @@ export function mergeObservedPhases(declared: readonly string[], run: WorkflowRu
     firstSeen.set(run.current_phase, Number.POSITIVE_INFINITY)
   }
 
+  // Implicit Setup pseudo-phase: if there are logs/agents with Setup or undefined, ensure Setup is observed
+  const hasSetup =
+    run.logs.some((l: any) => (l.phase ?? SETUP_PHASE) === SETUP_PHASE) ||
+    run.agents.some((a: any) => (a.phase ?? SETUP_PHASE) === SETUP_PHASE)
+  if (hasSetup && !firstSeen.has(SETUP_PHASE)) {
+    // Find earliest time among Setup items
+    let earliest = Number.POSITIVE_INFINITY
+    for (const entry of run.logs) {
+      if ((entry.phase ?? SETUP_PHASE) === SETUP_PHASE) {
+        const t = timestamp(entry.time) ?? Number.POSITIVE_INFINITY
+        if (t < earliest) earliest = t
+      }
+    }
+    for (const agent of run.agents) {
+      if ((agent.phase ?? SETUP_PHASE) === SETUP_PHASE) {
+        const t = timestamp(agent.started_at) ?? Number.POSITIVE_INFINITY
+        if (t < earliest) earliest = t
+      }
+    }
+    firstSeen.set(SETUP_PHASE, earliest)
+  }
+
   const declaredSet = new Set(declared)
   const extras = [...firstSeen.keys()].filter((phase) => !declaredSet.has(phase))
-  // Chronological by first observation; Array.prototype.sort is stable, so ties
-  // keep the first-observation (logs, then agents, then current_phase) order.
   extras.sort((a, b) => firstSeen.get(a)! - firstSeen.get(b)!)
 
-  const result: RunPhaseEntry[] = declared.map((title) => ({ title, child: false }))
+  // Build result: declared phases in order + extras inserted chronologically
+  // For v2, child flag read from structured child field, not title heuristic
+  const result: RunPhaseEntry[] = declared.map((title) => ({ title, child: hasChildFieldForPhase(run, title) }))
+
+  // If Setup exists and not in declared, prepend it as first phase (dimmed in TUI)
+  if (hasSetup && !declaredSet.has(SETUP_PHASE)) {
+    // Check if Setup already in extras
+    const setupIdx = extras.indexOf(SETUP_PHASE)
+    if (setupIdx !== -1) {
+      extras.splice(setupIdx, 1)
+    }
+    result.unshift({ title: SETUP_PHASE, child: false })
+  }
+
   for (const title of extras) {
+    if (title === SETUP_PHASE) continue // already handled
     const at = firstSeen.get(title)!
-    // Anchor = LAST declared phase whose own first observation is <= the extra's.
     let anchor = -1
     for (let i = 0; i < declared.length; i++) {
       const seen = firstSeen.get(declared[i])
       if (seen !== undefined && seen <= at) anchor = i
     }
-    const entry: RunPhaseEntry = { title, child: isChildPhaseTitle(title) }
+    const entry: RunPhaseEntry = { title, child: hasChildFieldForPhase(run, title) }
     if (anchor === -1) {
-      // No anchor: the extra precedes every observed declared phase (or no
-      // declared phase was ever observed) — append, never re-sort the plan.
       result.push(entry)
       continue
     }
-    // Insert directly behind the anchor and behind earlier-inserted extras of the
-    // same anchor (extras are processed in ascending firstSeen order).
     let index = result.findIndex((item) => item.title === declared[anchor]) + 1
     while (index < result.length && !declaredSet.has(result[index].title)) index++
     result.splice(index, 0, entry)

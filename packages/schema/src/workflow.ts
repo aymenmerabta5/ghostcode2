@@ -20,10 +20,17 @@ export const Argument = Schema.Struct({
 }).annotate({ identifier: "WorkflowArgument" })
 export interface Argument extends Schema.Schema.Type<typeof Argument> {}
 
+export const PhaseBudget = Schema.Struct({
+  usd: optional(Schema.Finite),
+  tokens: optional(Schema.Finite),
+})
+export type PhaseBudget = Schema.Schema.Type<typeof PhaseBudget>
+
 export const Phase = Schema.Struct({
   title: Schema.String,
   detail: optional(Schema.String),
   model: optional(Schema.String),
+  budget: optional(Schema.Union([Schema.Finite, PhaseBudget])),
 }).annotate({ identifier: "WorkflowPhase" })
 export interface Phase extends Schema.Schema.Type<typeof Phase> {}
 
@@ -35,7 +42,9 @@ const Phases = Schema.Array(PhaseEntry).pipe(
       entries.map((entry) => (typeof entry === "string" ? { title: entry } : entry)),
     ),
     encode: SchemaGetter.transform((phases) =>
-      phases.map((phase) => (phase.detail === undefined && phase.model === undefined ? phase.title : phase)),
+      phases.map((phase) =>
+        phase.detail === undefined && phase.model === undefined && phase.budget === undefined ? phase.title : phase,
+      ),
     ),
   }),
 )
@@ -46,6 +55,9 @@ export const Meta = Schema.Struct({
   whenToUse: optional(Schema.String),
   phases: optional(Phases),
   arguments: optional(Schema.Record(Schema.String, Argument)),
+  phaseValidation: optional(Schema.Literals(["strict", "warn"])),
+  allowNondeterminism: optional(Schema.Boolean),
+  tools: optional(Schema.Array(Schema.String)),
 }).annotate({ identifier: "WorkflowMeta" })
 export interface Meta extends Schema.Schema.Type<typeof Meta> {}
 
@@ -90,10 +102,16 @@ export const Status = Schema.Literals([
 ])
 export type Status = Schema.Schema.Type<typeof Status>
 
+export const ChildRef = Schema.Struct({
+  run: Schema.String,
+  workflow: Schema.String,
+})
+
 export const LogEntry = Schema.Struct({
   time: Schema.Finite,
   phase: optional(Schema.String),
   message: Schema.String,
+  child: optional(ChildRef),
 }).annotate({ identifier: "WorkflowLogEntry" })
 export interface LogEntry extends Schema.Schema.Type<typeof LogEntry> {}
 
@@ -126,8 +144,13 @@ export const AgentRun = Schema.Struct({
   ),
   error: optional(Schema.String),
   cached: optional(Schema.Boolean),
-  kind: optional(Schema.Literals(["agent", "question"])),
+  kind: optional(Schema.Literals(["agent", "question", "tool"])),
   answer: optional(Schema.String),
+  cache_key: optional(Schema.String),
+  child: optional(ChildRef),
+  branch: optional(Schema.String),
+  effort: optional(Schema.String),
+  agentType: optional(Schema.String),
 }).annotate({ identifier: "WorkflowAgentRun" })
 export interface AgentRun extends Schema.Schema.Type<typeof AgentRun> {}
 
@@ -153,6 +176,8 @@ export const Run = Schema.Struct({
       asked_at: Schema.Number,
     }),
   ),
+  phase_data: optional(Schema.Record(Schema.String, Schema.Unknown)),
+  state: optional(Schema.Record(Schema.String, Schema.Unknown)),
 }).annotate({ identifier: "WorkflowRun" })
 export interface Run extends Schema.Schema.Type<typeof Run> {}
 

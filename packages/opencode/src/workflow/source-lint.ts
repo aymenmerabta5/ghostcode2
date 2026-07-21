@@ -39,7 +39,41 @@ export function lint(source: string, filePath: string): { findings: Finding[] } 
     findings.push({ line: line + 1, rule, text: snippet(node, file) })
   }
 
+  // Escape hatch for determinism: if meta.allowNondeterminism: true, skip determinism checks
+  const allowNondeterminism = /allowNondeterminism\s*:\s*true/.test(source)
+
   const visit = (node: ts.Node): void => {
+    // Determinism lint per locked decision #4: BLOCKING error for Date.now(), Math.random(), no-arg new Date()
+    if (!allowNondeterminism) {
+      if (ts.isCallExpression(node)) {
+        // Date.now()
+        if (
+          ts.isPropertyAccessExpression(node.expression) &&
+          ts.isIdentifier(node.expression.expression) &&
+          node.expression.expression.text === "Date" &&
+          node.expression.name.text === "now"
+        ) {
+          add(node, "determinism-date-now")
+        }
+        // Math.random()
+        if (
+          ts.isPropertyAccessExpression(node.expression) &&
+          ts.isIdentifier(node.expression.expression) &&
+          node.expression.expression.text === "Math" &&
+          node.expression.name.text === "random"
+        ) {
+          add(node, "determinism-math-random")
+        }
+      }
+      if (ts.isNewExpression(node)) {
+        if (ts.isIdentifier(node.expression) && node.expression.text === "Date") {
+          if (!node.arguments || node.arguments.length === 0) {
+            add(node, "determinism-new-date")
+          }
+        }
+      }
+    }
+
     if (
       (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
       node.moduleSpecifier !== undefined &&

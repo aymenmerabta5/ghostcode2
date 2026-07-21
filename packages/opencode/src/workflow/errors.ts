@@ -35,6 +35,12 @@ export class AgentLimitError extends Schema.TaggedErrorClass<AgentLimitError>()(
   started: Schema.Finite,
 }) {}
 
+export class InvalidPhaseError extends Schema.TaggedErrorClass<InvalidPhaseError>()("WorkflowInvalidPhaseError", {
+  phase: Schema.String,
+  declared: Schema.Array(Schema.String),
+  message: Schema.String,
+}) {}
+
 export class CancelledError extends Error {
   readonly _tag = "WorkflowCancelledError"
   constructor() {
