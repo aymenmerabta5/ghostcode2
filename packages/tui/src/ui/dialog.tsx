@@ -70,7 +70,7 @@ function init() {
   const [store, setStore] = createStore({
     stack: [] as {
       element: JSX.Element
-      onClose?: () => void
+      onClose?: () => boolean | void
     }[],
     size: "medium" as "medium" | "large" | "xlarge",
   })
@@ -102,6 +102,18 @@ function init() {
     }, 1)
   }
 
+  function close() {
+    const current = store.stack.at(-1)
+    if (!current) return
+    setStore("stack", store.stack.slice(0, -1))
+    const result = current.onClose?.()
+    if (result === false) {
+      if (store.stack.length === 0) setStore("stack", [current])
+      return
+    }
+    refocus()
+  }
+
   useBindings(() => ({
     enabled: store.stack.length > 0 && !renderer.getSelection()?.getSelectedText(),
     bindings: [
@@ -112,11 +124,9 @@ function init() {
         cmd: () => {
           if (renderer.getSelection()) {
             renderer.clearSelection()
+            return
           }
-          const current = store.stack.at(-1)
-          current?.onClose?.()
-          setStore("stack", store.stack.slice(0, -1))
-          refocus()
+          close()
         },
       },
       {
@@ -126,11 +136,9 @@ function init() {
         cmd: () => {
           if (renderer.getSelection()) {
             renderer.clearSelection()
+            return
           }
-          const current = store.stack.at(-1)
-          current?.onClose?.()
-          setStore("stack", store.stack.slice(0, -1))
-          refocus()
+          close()
         },
       },
     ],
@@ -138,7 +146,12 @@ function init() {
 
   return {
     clear() {
-      for (const item of store.stack) {
+      const stack = [...store.stack]
+      batch(() => {
+        setStore("size", "medium")
+        setStore("stack", [])
+      })
+      for (const item of stack) {
         if (item.onClose) item.onClose()
       }
       batch(() => {
@@ -147,12 +160,17 @@ function init() {
       })
       refocus()
     },
-    replace(input: any, onClose?: () => void) {
+    replace(input: any, onClose?: () => boolean | void) {
       if (store.stack.length === 0) {
         focus = renderer.currentFocusedRenderable
         focus?.blur()
       }
-      for (const item of store.stack) {
+      const stack = [...store.stack]
+      batch(() => {
+        setStore("size", "medium")
+        setStore("stack", [])
+      })
+      for (const item of stack) {
         if (item.onClose) item.onClose()
       }
       setStore("size", "medium")

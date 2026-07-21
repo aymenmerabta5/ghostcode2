@@ -33,6 +33,12 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
 import * as KeyRotator from "./key-rotator"
 
+// Session-level liveness (session/llm/liveness.ts) is mandatory and provides TTFT/content watchdog
+// after normalization to LLMEvent. Transport-level timeouts (headerTimeout/chunkTimeout) are
+// optional and deliberately not added for meta in first patch to avoid headerTimeout < TTFT
+// conflicts (reasoning models can take 40-90s for first token). Follow-up may add proven
+// non-conflicting values once measured.
+
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 10_000
 
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
@@ -1184,13 +1190,15 @@ export class NoModelsError extends Schema.TaggedErrorClass<NoModelsError>()("Pro
 export type DefaultModelError = ModelNotFoundError | NoProvidersError | NoModelsError
 export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModelsError
 
+export type KeyInfo = { index: number; identity: string }
+
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
   readonly getLanguage: (
     model: Model,
-    onKeyIndex?: (index: number) => void,
+    onKeyInfo?: (info: KeyInfo) => void,
   ) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly getRotation: (
     providerID: ProviderV2.ID,
@@ -1198,9 +1206,13 @@ export interface Interface {
   readonly markRateLimited: (
     providerID: ProviderV2.ID,
     index: number | undefined,
-    opts?: { retryAfterMs?: number; exhausted?: boolean },
+    opts?: { retryAfterMs?: number; exhausted?: boolean; expectedIdentity?: string },
   ) => Effect.Effect<void>
-  readonly removeKey: (providerID: ProviderV2.ID, index: number | undefined) => Effect.Effect<void>
+  readonly removeKey: (
+    providerID: ProviderV2.ID,
+    index: number | undefined,
+    opts?: { expectedIdentity?: string },
+  ) => Effect.Effect<void>
   readonly closest: (
     providerID: ProviderV2.ID,
     query: string[],
@@ -1944,7 +1956,7 @@ const layer = Layer.effect(
     })
 
     const getLanguage = Effect.fn("Provider.getLanguage")(
-      function* (model: Model, onKeyIndex?: (index: number) => void) {
+      function* (model: Model, onKeyInfo?: (info: KeyInfo) => void) {
         const s = yield* InstanceState.get(state)
         const envs = yield* env.all()
         const key = `${model.providerID}/${model.id}`
@@ -1973,7 +1985,7 @@ const layer = Layer.effect(
             const result = yield* s.rotator.getNext(model.providerID)
             if (result.status === "available") {
               keyOverride = { entry: result.entry, index: result.index }
-              onKeyIndex?.(result.index)
+              onKeyInfo?.({ index: result.index, identity: result.identity })
               break
             }
             const waitMs = yield* s.rotator.getWaitTime(model.providerID)
@@ -1987,7 +1999,7 @@ const layer = Layer.effect(
               }
             }
             keyOverride = { entry: result.entry, index: result.index }
-            onKeyIndex?.(result.index)
+            onKeyInfo?.({ index: result.index, identity: result.identity })
             break
           }
         }
@@ -2148,7 +2160,7 @@ const layer = Layer.effect(
       function* (
         providerID: ProviderV2.ID,
         index: number | undefined,
-        opts?: { retryAfterMs?: number; exhausted?: boolean },
+        opts?: { retryAfterMs?: number; exhausted?: boolean; expectedIdentity?: string },
       ) {
         const s = yield* InstanceState.get(state)
         if (!s.rotator.hasPool(providerID)) return
@@ -2160,11 +2172,12 @@ const layer = Layer.effect(
     const removeKey = Effect.fn("Provider.removeKey")(function* (
       providerID: ProviderV2.ID,
       index: number | undefined,
+      opts?: { expectedIdentity?: string },
     ) {
       const s = yield* InstanceState.get(state)
       if (!s.rotator.hasPool(providerID)) return
       if (index === undefined) return
-      yield* s.rotator.removeKey(providerID, index)
+      yield* s.rotator.removeKey(providerID, index, opts)
     })
 
     return Service.of({

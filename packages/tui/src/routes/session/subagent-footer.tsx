@@ -7,9 +7,12 @@ import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { useTerminalDimensions } from "@opentui/solid"
 import { useCommandShortcut, useOpencodeKeymap } from "../../keymap"
+import { useDialog } from "../../ui/dialog"
+import { DialogWorkflow } from "../../component/dialog-workflow"
 
 export function SubagentFooter() {
   const route = useRouteData("session")
+  const dialog = useDialog()
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const session = createMemo(() => sync.session.get(route.sessionID))
@@ -59,8 +62,16 @@ export function SubagentFooter() {
   const parentShortcut = useCommandShortcut("session.parent")
   const previousShortcut = useCommandShortcut("session.child.previous")
   const nextShortcut = useCommandShortcut("session.child.next")
-  const [hover, setHover] = createSignal<"parent" | "prev" | "next" | null>(null)
+  const [hover, setHover] = createSignal<"parent" | "prev" | "next" | "workflow" | null>(null)
   useTerminalDimensions()
+
+  function openWorkflow() {
+    const runID = route.workflowRunID
+    if (!runID) return
+    dialog.replace(() => (
+      <DialogWorkflow openRunID={runID} openPhase={route.workflowPhase} openAgentID={route.workflowAgentID} />
+    ))
+  }
 
   return (
     <box flexShrink={0}>
@@ -94,6 +105,18 @@ export function SubagentFooter() {
             </Show>
           </box>
           <box flexDirection="row" gap={2}>
+            <Show when={route.workflowRunID}>
+              <box
+                onMouseOver={() => setHover("workflow")}
+                onMouseOut={() => setHover(null)}
+                onMouseUp={() => openWorkflow()}
+                backgroundColor={hover() === "workflow" ? theme.backgroundElement : theme.backgroundPanel}
+              >
+                <text fg={theme.text}>
+                  Workflow <span style={{ fg: theme.textMuted }}>b</span>
+                </text>
+              </box>
+            </Show>
             <box
               onMouseOver={() => setHover("parent")}
               onMouseOut={() => setHover(null)}

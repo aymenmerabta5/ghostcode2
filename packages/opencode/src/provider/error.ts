@@ -20,6 +20,24 @@ export class ResponseStreamError extends Error {
   }
 }
 
+export class StalledStreamError extends Error {
+  public override readonly name = "StalledStreamError"
+  constructor(
+    public readonly phase: "ttft" | "content",
+    public readonly elapsedMs: number,
+    public readonly timeoutMs: number,
+    public readonly context?: {
+      providerID?: string
+      modelID?: string
+      sessionID?: string
+      keyIndex?: number
+      attempt?: number
+    },
+  ) {
+    super(`SSE stalled - no ${phase} content within ${timeoutMs}ms (elapsed ${elapsedMs}ms)`)
+  }
+}
+
 function isOpenAiErrorRetryable(e: APICallError) {
   const status = e.statusCode
   if (!status) return e.isRetryable

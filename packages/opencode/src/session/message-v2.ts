@@ -673,6 +673,23 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case e instanceof ProviderError.StalledStreamError:
+      return new APIError(
+        {
+          message: e.message,
+          isRetryable: true,
+          metadata: {
+            code: "StalledStreamError",
+            phase: e.phase,
+            elapsedMs: String(e.elapsedMs),
+            timeoutMs: String(e.timeoutMs),
+            ...(e.context?.providerID ? { providerID: e.context.providerID } : {}),
+            ...(e.context?.modelID ? { modelID: e.context.modelID } : {}),
+            ...(e.context?.sessionID ? { sessionID: e.context.sessionID } : {}),
+          },
+        },
+        { cause: e },
+      ).toObject()
     case APICallError.isInstance(e):
       const parsed = ProviderError.parseAPICallError({
         providerID: ctx.providerID,

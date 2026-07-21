@@ -44,15 +44,20 @@ function getNextMidnightUTC(now: number): number {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0)
 }
 
+export type RemoveKeyOpts = { expectedIdentity?: string }
+export type MarkRateLimitedOpts = { retryAfterMs?: number; exhausted?: boolean; expectedIdentity?: string }
+
 export interface Interface {
   readonly init: (providerID: string, keys: KeyEntry[], defaultCooldownMs?: number) => void
-  readonly getNext: (providerID: string) => Effect.Effect<{ entry: KeyEntry; index: number; status: "available" | "cooldown" }>
+  readonly getNext: (
+    providerID: string,
+  ) => Effect.Effect<{ entry: KeyEntry; index: number; identity: string; status: "available" | "cooldown" }>
   readonly markRateLimited: (
     providerID: string,
     index: number,
-    opts?: { retryAfterMs?: number; exhausted?: boolean },
+    opts?: MarkRateLimitedOpts,
   ) => Effect.Effect<void>
-  readonly removeKey: (providerID: string, index: number) => Effect.Effect<void>
+  readonly removeKey: (providerID: string, index: number, opts?: RemoveKeyOpts) => Effect.Effect<void>
   readonly hasPool: (providerID: string) => boolean
   readonly getPoolSize: (providerID: string) => number
   readonly hasAvailableKeys: (providerID: string) => Effect.Effect<boolean>
@@ -69,6 +74,7 @@ export const layer = Layer.effect(
     const pools = new Map<string, Pool>()
     let persistedCache: PersistedState | undefined | null = null
     const writer = Semaphore.makeUnsafe(1)
+    const poolLock = yield* Semaphore.make(1)
 
     function getPersisted(): PersistedState | undefined {
       if (persistedCache !== null) return persistedCache
@@ -84,6 +90,7 @@ export const layer = Layer.effect(
             for (const [providerID, pool] of pools.entries()) {
               const active: PersistedPool = {}
               for (const [index, entry] of pool.cooldowns.entries()) {
+                if (index < 0 || index >= pool.keys.length) continue
                 if (entry.expiry <= now) continue
                 active[keyIdentity(pool.keys[index])] = { expiry: entry.expiry, kind: entry.kind }
               }
@@ -97,9 +104,30 @@ export const layer = Layer.effect(
       )
     }
 
+    function resolveEffectiveIndex(pool: Pool, index: number, expectedIdentity?: string): number | undefined {
+      if (expectedIdentity) {
+        // If index is in bounds and matches, use it
+        if (index >= 0 && index < pool.keys.length) {
+          try {
+            if (keyIdentity(pool.keys[index]) === expectedIdentity) return index
+          } catch {}
+        }
+        // Otherwise search by identity — handles stale index after concurrent removal
+        for (let i = 0; i < pool.keys.length; i++) {
+          try {
+            if (keyIdentity(pool.keys[i]) === expectedIdentity) return i
+          } catch {}
+        }
+        // Not found — already removed by another fiber
+        return undefined
+      }
+      if (index < 0 || index >= pool.keys.length) return undefined
+      return index
+    }
+
     return Service.of({
       init(providerID, keys, defaultCooldownMs?) {
-        const pool: Pool = { keys, current: 0, cooldowns: new Map(), defaultCooldownMs }
+        const pool: Pool = { keys: [...keys], current: 0, cooldowns: new Map(), defaultCooldownMs }
 
         const persistedState = getPersisted()
         if (persistedState && persistedState[providerID]) {
@@ -127,98 +155,134 @@ export const layer = Layer.effect(
       },
 
       getNext(providerID) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) throw new Error(`No key pool for provider: ${providerID}`)
-          if (pool.keys.length === 0) throw new Error(`Empty key pool for provider: ${providerID}`)
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) throw new Error(`No key pool for provider: ${providerID}`)
+            if (pool.keys.length === 0) throw new Error(`Empty key pool for provider: ${providerID}`)
 
-          const now = yield* Clock.currentTimeMillis
+            const now = yield* Clock.currentTimeMillis
 
-          pool.cooldowns = new Map(
-            Array.from(pool.cooldowns.entries()).filter(([, c]) => c.expiry > now),
-          )
+            pool.cooldowns = new Map(
+              Array.from(pool.cooldowns.entries()).filter(([, c]) => c.expiry > now),
+            )
 
-          if (!pool.cooldowns.has(pool.current)) {
-            return { entry: pool.keys[pool.current], index: pool.current, status: "available" as const }
-          }
+            const total = pool.keys.length
+            // Round-robin scan starting from pool.current to avoid thundering herd
+            for (let offset = 0; offset < total; offset++) {
+              const idx = (pool.current + offset) % total
+              if (!pool.cooldowns.has(idx)) {
+                const entry = pool.keys[idx]!
+                // Advance current for next caller — defeats thundering herd
+                pool.current = (idx + 1) % total
+                return {
+                  entry,
+                  index: idx,
+                  identity: keyIdentity(entry),
+                  status: "available" as const,
+                }
+              }
+            }
 
-          const available = pool.keys
-            .map((entry, i) => ({ entry, i }))
-            .filter(({ i }) => !pool.cooldowns.has(i))
-
-          if (available.length > 0) {
-            const best = available.reduce((a, b) => (a.i < b.i ? a : b))
-            pool.current = best.i
-            return { entry: best.entry, index: best.i, status: "available" as const }
-          }
-
-          const earliest = Array.from(pool.cooldowns.entries()).reduce((a, b) => (a[1].expiry <= b[1].expiry ? a : b))
-          pool.current = earliest[0]
-          return { entry: pool.keys[pool.current], index: pool.current, status: "cooldown" as const }
-        })
+            // All on cooldown — return earliest expiring and advance
+            const earliest = Array.from(pool.cooldowns.entries()).reduce((a, b) =>
+              a[1].expiry <= b[1].expiry ? a : b,
+            )
+            const idx = earliest[0]
+            pool.current = (idx + 1) % total
+            return {
+              entry: pool.keys[idx],
+              index: idx,
+              identity: keyIdentity(pool.keys[idx]),
+              status: "cooldown" as const,
+            }
+          }),
+        )
       },
 
       markRateLimited(providerID, index, opts?) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) return
-          if (index < 0 || index >= pool.keys.length) return
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) return
+            const effective = resolveEffectiveIndex(pool, index, (opts as any)?.expectedIdentity)
+            if (effective === undefined) return
 
-          const now = yield* Clock.currentTimeMillis
-          const kind: CooldownKind = opts?.exhausted === true ? "exhausted" : "transient"
-          const expiry =
-            kind === "exhausted"
-              ? getNextMidnightUTC(now)
-              : now + (opts?.retryAfterMs ?? pool.defaultCooldownMs ?? 60_000)
+            const now = yield* Clock.currentTimeMillis
+            const kind: CooldownKind = opts?.exhausted === true ? "exhausted" : "transient"
+            const expiry =
+              kind === "exhausted"
+                ? getNextMidnightUTC(now)
+                : now + (opts?.retryAfterMs ?? pool.defaultCooldownMs ?? 60_000)
 
-          const alreadyCooled = pool.cooldowns.has(index)
-          pool.cooldowns.set(index, { expiry, kind })
+            const alreadyCooled = pool.cooldowns.has(effective)
+            pool.cooldowns.set(effective, { expiry, kind })
 
-          if (!alreadyCooled) {
-            const available = pool.keys.map((_, i) => i).filter((i) => !pool.cooldowns.has(i))
-            if (available.length > 0) pool.current = available.reduce((a, b) => (a < b ? a : b))
-          }
+            if (!alreadyCooled) {
+              // Advance past cooled key if current points at it
+              if (pool.current === effective) {
+                const available = pool.keys.map((_, i) => i).filter((i) => !pool.cooldowns.has(i))
+                if (available.length > 0) {
+                  // Pick next available after effective, round-robin
+                  const total = pool.keys.length
+                  for (let off = 1; off < total; off++) {
+                    const cand = (effective + off) % total
+                    if (!pool.cooldowns.has(cand)) {
+                      pool.current = cand
+                      break
+                    }
+                  }
+                }
+              }
+            }
 
-          yield* writeCooldownsFile(now)
-        })
+            yield* writeCooldownsFile(now)
+          }),
+        )
       },
 
-      removeKey(providerID, index) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) return
-          if (index < 0 || index >= pool.keys.length) return
+      removeKey(providerID, index, opts?) {
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) return
+            const effective = resolveEffectiveIndex(pool, index, opts?.expectedIdentity)
+            if (effective === undefined) {
+              // Already removed by another fiber — idempotent no-op
+              return
+            }
 
-          pool.keys.splice(index, 1)
+            pool.keys.splice(effective, 1)
 
-          const newCooldowns = new Map<number, CooldownEntry>()
-          for (const [i, cd] of pool.cooldowns.entries()) {
-            if (i === index) continue
-            const newIndex = i > index ? i - 1 : i
-            newCooldowns.set(newIndex, cd)
-          }
-          pool.cooldowns = newCooldowns
+            const newCooldowns = new Map<number, CooldownEntry>()
+            for (const [i, cd] of pool.cooldowns.entries()) {
+              if (i === effective) continue
+              const newIndex = i > effective ? i - 1 : i
+              newCooldowns.set(newIndex, cd)
+            }
+            pool.cooldowns = newCooldowns
 
-          if (pool.keys.length === 0) {
-            pool.current = 0
-          } else if (pool.current > index) {
-            pool.current--
-          } else if (pool.current >= pool.keys.length) {
-            pool.current = 0
-          }
+            if (pool.keys.length === 0) {
+              pool.current = 0
+            } else if (pool.current > effective) {
+              pool.current--
+            } else if (pool.current >= pool.keys.length) {
+              pool.current = 0
+            }
 
-          const now = yield* Clock.currentTimeMillis
-          yield* writeCooldownsFile(now)
+            const now = yield* Clock.currentTimeMillis
+            yield* writeCooldownsFile(now)
 
-          yield* Effect.tryPromise({
-            try: async () => {
-              const filePath = path.join(Global.Path.data, "providers", providerID, "apiKeys.json")
-              await fs.promises.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {})
-              await fs.promises.writeFile(filePath, JSON.stringify(pool.keys, null, 2))
-            },
-            catch: () => undefined,
-          }).pipe(Effect.ignore)
-        })
+            yield* Effect.tryPromise({
+              try: async () => {
+                const filePath = path.join(Global.Path.data, "providers", providerID, "apiKeys.json")
+                await fs.promises.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {})
+                await fs.promises.writeFile(filePath, JSON.stringify(pool.keys, null, 2))
+              },
+              catch: () => undefined,
+            }).pipe(Effect.ignore)
+          }),
+        )
       },
 
       hasPool(providerID) {
@@ -230,66 +294,87 @@ export const layer = Layer.effect(
       },
 
       hasAvailableKeys(providerID) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) return false
-          if (pool.keys.length === 0) return false
-          const now = yield* Clock.currentTimeMillis
-          return pool.keys.some((_, i) => {
-            const c = pool.cooldowns.get(i)
-            return !c || c.expiry <= now
-          })
-        })
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) return false
+            if (pool.keys.length === 0) return false
+            const now = yield* Clock.currentTimeMillis
+            // Purge expired inside lock for consistent view
+            pool.cooldowns = new Map(
+              Array.from(pool.cooldowns.entries()).filter(([, c]) => c.expiry > now),
+            )
+            return pool.keys.some((_, i) => {
+              const c = pool.cooldowns.get(i)
+              return !c || c.expiry <= now
+            })
+          }),
+        )
       },
 
       getAvailableCount(providerID) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) return 0
-          if (pool.keys.length === 0) return 0
-          const now = yield* Clock.currentTimeMillis
-          return pool.keys.filter((_, i) => {
-            const c = pool.cooldowns.get(i)
-            return !c || c.expiry <= now
-          }).length
-        })
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) return 0
+            if (pool.keys.length === 0) return 0
+            const now = yield* Clock.currentTimeMillis
+            pool.cooldowns = new Map(
+              Array.from(pool.cooldowns.entries()).filter(([, c]) => c.expiry > now),
+            )
+            return pool.keys.filter((_, i) => {
+              const c = pool.cooldowns.get(i)
+              return !c || c.expiry <= now
+            }).length
+          }),
+        )
       },
 
       getWaitTime(providerID) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) return 0
-          if (pool.keys.length === 0) return 0
-          const now = yield* Clock.currentTimeMillis
-          const available = pool.keys.some((_, i) => {
-            const c = pool.cooldowns.get(i)
-            return !c || c.expiry <= now
-          })
-          if (available) return 0
-          if (pool.cooldowns.size === 0) return 0
-          let earliest = Number.MAX_SAFE_INTEGER
-          for (const c of pool.cooldowns.values()) earliest = Math.min(earliest, c.expiry)
-          return Math.max(earliest - now, 0)
-        })
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) return 0
+            if (pool.keys.length === 0) return 0
+            const now = yield* Clock.currentTimeMillis
+            pool.cooldowns = new Map(
+              Array.from(pool.cooldowns.entries()).filter(([, c]) => c.expiry > now),
+            )
+            const available = pool.keys.some((_, i) => {
+              const c = pool.cooldowns.get(i)
+              return !c || c.expiry <= now
+            })
+            if (available) return 0
+            if (pool.cooldowns.size === 0) return 0
+            let earliest = Number.MAX_SAFE_INTEGER
+            for (const c of pool.cooldowns.values()) earliest = Math.min(earliest, c.expiry)
+            return Math.max(earliest - now, 0)
+          }),
+        )
       },
 
       getRotation(providerID) {
-        return Effect.gen(function* () {
-          const pool = pools.get(providerID)
-          if (!pool) return { total: 0, available: 0, waitMs: 0 }
-          const now = yield* Clock.currentTimeMillis
-          const available = pool.keys.filter((_, i) => {
-            const c = pool.cooldowns.get(i)
-            return !c || c.expiry <= now
-          }).length
-          let waitMs = 0
-          if (available === 0 && pool.cooldowns.size > 0) {
-            let earliest = Number.MAX_SAFE_INTEGER
-            for (const c of pool.cooldowns.values()) earliest = Math.min(earliest, c.expiry)
-            waitMs = Math.max(earliest - now, 0)
-          }
-          return { total: pool.keys.length, available, waitMs }
-        })
+        return poolLock.withPermits(1)(
+          Effect.gen(function* () {
+            const pool = pools.get(providerID)
+            if (!pool) return { total: 0, available: 0, waitMs: 0 }
+            const now = yield* Clock.currentTimeMillis
+            pool.cooldowns = new Map(
+              Array.from(pool.cooldowns.entries()).filter(([, c]) => c.expiry > now),
+            )
+            const available = pool.keys.filter((_, i) => {
+              const c = pool.cooldowns.get(i)
+              return !c || c.expiry <= now
+            }).length
+            let waitMs = 0
+            if (available === 0 && pool.cooldowns.size > 0) {
+              let earliest = Number.MAX_SAFE_INTEGER
+              for (const c of pool.cooldowns.values()) earliest = Math.min(earliest, c.expiry)
+              waitMs = Math.max(earliest - now, 0)
+            }
+            return { total: pool.keys.length, available, waitMs }
+          }),
+        )
       },
     })
   }),

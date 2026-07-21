@@ -82,6 +82,7 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { DialogWorkflow } from "../../component/dialog-workflow"
 
 addDefaultParsers(parsers.parsers)
 
@@ -232,7 +233,15 @@ export function Session() {
     if (session()?.parentID) return []
     return children().flatMap((x) => sync.data.question[x.id] ?? [])
   })
-  const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
+  const visible = createMemo(() => {
+    // Subagents normally hide the prompt (read-only transcript view).
+    // Workflow subagents are an exception: the operator should be able to
+    // steer them (talk to subagent) via the prompt, as the detail view's
+    // [P] Prompt does. Allow prompt when workflowRunID is present.
+    const isSub = !!session()?.parentID
+    const isWorkflowSub = !!route.workflowRunID
+    return (!isSub || isWorkflowSub) && permissions().length === 0 && questions().length === 0
+  })
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
   const pending = createMemo(() => {
@@ -1114,6 +1123,88 @@ export function Session() {
     enabled: foregroundTasks().length > 0,
     priority: 1,
     bindings: tuiConfig.keybinds.get("session.background"),
+  }))
+
+  // Workflow return: when this session is a workflow subagent (route carries
+  // workflowRunID), pressing `b` returns to the workflow run detail view.
+  // Must not intercept when an input/textarea is focused (e.g. typing "b"
+  // in the prompt box). We guard with prompt?.focused AND the renderer's
+  // focused editor/renderable AND selection, because openTUI focus can lag
+  // during mount. The prompt ref is the most reliable source; renderer checks
+  // are belt-and-suspenders for other inputs (filter, etc) and for cases where
+  // the ref hasn't settled yet.
+  //
+  // Esc is different: it does NOT produce a character, so it is safe to allow
+  // even when the prompt is focused — it should hide/return to parent rather
+  // than being swallowed by "interrupt" or doing nothing. Its priority is 2 so
+  // it beats session.interrupt (0) and the generic dialog escape (0). It also
+  // clears a text selection first (first Esc clears selection, second hides),
+  // matching DialogProvider's behavior.
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    priority: 1,
+    enabled: () => {
+      if (!route.workflowRunID) return false
+      if (dialog.stack.length !== 0) return false
+      // Do not trigger while typing in prompt or any editor, or when a
+      // selection exists (copy-on-select). All three checks together are
+      // needed because renderer focus can lag after a dialog closes.
+      if (prompt?.focused) return false
+      if (renderer.currentFocusedEditor !== null) return false
+      if (renderer.currentFocusedRenderable !== null) return false
+      if (renderer.getSelection()?.getSelectedText()) return false
+      return true
+    },
+    bindings: [
+      {
+        key: "b",
+        desc: "Back to workflow",
+        command: "workflow.return",
+        group: "Workflow",
+        cmd: () => {
+          const runID = route.workflowRunID
+          if (!runID) return
+          dialog.replace(() => (
+            <DialogWorkflow openRunID={runID} openPhase={route.workflowPhase} openAgentID={route.workflowAgentID} />
+          ))
+        },
+      },
+    ],
+  }))
+
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    priority: 2,
+    enabled: () => {
+      if (dialog.stack.length !== 0) return false
+      if (!route.workflowRunID && !session()?.parentID) return false
+      return true
+    },
+    bindings: [
+      {
+        key: "escape",
+        desc: "Hide workflow / Back to parent",
+        command: "workflow.hide",
+        group: "Workflow",
+        cmd: () => {
+          // First Esc clears a text selection, matching DialogProvider UX.
+          if (renderer.getSelection()) {
+            renderer.clearSelection()
+            return
+          }
+          // If we have an explicit return session (workflow opened this subagent),
+          // prefer going back to that session; otherwise go to parent if available.
+          if (route.workflowReturnSessionID) {
+            navigate({ type: "session", sessionID: route.workflowReturnSessionID })
+            return
+          }
+          const parentID = session()?.parentID
+          if (parentID) {
+            navigate({ type: "session", sessionID: parentID })
+          }
+        },
+      },
+    ],
   }))
 
   const revertInfo = createMemo(() => session()?.revert)

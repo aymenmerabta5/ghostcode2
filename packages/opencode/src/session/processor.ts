@@ -634,14 +634,19 @@ const layer = Layer.effect(
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
-        const keyIndex = { current: undefined as number | undefined }
+        const keyInfo = { current: undefined as { index: number; identity: string } | undefined }
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream({ ...streamInput, onKeyIndex: (i) => (keyIndex.current = i) })
+            const stream = llm.stream({
+              ...streamInput,
+              onKeyIndex: (info) => {
+                keyInfo.current = info
+              },
+            })
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
@@ -672,18 +677,24 @@ const layer = Layer.effect(
                     next: info.next,
                   }),
                 onRateLimited: (info) =>
-                  keyIndex.current !== undefined
-                    ? rotator.markRateLimited(input.model.providerID, keyIndex.current, {
+                  keyInfo.current !== undefined
+                    ? rotator.markRateLimited(input.model.providerID, keyInfo.current.index, {
                         retryAfterMs: info?.retryAfterMs,
+                        expectedIdentity: keyInfo.current.identity,
                       })
                     : Effect.void,
                 onKeyExhausted: () =>
-                  keyIndex.current !== undefined
-                    ? rotator.markRateLimited(input.model.providerID, keyIndex.current, { exhausted: true })
+                  keyInfo.current !== undefined
+                    ? rotator.markRateLimited(input.model.providerID, keyInfo.current.index, {
+                        exhausted: true,
+                        expectedIdentity: keyInfo.current.identity,
+                      })
                     : Effect.void,
                 onInvalidKey: () =>
-                  keyIndex.current !== undefined
-                    ? rotator.removeKey(input.model.providerID, keyIndex.current)
+                  keyInfo.current !== undefined
+                    ? rotator.removeKey(input.model.providerID, keyInfo.current.index, {
+                        expectedIdentity: keyInfo.current.identity,
+                      })
                     : Effect.void,
                 canRotateKey: () => rotator.hasAvailableKeys(input.model.providerID),
                 delay: ({ isRateLimit }) =>

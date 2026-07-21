@@ -4,7 +4,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Ref } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -29,8 +29,11 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { LLMLiveness } from "./llm/liveness"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+export type KeyInfo = { index: number; identity: string }
 
 export type StreamInput = {
   user: SessionV1.User
@@ -45,7 +48,9 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
-  onKeyIndex?: (index: number | undefined) => void
+  onKeyIndex?: (info: KeyInfo | undefined) => void
+  /** @deprecated use onKeyIndex which now receives KeyInfo; kept for compatibility */
+  onKeyInfo?: (info: KeyInfo) => void
 }
 
 export type StreamRequest = StreamInput & {
@@ -53,7 +58,7 @@ export type StreamRequest = StreamInput & {
 }
 
 export interface Interface {
-  readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
+  readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown, never>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
@@ -364,19 +369,51 @@ const live: Layer.Layer<
               (ctrl) => Effect.sync(() => ctrl.abort()),
             )
 
-            const result = yield* run({ ...input, abort: ctrl.signal })
+            // Capture keyIndex for liveness error context
+            let currentKeyIndex: number | undefined
+            const keyIndexRef = yield* Ref.make<number | undefined>(undefined)
+            const wrappedOnKeyIndex = (info: KeyInfo | undefined) => {
+              if (info) currentKeyIndex = info.index
+              input.onKeyIndex?.(info)
+              const legacy = (input as any).onKeyInfo as ((info: KeyInfo) => void) | undefined
+              legacy?.(info as any)
+            }
 
-            if (result.type === "native") return result.stream
+            const result = yield* run({ ...input, onKeyIndex: wrappedOnKeyIndex, abort: ctrl.signal })
 
-            // Adapter seam: both runtimes expose the same LLMEvent stream. Native
-            // already returns one; AI SDK streams are converted here.
-            const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
+            // Sync ref after getLanguage (keyIndex now known)
+            yield* Ref.set(keyIndexRef, currentKeyIndex)
+
+            const liveness = LLMLiveness.resolveLiveness(input.model.providerID)
+
+            let rawStream: Stream.Stream<LLMEvent, unknown, any>
+            if (result.type === "native") {
+              rawStream = result.stream
+            } else {
+              // Adapter seam: both runtimes expose the same LLMEvent stream. Native
+              // already returns one; AI SDK streams are converted here.
+              const state = LLMAISDK.adapterState()
+              rawStream = Stream.fromAsyncIterable(result.result.fullStream, (e) =>
+                e instanceof Error ? e : new Error(String(e)),
+              ).pipe(
+                Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+                Stream.flatMap((events) => Stream.fromIterable(events)),
+              )
+            }
+
+            const withLive = rawStream.pipe(
+              LLMLiveness.withLivenessEventStream({
+                ttftMs: liveness.ttftMs,
+                contentMs: liveness.contentMs,
+                providerID: input.model.providerID,
+                modelID: input.model.id,
+                sessionID: input.sessionID,
+                ctrl,
+                getKeyIndex: () => currentKeyIndex,
+                keyIndexRef,
+              }),
             )
+            return withLive as unknown as Stream.Stream<LLMEvent, unknown, never>
           }),
         ),
       )

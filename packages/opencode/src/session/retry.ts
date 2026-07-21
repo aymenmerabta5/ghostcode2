@@ -46,6 +46,11 @@ function parseRetryAfter(headers: Record<string, string> | undefined): number | 
 
 export function retryable(error: Err): Retryable | undefined {
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
+  // Serialized detection for StalledStreamError - must not rely on instanceof across APIError boundary
+  const meta = (error.data as any)?.metadata as any
+  if (meta?.code === "StalledStreamError") {
+    return { message: (error.data as any)?.message ?? meta.code, isRateLimit: false }
+  }
   if (SessionV1.APIError.isInstance(error)) {
     const data = error.data as any
     const status = data.statusCode as number | undefined
@@ -145,7 +150,11 @@ export function retryable(error: Err): Retryable | undefined {
       lower.includes("econnreset") ||
       lower.includes("socket connection was closed") ||
       lower.includes("connection was closed unexpectedly") ||
-      lower.includes("the connection was closed")
+      lower.includes("the connection was closed") ||
+      lower.includes("timed out") ||
+      lower.includes("timeout") ||
+      lower.includes("service timeout") ||
+      lower.includes("authentication service")
     ) {
       return { message: msg, isRateLimit: false }
     }
@@ -156,8 +165,12 @@ export function retryable(error: Err): Retryable | undefined {
 
 function isRotateTrigger(error: Err) {
   const msg = typeof (error.data as any)?.message === "string" ? (error.data as any).message.toLowerCase() : ""
+  const meta = (error.data as any)?.metadata as any
+  if (meta?.code === "StalledStreamError") return true
+  if (meta?.code === "ECONNRESET") return true
   if (SessionV1.APIError.isInstance(error)) {
     if (((error.data as any).metadata as any)?.code === "ECONNRESET") return true
+    if (((error.data as any).metadata as any)?.code === "StalledStreamError") return true
   }
   return (
     msg.includes("stream ended without finish") ||
@@ -166,7 +179,11 @@ function isRotateTrigger(error: Err) {
     msg.includes("econnreset") ||
     msg.includes("socket connection was closed") ||
     msg.includes("connection was closed unexpectedly") ||
-    msg.includes("the connection was closed")
+    msg.includes("the connection was closed") ||
+    msg.includes("timed out") ||
+    msg.includes("timeout") ||
+    msg.includes("service timeout") ||
+    msg.includes("authentication service")
   )
 }
 
