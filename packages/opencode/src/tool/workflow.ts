@@ -42,13 +42,13 @@ type Metadata = {
   status?: string
 }
 
-export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Workflow.Service>(
+export const WorkflowTool = Tool.define<typeof Parameters, Metadata, never>(
   "workflow",
   Effect.gen(function* () {
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
+      execute: ((params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
           const workflows = yield* Workflow.Service
           if (params.action === "list") {
@@ -203,7 +203,7 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Workflow.Se
           }
 
           return { title: "error", output: `Unknown action: ${params.action}`, metadata: {} }
-        }),
+        })) as any,
     } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>
   }),
 )
