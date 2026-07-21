@@ -10,6 +10,8 @@ import { Permission } from "@/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../plugin"
 import * as Truncate from "@/tool/truncate"
+import { ToolRegistry } from "@/tool/registry"
+import { Permission as PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { SessionID } from "@/session/schema"
@@ -383,6 +385,7 @@ const layer = Layer.effect(
     const fsUtil = yield* FSUtil.Service
     const plugin = yield* Plugin.Service
     const truncate = yield* Truncate.Service
+    const toolRegistry = yield* ToolRegistry.Service
 
     const state = yield* InstanceState.make<State>((ctx) =>
       Effect.gen(function* () {
@@ -2288,7 +2291,54 @@ const layer = Layer.effect(
     })
 
     const exportRun: Interface["export"] = Effect.fn("Workflow.export")(function* (id: RunID) {
-      return undefined
+      const row = yield* db
+        .select()
+        .from(WorkflowRunTable)
+        .where(eq(WorkflowRunTable.id, id))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return undefined
+
+      const run = rowToRun(row)
+      const bundle = {
+        run,
+        agents: run.agents,
+        logs: run.logs,
+        phase_data: (run as any).phase_data,
+        state: (run as any).state,
+        journal: run.agents,
+      }
+
+      const dir = yield* InstanceState.directory
+      const exportDir = path.join(dir, ".opencode", "workflows", "exports", id)
+      const { mkdir, writeFile } = yield* Effect.promise(() => import("fs/promises"))
+
+      yield* Effect.promise(() => mkdir(exportDir, { recursive: true }))
+
+      const jsonPath = path.join(exportDir, "bundle.json")
+      yield* Effect.promise(() => writeFile(jsonPath, JSON.stringify(bundle, null, 2), "utf-8"))
+
+      // Optional markdown rendering
+      const mdPath = path.join(exportDir, "bundle.md")
+      const mdContent = `# Workflow Run ${run.id}
+
+Workflow: ${run.workflow}
+Status: ${run.status}
+Started: ${new Date(run.started_at).toISOString()}
+Completed: ${run.completed_at ? new Date(run.completed_at).toISOString() : "N/A"}
+
+## Phases
+${Object.entries((run as any).phase_data ?? {}).map(([k, v]) => `### ${k}\n\`\`\`json\n${JSON.stringify(v, null, 2)}\n\`\`\``).join("\n\n")}
+
+## Agents
+${run.agents.map((a: any) => `### ${a.label ?? a.id} (${a.status})\nPhase: ${a.phase ?? "N/A"}\nCost: ${a.cost ?? 0}\n\`\`\`\n${a.output?.slice(0, 1000) ?? ""}\n\`\`\``).join("\n\n")}
+
+## Logs
+${run.logs.map((l: any) => `- [${new Date(l.time).toISOString()}] ${l.phase ?? ""}: ${l.message}`).join("\n")}
+`
+      yield* Effect.promise(() => writeFile(mdPath, mdContent, "utf-8")).pipe(Effect.ignore)
+
+      return { path: exportDir, files: [jsonPath, mdPath] }
     })
 
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id: RunID) {
@@ -2358,6 +2408,7 @@ export const node = LayerNode.make({
     FSUtil.node,
     Plugin.node,
     Truncate.node,
+    ToolRegistry.node,
   ],
 })
 

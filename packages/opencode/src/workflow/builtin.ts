@@ -30,7 +30,7 @@ const DEEP_RESEARCH = `export default {
     const question = String(args.question ?? "")
     if (!question) throw new Error("deep-research needs args.question")
 
-    ctx.setPhase("plan")
+    ctx.setPhase("plan", { question })
     const plan = await ctx.agent({
       prompt: \`Break this research question into 3-5 distinct search angles. Question: \${question}. Respond ONLY via the schema.\`,
       schema: {
@@ -38,15 +38,16 @@ const DEEP_RESEARCH = `export default {
         required: ["angles"],
         properties: { angles: { type: "array", minItems: 3, maxItems: 5, items: { type: "string" } } },
       },
-      label: "plan"
+      label: "plan",
+      effort: "max"
     })
     if (!plan) throw new Error("deep-research: plan agent failed to return result (check previous agent logs for parse errors)")
     const angles = (plan.data as any)?.angles
     if (!Array.isArray(angles) || angles.length === 0) throw new Error("deep-research: plan returned invalid data, expected {angles: string[]}")
 
-    ctx.setPhase("research")
+    ctx.setPhase("research", { plan: angles })
     const findingsRaw = await ctx.parallel(
-      angles.map((angle) => {
+      angles.map((angle, idx) => {
         const safeAngle = String(angle ?? "")
         return () =>
           ctx.agent({
@@ -69,7 +70,8 @@ const DEEP_RESEARCH = `export default {
                 no_web_tools: { type: "boolean" },
               },
             },
-            label: \`research:\${safeAngle.slice(0,30)}\`
+            label: \`research:\${idx}:\${safeAngle.slice(0,20)}\`,
+            effort: "max"
           })
       }),
     )
@@ -83,34 +85,47 @@ const DEEP_RESEARCH = `export default {
       return Array.isArray(c) ? c.filter((x: any) => x && typeof x.claim === "string") : []
     })
 
-    ctx.setPhase("verify")
+    ctx.setPhase("verify", { claims: claims.length })
+    // Adversarial verify with 3 lenses per claim, survive on >=2 support
     const verifiedRaw = await ctx.parallel(
-      claims.map((c) => {
+      claims.map((c, claimIdx) => {
         const claimStr = String((c as any)?.claim ?? "")
         const sourcesArr = Array.isArray((c as any)?.sources) ? (c as any).sources : []
         return () =>
-          ctx
-            .agent({
-              prompt: \`Adversarially verify this claim against its sources (fetch them). Claim: \${claimStr}\\nSources: \${sourcesArr.join(", ")}\\nReply via schema: supported=true only if the sources actually back the claim.\`,
+          ctx.parallel([0,1,2].map(lens => () =>
+            ctx.agent({
+              prompt: \`Adversarially verify (lens \${lens}: \${["correctness","exploitability","reproduction"][lens]}): does claim "\${claimStr}" hold against sources \${sourcesArr.join(", ")}? Try to REFUTE it. Reply {supported:boolean, reason:string}\`,
               schema: {
                 type: "object",
                 required: ["supported", "reason"],
                 properties: { supported: { type: "boolean" }, reason: { type: "string" } },
               },
-              label: \`verify:\${claimStr.slice(0,30)}\`
+              label: \`verify:\${claimIdx}:\${lens}\`,
+              effort: "max"
             })
-            .then((v) => v ? ({ ...c, verdict: v.data }) : null)
+          )).then(votes => {
+            const validVotes = votes.filter(Boolean).map((v: any) => v.data)
+            const supportedCount = validVotes.filter((v: any) => v.supported).length
+            return { ...c, votes: validVotes, supported: supportedCount >= 2 }
+          })
       }),
       { concurrencyLimit: 8 },
     )
     const verified = (verifiedRaw as any[]).filter((v) => v !== null)
-    const surviving = verified.filter((c) => c.verdict?.supported)
-    const rejected = verified.filter((c) => !c.verdict?.supported)
+    const surviving = verified.filter((c: any) => c.supported)
+    const rejected = verified.filter((c: any) => !c.supported)
 
-    ctx.setPhase("synthesize")
+    ctx.setPhase("synthesize", { verified: surviving.length, rejected: rejected.length })
+    const critic = await ctx.agent({
+      prompt: \`Completeness critic: for question "\${question}" and verified claims \${JSON.stringify(surviving.slice(0,5))}, what is MISSING? What did the research likely overlook?\`,
+      label: "completeness-critic",
+      effort: "max"
+    })
+    const planData = ctx.getPhase("plan")
     const report = await ctx.agent({
-      prompt: \`Write a cited research report answering: \${question}\\nUse ONLY these verified claims (cite their sources inline): \${JSON.stringify(surviving)}\\nList rejected claims briefly at the end: \${JSON.stringify(rejected.map((r) => ({ claim: r.claim, reason: r.verdict?.reason })))}\`,
-      label: "synthesize"
+      prompt: \`Write a cited research report answering: \${question}\\nPlan was: \${JSON.stringify(planData)}\\nUse ONLY these verified claims (cite their sources inline): \${JSON.stringify(surviving)}\\nGaps from critic: \${critic?.text ?? "none"}\\nList rejected claims briefly at the end: \${JSON.stringify(rejected.map((r: any) => ({ claim: r.claim, reason: r.votes?.[0]?.reason })))}\`,
+      label: "synthesize",
+      effort: "max"
     })
     if (!report) throw new Error("deep-research: synthesize agent failed")
 
