@@ -10,7 +10,6 @@ import { Permission } from "@/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../plugin"
 import * as Truncate from "@/tool/truncate"
-import { ToolRegistry } from "@/tool/registry"
 import { Permission as PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
@@ -385,7 +384,6 @@ const layer = Layer.effect(
     const fsUtil = yield* FSUtil.Service
     const plugin = yield* Plugin.Service
     const truncate = yield* Truncate.Service
-    const toolRegistry = yield* ToolRegistry.Service
 
     const state = yield* InstanceState.make<State>((ctx) =>
       Effect.gen(function* () {
@@ -2408,7 +2406,6 @@ export const node = LayerNode.make({
     FSUtil.node,
     Plugin.node,
     Truncate.node,
-    ToolRegistry.node,
   ],
 })
 
