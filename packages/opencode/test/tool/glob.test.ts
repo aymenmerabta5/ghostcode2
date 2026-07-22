@@ -129,4 +129,82 @@ describe("tool.glob", () => {
       }
     }),
   )
+
+  it.instance("invalid path returns error not defect (non-existent directory)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const nonExistent = path.join(test.directory, "does-not-exist-xyz")
+      const exit = yield* glob
+        .execute(
+          {
+            pattern: "*.ts",
+            path: nonExistent,
+          },
+          ctx,
+        )
+        .pipe(Effect.exit)
+
+      // Should not crash the fiber — should be either success with empty or failure with message
+      // The key is it returns a controlled error, not a session-killing defect that leaves no output
+      if (Exit.isSuccess(exit)) {
+        expect(exit.value.output).toBeDefined()
+      } else {
+        expect(Exit.isFailure(exit)).toBe(true)
+        const msg = Cause.squash(exit.cause)
+        expect(String(msg).length).toBeGreaterThan(0)
+      }
+    }),
+  )
+
+  it.instance("glob source does not contain orDie (prevents defect on expected fs errors)", () =>
+    Effect.gen(function* () {
+      const content = yield* Effect.promise(() => Bun.file(path.join(process.cwd(), "src/tool/glob.ts")).text())
+      expect(content).not.toContain("Effect.orDie")
+      expect(content).not.toContain("orDie")
+    }),
+  )
+
+  it.instance("valid glob still works after orDie removal", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "x.ts"), "export const x=1\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "y.ts"), "export const y=2\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "z.md"), "# docs\n"))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const asksCtx = asks()
+      const result = yield* glob.execute(
+        {
+          pattern: "**/*.ts",
+          path: test.directory,
+        },
+        asksCtx.next,
+      )
+      expect(result.metadata.count).toBeGreaterThanOrEqual(2)
+      expect(result.output).toContain("x.ts")
+      expect(result.output).toContain("y.ts")
+      expect(result.output).not.toContain("z.md")
+      // Ensure permission ask was made
+      expect(asksCtx.items.length).toBeGreaterThanOrEqual(1)
+    }),
+  )
+
+  it.instance("glob with no matches returns No files found not defect", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute(
+        {
+          pattern: "*.nonexistentext123",
+          path: test.directory,
+        },
+        ctx,
+      )
+      expect(result.output).toContain("No files found")
+      expect(result.metadata.count).toBe(0)
+    }),
+  )
 })

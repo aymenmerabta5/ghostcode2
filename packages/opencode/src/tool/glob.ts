@@ -39,7 +39,7 @@ export const GlobTool = Tool.define(
           search = path.isAbsolute(search) ? search : path.resolve(ins.directory, search)
           const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
           if (info?.type === "File") {
-            throw new Error(`glob path must be a directory: ${search}`)
+            return yield* Effect.fail(new Error(`glob path must be a directory: ${search}`))
           }
           yield* assertExternalDirectoryEffect(ctx, search, {
             bypass: false,
@@ -70,7 +70,7 @@ export const GlobTool = Tool.define(
             },
             output: output.join("\n"),
           }
-        }).pipe(Effect.orDie),
+        }),
     }
   }),
 )
