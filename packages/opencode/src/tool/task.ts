@@ -86,7 +86,10 @@ export const TaskTool = Tool.define(
     const sessions = yield* Session.Service
     const scope = yield* Scope.Scope
     const database = yield* Database.Service
-    const flags = yield* RuntimeFlags.Service.pipe(Effect.catch(() => Effect.succeed({ experimentalBackgroundSubagents: false } as any)))
+    const flags = yield* RuntimeFlags.Service.pipe(
+      Effect.catch(() => Effect.succeed({ experimentalBackgroundSubagents: false } as any)),
+      Effect.orDie,
+    )
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -97,9 +100,9 @@ export const TaskTool = Tool.define(
 
       // Restore opencode vanilla: main locked 100% for subagents by default, background requires experimental flag
       // This is the hard lock you asked for — prevents 12+12 duplicate spam
-      const flagVal = yield* flags
+      const flagVal = flags as any
       // @ts-ignore - experimentalBackgroundSubagents may be boolean or undefined
-      if (runInBackground && !(flagVal as any).experimentalBackgroundSubagents) {
+      if (runInBackground && !flagVal.experimentalBackgroundSubagents) {
         return {
           title: "Background subagents disabled",
           metadata: { error: true } as any,

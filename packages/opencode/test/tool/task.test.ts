@@ -491,7 +491,8 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("allows background execution without experimental flag", () =>
+  // Updated: background now requires experimental flag (main locked 100% by default) — use background layer with flag enabled
+  background.instance("allows background execution with experimental flag", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
@@ -538,7 +539,7 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("depth guard blocks nesting at depth >=2", () =>
+  background.instance("depth guard blocks nesting at depth >=2", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
