@@ -1,1 +1,2 @@
-Intent A - alpha change 
+Intent A - alpha change
+Intent B - beta change
