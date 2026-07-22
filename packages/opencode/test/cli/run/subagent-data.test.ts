@@ -544,4 +544,192 @@ describe("run subagent data", () => {
       }),
     ])
   })
+
+  test("merges shell background jobs into unified tabs view", () => {
+    const data = createSubagentData()
+    bootstrapSubagentData({
+      data,
+      messages: [taskMessage("child-1", "running")],
+      children: [{ id: "child-1" }],
+      permissions: [],
+      questions: [],
+    })
+
+    const { setBackgroundJobs, listUnifiedTabs, listBackgroundTabs, backgroundToTab } =
+      // lazy import to avoid circular, but we can import directly
+      require("@/cli/cmd/run/subagent-data") as typeof import("@/cli/cmd/run/subagent-data")
+
+    const job = {
+      id: "job-123",
+      type: "shell",
+      title: "bun run dev",
+      status: "running" as const,
+      started_at: Date.now() - 5000,
+      output: "localhost:3000 started\nready",
+      metadata: { command: "bun run dev" },
+    }
+
+    const changed = setBackgroundJobs({ data, jobs: [job] })
+    expect(changed).toBe(true)
+
+    const unified = listUnifiedTabs(data)
+    expect(unified.length).toBe(2)
+    const shellTab = unified.find((t: any) => t.sessionID === "job-123")
+    expect(shellTab).toBeDefined()
+    expect(shellTab?.label).toBe("Shell")
+    expect(shellTab?.description).toBe("bun run dev")
+    expect(shellTab?.background).toBe(true)
+    expect(shellTab?.status).toBe("running")
+
+    const bgTabs = listBackgroundTabs(data)
+    expect(bgTabs.length).toBe(1)
+    expect(bgTabs[0].sessionID).toBe("job-123")
+
+    const converted = backgroundToTab(job)
+    expect(converted.sessionID).toBe("job-123")
+    expect(converted.partID).toBe("background:job-123")
+
+    const snap = snapshotSubagentData(data)
+    expect(snap.tabs.length).toBe(2)
+    expect(snap.tabs.map((t) => t.sessionID).sort()).toEqual(["child-1", "job-123"].sort())
+  })
+
+  test("banner data shows agent name index total type icon and status", () => {
+    const data = createSubagentData()
+    bootstrapSubagentData({
+      data,
+      messages: [taskMessage("child-1", "running"), taskMessage("child-2", "completed")],
+      children: [{ id: "child-1" }, { id: "child-2" }],
+      permissions: [],
+      questions: [],
+    })
+
+    const { setBackgroundJobs, listUnifiedTabs } = require("@/cli/cmd/run/subagent-data") as typeof import(
+      "@/cli/cmd/run/subagent-data"
+    )
+
+    const job = {
+      id: "job-shell",
+      type: "shell",
+      title: "bun run dev",
+      status: "running" as const,
+      started_at: Date.now() - 12000,
+      output: "Server running at http://localhost:3000",
+      metadata: { command: "bun run dev" },
+    }
+    setBackgroundJobs({ data, jobs: [job] })
+
+    const unified = listUnifiedTabs(data)
+    // Should be sorted: running first
+    expect(unified.filter((t: any) => t.status === "running").length).toBe(2)
+
+    // Simulate banner data for selected subagent
+    const selectedID = "child-1"
+    const idx = unified.findIndex((t: any) => t.sessionID === selectedID) + 1
+    const total = unified.length
+    const tab = unified.find((t: any) => t.sessionID === selectedID)
+
+    expect(tab).toBeDefined()
+    expect(tab?.label).toBe("Explore")
+    expect(idx).toBeGreaterThan(0)
+    expect(total).toBe(3)
+
+    // Banner should show @explore, index/total, icon, status
+    const typeIcon = tab?.label === "Shell" ? "▣" : "🤖"
+    expect(typeIcon).toBe("🤖")
+    const bannerText = `Messaging: @${tab?.label.toLowerCase()} subagent (${idx}/${total}) [${typeIcon} ${tab?.description} ${tab?.status}] — ESC=kill subagent, return to main`
+    expect(bannerText).toContain("@explore")
+    expect(bannerText).toContain(`(${idx}/${total})`)
+    expect(bannerText).toContain("🤖")
+    expect(bannerText).toContain("running")
+    expect(bannerText).toContain("ESC=kill")
+
+    // Shell job banner
+    const shellTab = unified.find((t: any) => t.sessionID === "job-shell")
+    const shellIcon = shellTab?.label === "Shell" ? "▣" : "🤖"
+    expect(shellIcon).toBe("▣")
+    const shellBanner = `Messaging: @${shellTab?.label.toLowerCase()} subagent [${shellIcon} ${shellTab?.description} ${shellTab?.status}]`
+    expect(shellBanner).toContain("▣")
+    expect(shellBanner).toContain("bun run dev")
+  })
+
+  test("background job detail shows output tail and command", () => {
+    const data = createSubagentData()
+    const { setBackgroundJobs } = require("@/cli/cmd/run/subagent-data") as typeof import(
+      "@/cli/cmd/run/subagent-data"
+    )
+
+    const job = {
+      id: "job-output",
+      type: "shell",
+      title: "bun run dev",
+      status: "running" as const,
+      started_at: Date.now() - 1000,
+      output: "line1\nline2\nlocalhost:3000 ready\n",
+      metadata: { command: "bun run dev" },
+    }
+    setBackgroundJobs({ data, jobs: [job] })
+
+    const snap = snapshotSubagentData(data)
+    const detail = (snap.details as any)["job-output"]
+    expect(detail).toBeDefined()
+    expect(detail.commits.length).toBeGreaterThan(0)
+    const text = detail.commits[0].text
+    expect(text).toContain("localhost:3000")
+  })
+
+  test("setBackgroundJobs removes stale jobs and keeps snapshot consistent", () => {
+    const data = createSubagentData()
+    const { setBackgroundJobs, listUnifiedTabs } = require("@/cli/cmd/run/subagent-data") as typeof import(
+      "@/cli/cmd/run/subagent-data"
+    )
+
+    const job1 = {
+      id: "job-1",
+      type: "shell",
+      title: "bun run dev",
+      status: "running" as const,
+      started_at: Date.now(),
+      metadata: { command: "bun run dev" },
+    }
+    const job2 = {
+      id: "job-2",
+      type: "shell",
+      title: "npm run build",
+      status: "completed" as const,
+      started_at: Date.now() - 10000,
+      completed_at: Date.now(),
+      metadata: { command: "npm run build" },
+    }
+
+    setBackgroundJobs({ data, jobs: [job1, job2] })
+    expect(listUnifiedTabs(data).length).toBe(2)
+
+    // Remove job1
+    setBackgroundJobs({ data, jobs: [job2] })
+    expect(listUnifiedTabs(data).length).toBe(1)
+    expect(listUnifiedTabs(data)[0].sessionID).toBe("job-2")
+  })
+
+  test("snapshotSelectedSubagentData still works with background selected", () => {
+    const data = createSubagentData()
+    const { setBackgroundJobs, snapshotSelectedSubagentData: snapSel } = require(
+      "@/cli/cmd/run/subagent-data",
+    ) as typeof import("@/cli/cmd/run/subagent-data")
+
+    const job = {
+      id: "job-sel",
+      type: "shell",
+      title: "bun run dev",
+      status: "running" as const,
+      started_at: Date.now(),
+      output: "output here",
+      metadata: { command: "bun run dev" },
+    }
+    setBackgroundJobs({ data, jobs: [job] })
+
+    const snap = snapSel(data, "job-sel")
+    expect(snap.tabs.find((t: any) => t.sessionID === "job-sel")).toBeDefined()
+    expect(snap.details["job-sel"]).toBeDefined()
+  })
 })

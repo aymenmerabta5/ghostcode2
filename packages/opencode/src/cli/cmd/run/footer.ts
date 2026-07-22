@@ -96,6 +96,7 @@ type RunFooterOptions = {
   onInterruptSubagent?: (sessionID: string) => void
   onInterruptAll?: () => void
   onBackground?: () => void
+  onKillJob?: (id: string, kind: "task" | "shell") => void
   onEditorOpen: (input: { value: string }) => Promise<string | undefined>
   onExit?: () => void
   onSubagentSelect?: (sessionID: string | undefined) => void
@@ -202,6 +203,30 @@ export class RunFooter implements FooterApi {
   private setView: Setter<FooterView>
   private subagent: Accessor<FooterSubagentState>
   private setSubagent: (next: FooterSubagentState) => void
+  private background!: Accessor<
+    Array<{
+      id: string
+      type: string
+      title?: string
+      status: string
+      started_at: number
+      completed_at?: number
+      output?: string
+      metadata?: Record<string, unknown>
+    }>
+  >
+  private setBackground!: Setter<
+    Array<{
+      id: string
+      type: string
+      title?: string
+      status: string
+      started_at: number
+      completed_at?: number
+      output?: string
+      metadata?: Record<string, unknown>
+    }>
+  >
   private queuedPrompts: Accessor<FooterQueuedPrompt[]>
   private setQueuedPrompts: Setter<FooterQueuedPrompt[]>
   private promptRoute: FooterPromptRoute = { type: "composer" }
@@ -290,6 +315,20 @@ export class RunFooter implements FooterApi {
       setSubagent("permissions", reconcile(next.permissions, { key: "id" }))
       setSubagent("questions", reconcile(next.questions, { key: "id" }))
     }
+    const [backgroundJobs, setBackgroundJobs] = createSignal<
+      Array<{
+        id: string
+        type: string
+        title?: string
+        status: string
+        started_at: number
+        completed_at?: number
+        output?: string
+        metadata?: Record<string, unknown>
+      }>
+    >([])
+    this.background = backgroundJobs
+    this.setBackground = setBackgroundJobs
     const [queuedPrompts, setQueuedPrompts] = createSignal<FooterQueuedPrompt[]>([])
     this.queuedPrompts = queuedPrompts
     this.setQueuedPrompts = setQueuedPrompts
@@ -348,6 +387,9 @@ export class RunFooter implements FooterApi {
               onLayout: footer.syncLayout,
               onStatus: footer.setStatus,
               onSubagentSelect: footer.handleSubagentSelectInternal,
+              onSubagentKill: footer.handleKillSubagent,
+              onJobKill: footer.handleKillJob,
+              background: footer.background,
               onQueuedRemove: footer.handleQueuedRemove,
             })
           },
@@ -1089,6 +1131,33 @@ export class RunFooter implements FooterApi {
     }
     this.options.onInterruptAll?.()
     return true
+  }
+
+  private handleKillSubagent = (sessionID: string): void => {
+    if (this.isClosed) return
+    const shortId = sessionID.slice(0, 8)
+    this.setNotice(`Killing ${shortId}...`)
+    // If killed is the currently selected, clear selection
+    if (this.selectedSubagent === sessionID) {
+      this.selectedSubagent = undefined
+      this.options.onSubagentSelect?.(undefined)
+    }
+    this.options.onInterruptSubagent?.(sessionID)
+    this.options.onKillJob?.(sessionID, "task")
+  }
+
+  private handleKillJob = (id: string, kind: "task" | "shell"): void => {
+    if (this.isClosed) return
+    const shortId = id.slice(0, 8)
+    if (kind === "task") {
+      this.handleKillSubagent(id)
+      return
+    }
+    this.setNotice(`Killing shell job ${shortId}...`)
+    // For shell jobs, try both callbacks; abort will be no-op if not a session,
+    // but onKillJob allows runtime to cancel BackgroundJob
+    this.options.onInterruptSubagent?.(id)
+    this.options.onKillJob?.(id, kind)
   }
 
   private handleExit = (): boolean => {

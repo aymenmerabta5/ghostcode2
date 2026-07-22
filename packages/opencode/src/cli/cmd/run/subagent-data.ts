@@ -37,9 +37,22 @@ type DetailState = {
   frames: Frame[]
 }
 
+export type BackgroundJobInfo = {
+  id: string
+  type: string
+  title?: string
+  status: "running" | "completed" | "error" | "cancelled"
+  started_at: number
+  completed_at?: number
+  output?: string
+  error?: string
+  metadata?: Record<string, unknown>
+}
+
 export type SubagentData = {
   tabs: Map<string, FooterSubagentTab>
   details: Map<string, DetailState>
+  background: Map<string, BackgroundJobInfo>
 }
 
 export type BootstrapSubagentInput = {
@@ -654,7 +667,93 @@ export function createSubagentData(): SubagentData {
   return {
     tabs: new Map(),
     details: new Map(),
+    background: new Map(),
   }
+}
+
+function sameBackgroundInfo(a: BackgroundJobInfo | undefined, b: BackgroundJobInfo | undefined) {
+  if (!a && !b) return true
+  if (!a || !b) return false
+  return (
+    a.id === b.id &&
+    a.type === b.type &&
+    a.title === b.title &&
+    a.status === b.status &&
+    a.started_at === b.started_at &&
+    a.completed_at === b.completed_at &&
+    a.output === b.output &&
+    a.error === b.error &&
+    JSON.stringify(a.metadata) === JSON.stringify(b.metadata)
+  )
+}
+
+function backgroundStatus(status: BackgroundJobInfo["status"]): FooterSubagentTab["status"] {
+  if (status === "running") return "running"
+  if (status === "completed") return "completed"
+  if (status === "cancelled") return "cancelled"
+  return "error"
+}
+
+function backgroundCommand(info: BackgroundJobInfo): string | undefined {
+  const meta = info.metadata as Record<string, unknown> | undefined
+  const cmd = meta ? (text(meta.command) ?? text(meta.cmd)) : undefined
+  if (cmd) return cmd
+  return info.title
+}
+
+export function backgroundToTab(info: BackgroundJobInfo): FooterSubagentTab {
+  const command = backgroundCommand(info)
+  const isShell = info.type === "shell"
+  const label = isShell
+    ? "Shell"
+    : Locale.titlecase(
+        text((info.metadata as any)?.subagent_type) ?? text((info.metadata as any)?.agent) ?? info.type ?? "general",
+      )
+  const description = isShell ? (command ?? info.title ?? info.id) : (info.title ?? (command as string) ?? info.id)
+  const title = isShell
+    ? (info.title && info.title !== command ? info.title : undefined) ?? (info.output ? info.output.slice(-200) : undefined)
+    : (command && command !== info.title ? command : undefined) ?? info.title
+
+  return {
+    sessionID: info.id,
+    partID: `background:${info.id}`,
+    callID: `background:${info.id}`,
+    label,
+    description,
+    status: backgroundStatus(info.status),
+    background: true,
+    title,
+    lastUpdatedAt: info.completed_at ?? info.started_at ?? Date.now(),
+  }
+}
+
+function syncBackgroundDetail(data: SubagentData, info: BackgroundJobInfo) {
+  // Ensure detail exists for background job so inspector can show output
+  const detail = ensureDetail(data, info.id)
+  const output = info.output ?? info.error ?? ""
+  const textContent = output || info.title || backgroundCommand(info) || info.id
+  const commit: Extract<(typeof detail.frames)[number], { commit: any }>["commit"] | any = {
+    kind: textContent ? "tool" : "system",
+    text: textContent ? textContent.slice(-4000) : `Background job ${info.id} ${info.status}`,
+    phase: info.status === "running" ? "progress" : "final",
+    source: "tool",
+    messageID: `background:${info.id}`,
+    partID: `background:${info.id}:output`,
+    tool: info.type === "shell" ? "bash" : "task",
+  }
+  // Replace frames with single synthetic frame reflecting latest output
+  // Keep it simple - overwrite if output changed
+  const key = `background:output:${info.id}`
+  const existingIndex = detail.frames.findIndex((f) => f.key === key)
+  if (existingIndex !== -1) {
+    if (detail.frames[existingIndex].commit.text === commit.text && detail.frames[existingIndex].commit.phase === commit.phase) {
+      return
+    }
+    detail.frames[existingIndex] = { key, commit }
+  } else {
+    detail.frames.push({ key, commit })
+  }
+  limitFrames(detail)
 }
 
 function snapshotDetail(detail: DetailState) {
@@ -675,6 +774,71 @@ export function listSubagentTabs(data: SubagentData) {
   })
 }
 
+export function listBackgroundJobs(data: SubagentData): BackgroundJobInfo[] {
+  return [...data.background.values()].sort((a, b) => {
+    const active = Number((b.status === "running" ? 1 : 0) - (a.status === "running" ? 1 : 0))
+    if (active !== 0) return active
+    return (b.started_at ?? 0) - (a.started_at ?? 0)
+  })
+}
+
+export function listBackgroundTabs(data: SubagentData): FooterSubagentTab[] {
+  return listBackgroundJobs(data).map(backgroundToTab)
+}
+
+export function listUnifiedTabs(data: SubagentData): FooterSubagentTab[] {
+  const subagents = [...data.tabs.values()]
+  const backgrounds = [...data.background.values()].map(backgroundToTab)
+  const all = [...subagents, ...backgrounds]
+  return all.sort((a, b) => {
+    const active = Number(b.status === "running") - Number(a.status === "running")
+    if (active !== 0) return active
+    return b.lastUpdatedAt - a.lastUpdatedAt
+  })
+}
+
+// Alias required by task spec
+export const listAllTabsAndJobs = listUnifiedTabs
+export const listAllTabs = listUnifiedTabs
+
+export function getBackgroundJob(data: SubagentData, id: string): BackgroundJobInfo | undefined {
+  return data.background.get(id)
+}
+
+export function setBackgroundJobs(input: { data: SubagentData; jobs: BackgroundJobInfo[] }): boolean {
+  let changed = false
+  const seen = new Set<string>()
+  for (const job of input.jobs) {
+    seen.add(job.id)
+    const existing = input.data.background.get(job.id)
+    if (!sameBackgroundInfo(existing, job)) {
+      input.data.background.set(job.id, job)
+      changed = true
+    }
+    syncBackgroundDetail(input.data, job)
+  }
+  // Remove jobs that no longer exist
+  for (const id of [...input.data.background.keys()]) {
+    if (!seen.has(id)) {
+      input.data.background.delete(id)
+      // Keep detail for history? Remove detail if it was purely background
+      const detail = input.data.details.get(id)
+      if (detail && detail.frames.every((f) => f.key.startsWith("background:"))) {
+        input.data.details.delete(id)
+      }
+      changed = true
+    }
+  }
+  return changed
+}
+
+export const bootstrapBackgroundJobs = setBackgroundJobs
+export const setBackground = setBackgroundJobs
+
+export function reduceBackgroundJobs(input: { data: SubagentData; jobs: BackgroundJobInfo[] }): boolean {
+  return setBackgroundJobs(input)
+}
+
 function snapshotQueues(data: SubagentData) {
   return {
     permissions: listSubagentPermissions(data).sort((a, b) => a.id.localeCompare(b.id)),
@@ -684,8 +848,17 @@ function snapshotQueues(data: SubagentData) {
 
 function snapshotState(data: SubagentData, details: FooterSubagentState["details"]): FooterSubagentState {
   return {
-    tabs: listSubagentTabs(data),
+    tabs: listUnifiedTabs(data),
     details,
+    ...snapshotQueues(data),
+  }
+}
+
+// Keep old snapshot that only includes subagent tabs for compatibility if needed
+export function snapshotSubagentDataWithoutBackground(data: SubagentData): FooterSubagentState {
+  return {
+    tabs: listSubagentTabs(data),
+    details: Object.fromEntries([...data.details.entries()].map(([sessionID, detail]) => [sessionID, snapshotDetail(detail)])),
     ...snapshotQueues(data),
   }
 }
