@@ -455,6 +455,7 @@ export const ShellTool = Tool.define(
         cwd: string
         env: NodeJS.ProcessEnv
         timeout: number
+        logPath?: string
       },
       ctx: Tool.Context,
     ) {
@@ -504,6 +505,16 @@ export const ShellTool = Tool.define(
       const code: number | null = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
+          // For background jobs with explicit logPath, open sink immediately so all output streams to file
+          if (input.logPath) {
+            yield* Effect.sync(() => {
+              file = input.logPath!
+              cut = false
+              try {
+                sink = createWriteStream(file, { flags: "w" })
+              } catch {}
+            })
+          }
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
           yield* Effect.forkScoped(
@@ -659,6 +670,8 @@ export const ShellTool = Tool.define(
                   abort: new AbortController().signal,
                   metadata: () => Effect.void,
                 }
+                // Create log file upfront so task_output can read live logs even while running
+                const logFile = yield* trunc.write("").pipe(Effect.orElseSucceed(() => ""))
                 const info = yield* background.start({
                   type: "shell",
                   title,
@@ -666,6 +679,7 @@ export const ShellTool = Tool.define(
                     command: params.command,
                     cwd,
                     background: true,
+                    ...(logFile ? { logPath: logFile, outputPath: logFile } : {}),
                   },
                   run: run(
                     {
@@ -674,6 +688,7 @@ export const ShellTool = Tool.define(
                       cwd,
                       env,
                       timeout: 24 * 60 * 60 * 1000,
+                      ...(logFile ? { logPath: logFile } : {}),
                     },
                     bgCtx,
                   ).pipe(Effect.map((r) => r.output)),

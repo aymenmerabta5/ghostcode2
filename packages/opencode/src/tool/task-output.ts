@@ -190,10 +190,24 @@ function makeExecute(id: string) {
 
             const getFullRaw = (info: typeof job, fallback: string) =>
               Effect.gen(function* () {
+                // For running jobs, try to read live log file from metadata.logPath or outputPath
+                const meta = (info.metadata as any) ?? {}
+                const liveLogPath = meta.logPath as string | undefined
+                const metaPath = meta.outputPath as string | undefined
+
+                // If not full, but job is running and has live log, use live log content for tail
+                if (!full && info.status === "running" && liveLogPath) {
+                  const liveContent = yield* fs.readFileString(liveLogPath).pipe(
+                    Effect.catch(() => Effect.succeed(undefined as string | undefined)),
+                  )
+                  if (liveContent !== undefined && liveContent.length > 0) {
+                    return liveContent
+                  }
+                }
+
                 if (!full) return fallback
-                const metaPath = (info.metadata as any)?.outputPath as string | undefined
                 const extracted = extractOutputPath(info.output) ?? extractOutputPath(info.error) ?? extractOutputPath(fallback)
-                const candidate = metaPath ?? extracted
+                const candidate = metaPath ?? liveLogPath ?? extracted
                 if (!candidate) return fallback
                 const content = yield* fs.readFileString(candidate).pipe(
                   Effect.catch(() => Effect.succeed(undefined as string | undefined)),

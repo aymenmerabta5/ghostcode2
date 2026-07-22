@@ -52,7 +52,7 @@ export const BackgroundListTool = Tool.define(
             metadata: { count: jobs.length, jobs: jobs.map((j) => ({ id: j.id, type: j.type, status: j.status })) },
             output,
           }
-        }).pipe(Effect.orDie),
+        }),
     }
   }),
 )
