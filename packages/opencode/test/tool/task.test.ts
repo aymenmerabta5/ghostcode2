@@ -96,6 +96,35 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
   return { chat, assistant }
 })
 
+const seedAssistantIn = Effect.fn("TaskToolTest.seedAssistantIn")(function* (sessionID: SessionID) {
+  const session = yield* Session.Service
+  const user = yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: Date.now() },
+  })
+  const assistant: SessionV1.Assistant = {
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID: user.id,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    variant: "xhigh",
+    time: { created: Date.now() },
+  }
+  yield* session.updateMessage(assistant)
+  return assistant
+})
+
 function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void; text?: string }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
@@ -456,11 +485,16 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("rejects background execution when the experiment is disabled", () =>
+  it.instance("allows background execution without experimental flag", () =>
     Effect.gen(function* () {
+      const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
+
+      // Verify description always includes background guidance
+      expect(def.description).toContain("Background mode")
+      // Parameters should include background field (checked via successful execution)
 
       const exit = yield* def
         .execute(
@@ -483,7 +517,174 @@ describe("tool.task", () => {
         )
         .pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
+      // Should succeed without requiring OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) {
+        expect(exit.value.metadata.background).toBe(true)
+        expect(exit.value.output).toContain('state="running"')
+      }
+
+      // Cleanup
+      const kids = yield* sessions.children(chat.id)
+      for (const kid of kids) {
+        yield* sessions.remove(kid.id).pipe(Effect.ignore)
+      }
+    }),
+  )
+
+  it.instance("depth guard blocks nesting at depth >=2", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      // Build chain: main (chat) -> child -> grandchild
+      const child = yield* sessions.create({ parentID: chat.id, title: "child level1" })
+      const childAssistant = yield* seedAssistantIn(child.id)
+      const grandchild = yield* sessions.create({ parentID: child.id, title: "grandchild level2" })
+      const grandchildAssistant = yield* seedAssistantIn(grandchild.id)
+
+      // depth 0 (main) should pass
+      const exitMain = yield* def
+        .execute(
+          {
+            description: "from main",
+            prompt: "test",
+            subagent_type: "general",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isSuccess(exitMain)).toBe(true)
+
+      // depth 1 (child) should pass
+      const exitChild = yield* def
+        .execute(
+          {
+            description: "from child",
+            prompt: "test",
+            subagent_type: "general",
+            background: true,
+          },
+          {
+            sessionID: child.id,
+            messageID: childAssistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isSuccess(exitChild)).toBe(true)
+
+      // depth 2 (grandchild) should fail with fork bomb guard
+      const exitGrandchild = yield* def
+        .execute(
+          {
+            description: "from grandchild",
+            prompt: "test",
+            subagent_type: "general",
+            background: true,
+          },
+          {
+            sessionID: grandchild.id,
+            messageID: grandchildAssistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exitGrandchild)).toBe(true)
+      if (Exit.isFailure(exitGrandchild)) {
+        const cause = exitGrandchild.cause
+        // Check error message contains expected guard text
+        const defectString = String(cause)
+        expect(defectString).toContain("Subagent nesting too deep")
+      }
+
+      // Cleanup
+      yield* sessions.remove(grandchild.id).pipe(Effect.ignore)
+      yield* sessions.remove(child.id).pipe(Effect.ignore)
+      const kids = yield* sessions.children(chat.id)
+      for (const kid of kids) {
+        yield* sessions.remove(kid.id).pipe(Effect.ignore)
+      }
+    }),
+  )
+
+  it.instance("depth guard counts ancestors correctly up to max 2", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      // Create deeper chain: chat -> l1 -> l2 -> l3
+      const l1 = yield* sessions.create({ parentID: chat.id, title: "l1" })
+      const l1Asst = yield* seedAssistantIn(l1.id)
+      const l2 = yield* sessions.create({ parentID: l1.id, title: "l2" })
+      const l2Asst = yield* seedAssistantIn(l2.id)
+      const l3 = yield* sessions.create({ parentID: l2.id, title: "l3" })
+      const l3Asst = yield* seedAssistantIn(l3.id)
+
+      const tryExecute = (sid: SessionID, mid: MessageID) =>
+        def
+          .execute(
+            {
+              description: "depth test",
+              prompt: "test",
+              subagent_type: "general",
+            },
+            {
+              sessionID: sid,
+              messageID: mid,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+      // chat depth 0 -> allowed
+      expect(Exit.isSuccess(yield* tryExecute(chat.id, assistant.id))).toBe(true)
+      // l1 depth 1 -> allowed
+      expect(Exit.isSuccess(yield* tryExecute(l1.id, l1Asst.id))).toBe(true)
+      // l2 depth 2 -> blocked
+      const l2Exit = yield* tryExecute(l2.id, l2Asst.id)
+      expect(Exit.isFailure(l2Exit)).toBe(true)
+      if (Exit.isFailure(l2Exit)) expect(String(l2Exit.cause)).toContain("Subagent nesting too deep")
+      // l3 depth 3 -> blocked
+      const l3Exit = yield* tryExecute(l3.id, l3Asst.id)
+      expect(Exit.isFailure(l3Exit)).toBe(true)
+      if (Exit.isFailure(l3Exit)) expect(String(l3Exit.cause)).toContain("Subagent nesting too deep")
+
+      yield* sessions.remove(l3.id).pipe(Effect.ignore)
+      yield* sessions.remove(l2.id).pipe(Effect.ignore)
+      yield* sessions.remove(l1.id).pipe(Effect.ignore)
+      const kids = yield* sessions.children(chat.id)
+      for (const kid of kids) yield* sessions.remove(kid.id).pipe(Effect.ignore)
     }),
   )
 
