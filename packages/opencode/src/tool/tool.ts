@@ -142,7 +142,17 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               ...(truncated.truncated && { outputPath: truncated.outputPath }),
             },
           }
-        }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
+        }).pipe(
+          Effect.catchTag("ToolInvalidArgumentsError", (err) =>
+            Effect.succeed({
+              title: id,
+              metadata: { error: true },
+              output: err.message,
+            } as any),
+          ),
+          Effect.orDie,
+          Effect.withSpan("Tool.execute", { attributes: attrs }),
+        )
       }
       return toolInfo
     })
