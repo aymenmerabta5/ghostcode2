@@ -113,7 +113,7 @@ describe("tool.glob", () => {
       yield* Effect.promise(() => Bun.write(file, "export const a = 1\n"))
       const info = yield* GlobTool
       const glob = yield* info.init()
-      const exit = yield* glob
+      const result = yield* glob
         .execute(
           {
             pattern: "*.ts",
@@ -121,12 +121,9 @@ describe("tool.glob", () => {
           },
           ctx,
         )
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) {
-        const err = Cause.squash(exit.cause)
-        expect(err instanceof Error ? err.message : String(err)).toContain("glob path must be a directory")
-      }
+      // After fix, tool returns error result, not fiber defect — session stays alive
+      expect((result.metadata as any).error).toBe(true)
+      expect(result.output.toLowerCase()).toContain("glob path must be a directory")
     }),
   )
 
