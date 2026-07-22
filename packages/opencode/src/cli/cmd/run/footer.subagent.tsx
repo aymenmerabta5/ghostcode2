@@ -55,6 +55,7 @@ export function RunFooterSubagentBody(props: {
   diffStyle?: RunDiffStyle
   onCycle: (dir: -1 | 1) => void
   onClose: () => void
+  onInterrupt?: () => boolean
 }) {
   const theme = createMemo(() => props.theme())
   const footer = createMemo(() => theme().footer)
@@ -98,6 +99,13 @@ export function RunFooterSubagentBody(props: {
 
     if (event.name === "escape") {
       event.preventDefault()
+      // If interrupt handler exists, use it (kills subagent with double-press guard)
+      // Otherwise fallback to just closing inspector
+      if (props.onInterrupt) {
+        if (props.onInterrupt()) {
+          return
+        }
+      }
       props.onClose()
       return
     }

@@ -342,11 +342,58 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
         return
       }
 
+      // Main-only abort: does NOT cascade to subagents due to run-state.ts fix
+      // Subagents survive via task.ts promote on parent abort
       state.aborting = true
       void ctx.sdk.session
         .abort({
           sessionID: state.sessionID,
         })
+        .catch(() => {})
+        .finally(() => {
+          state.aborting = false
+        })
+    },
+    onInterruptSubagent: (subagentID: string) => {
+      if (!hasSession(input, state)) return
+      log?.write("subagent.interrupt", { sessionID: subagentID })
+      // Kill only that subagent: abort its session, it will cancel its own background job
+      void ctx.sdk.session
+        .abort({
+          sessionID: subagentID,
+        })
+        .catch(() => {})
+    },
+    onInterruptAll: () => {
+      if (!hasSession(input, state) || state.aborting) {
+        return
+      }
+
+      state.aborting = true
+      log?.write("session.interrupt.all", { sessionID: state.sessionID })
+      // Abort main
+      const abortMain = ctx.sdk.session
+        .abort({ sessionID: state.sessionID })
+        .catch(() => {})
+
+      // Abort all child sessions (best-effort)
+      const abortChildren = ctx.sdk.session
+        .children({ sessionID: state.sessionID })
+        .then((res) => {
+          const children = res.data ?? []
+          return Promise.all(
+            children.map((child: { id: string }) =>
+              ctx.sdk.session.abort({ sessionID: child.id }).catch(() => {}),
+            ),
+          )
+        })
+        .catch(() => {})
+
+      // For shell background jobs, try experimental background cancel? For now,
+      // aborting main + children covers task subagents. Shell jobs with
+      // parentSessionId = main will be left unless explicit cancel endpoint exists.
+      // Kill-all intention is best-effort; future server endpoint will handle shell jobs.
+      void Promise.all([abortMain, abortChildren])
         .catch(() => {})
         .finally(() => {
           state.aborting = false

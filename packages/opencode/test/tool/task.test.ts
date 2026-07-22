@@ -330,25 +330,23 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("execute cancels child session when abort signal fires", () =>
+  it.instance("execute promotes child session when abort signal fires (main abort keeps subagent alive)", () =>
     Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const ready = defer<SessionPrompt.PromptInput>()
-      const cancelled = defer<SessionID>()
       const abort = new AbortController()
       const promptOps: TaskPromptOps = {
-        cancel: (sessionID) =>
-          Effect.sync(() => {
-            cancelled.resolve(sessionID)
-          }),
+        cancel: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
             ready.resolve(input)
-            return cancelled.promise
-          }).pipe(Effect.as(reply(input, "cancelled"))),
+            // Never completes - simulates long-running subagent
+            return new Promise<SessionV1.WithParts>(() => {})
+          }),
       }
 
       const fiber = yield* def
@@ -372,11 +370,19 @@ describe("tool.task", () => {
         .pipe(Effect.forkChild)
 
       const input = yield* Effect.promise(() => ready.promise)
+      // Trigger abort (main interrupted)
       abort.abort()
-      expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
 
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) {
+        // Should be promoted to background, not cancelled
+        expect(exit.value.metadata.background).toBe(true)
+        expect(exit.value.output).toContain('state="running"')
+        const job = yield* jobs.get(input.sessionID)
+        expect(job?.status).toBe("running")
+        expect(job?.metadata?.background).toBe(true)
+      }
     }),
   )
 
@@ -1015,7 +1021,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("cancelling the parent run cancels running background tasks", () =>
+  background.instance("cancelling the parent run does NOT cancel running background tasks (invariant: main interrupt keeps subagents alive)", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
@@ -1049,8 +1055,9 @@ describe("tool.task", () => {
 
       yield* runState.cancel(chat.id)
       const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("cancelled")
+      // Per new spec, parent cancel should NOT kill child background task
+      expect(waited.timedOut).toBe(true)
+      expect(waited.info?.status).toBe("running")
     }),
   )
 
@@ -1075,7 +1082,7 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("cancelling a parent run recursively cancels descendant background tasks", () =>
+  it.instance("cancelling a parent run does NOT recursively cancel descendant background tasks (kill-all needed for cascade)", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const runState = yield* SessionRunState.Service
@@ -1099,8 +1106,9 @@ describe("tool.task", () => {
 
       yield* runState.cancel(chat.id)
 
-      expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
-      expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
+      // Per new invariant, cancelling parent does NOT cascade to children
+      expect((yield* jobs.get(child.id))?.status).toBe("running")
+      expect((yield* jobs.get(grandchild.id))?.status).toBe("running")
     }),
   )
 })

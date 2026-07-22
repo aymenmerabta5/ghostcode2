@@ -112,6 +112,11 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
   background: BackgroundJob.Interface,
   sessionID: SessionID,
 ) {
+  // Invariant (Task 7): interrupting main must NEVER stop subagents/background unless
+  // explicit kill-all (Shift+A). Previously this cascaded via parentSessionId, killing
+  // subagents when main was aborted. Now we only cancel jobs directly owned by the
+  // sessionID (job.id or metadata.sessionId). Parent->child cascade is intentionally
+  // removed; kill-all path will explicitly cancel via background.list + cancel loop.
   const jobs = yield* background.list()
   const pending = new Set<string>([sessionID])
   const cancelled = new Set<string>()
@@ -120,7 +125,7 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
     if (cancelled.has(job.id)) return false
     if (pending.has(job.id)) return true
     if (typeof job.metadata?.sessionId === "string" && pending.has(job.metadata.sessionId)) return true
-    return typeof job.metadata?.parentSessionId === "string" && pending.has(job.metadata.parentSessionId)
+    return false
   }
   let batch = jobs.filter(matches)
   while (batch.length > 0) {

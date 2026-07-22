@@ -99,7 +99,7 @@ export const TaskTool = Tool.define(
         let depth = 0
         let curParentID: SessionID | undefined = ctx.sessionID
         while (curParentID && depth < 10) {
-          const current = yield* sessions
+          const current: { parentID?: SessionID } | undefined = yield* sessions
             .get(curParentID)
             .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
           if (!current?.parentID) break
@@ -305,11 +305,12 @@ export const TaskTool = Tool.define(
         return backgroundResult()
       }
 
-      const runCancel = yield* EffectBridge.make()
-      const cancel = ops.cancel(nextSession.id)
+      const bridge = yield* EffectBridge.make()
+      const promote = background.promote(nextSession.id)
 
       function onAbort() {
-        runCancel.fork(cancel)
+        // Main interrupted: promote subagent to background so it survives (invariant)
+        bridge.fork(promote.pipe(Effect.ignore))
       }
 
       return yield* Effect.acquireUseRelease(
@@ -333,8 +334,10 @@ export const TaskTool = Tool.define(
           }),
         (_, exit) =>
           Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit))
-              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+            // On interrupt (main abort), promote to background instead of cancelling
+            if (Exit.hasInterrupts(exit)) {
+              yield* background.promote(nextSession.id).pipe(Effect.ignore)
+            }
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {

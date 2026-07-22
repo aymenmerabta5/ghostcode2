@@ -93,6 +93,8 @@ type RunFooterOptions = {
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
   onInterrupt?: () => void
+  onInterruptSubagent?: (sessionID: string) => void
+  onInterruptAll?: () => void
   onBackground?: () => void
   onEditorOpen: (input: { value: string }) => Promise<string | undefined>
   onExit?: () => void
@@ -206,6 +208,7 @@ export class RunFooter implements FooterApi {
   private subagentMenuRows = SUBAGENT_ROWS
   private autocomplete = false
   private interruptTimeout: NodeJS.Timeout | undefined
+  private interruptAllTimeout: NodeJS.Timeout | undefined
   private exitTimeout: NodeJS.Timeout | undefined
   private noticeTimeout: NodeJS.Timeout | undefined
   private noticeRestoreStatus = ""
@@ -216,6 +219,8 @@ export class RunFooter implements FooterApi {
   private paletteRefreshRunning = false
   private paletteRefreshQueued = false
   private themeRefreshTimeouts: NodeJS.Timeout[] = []
+  private selectedSubagent: string | undefined
+  private interruptAll = 0
 
   private createScrollback(wrote: boolean): RunScrollbackStream {
     return new RunScrollbackStream(this.renderer, this.theme(), {
@@ -329,6 +334,8 @@ export class RunFooter implements FooterApi {
               onQuestionReject: footer.handleQuestionReject,
               onCycle: footer.handleCycle,
               onInterrupt: footer.handleInterrupt,
+              onInterruptSubagent: footer.handleInterruptSubagent,
+              onInterruptAll: footer.handleInterruptAll,
               onBackground: options.onBackground,
               onEditorOpen: options.onEditorOpen,
               onInputClear: footer.handleInputClear,
@@ -340,7 +347,7 @@ export class RunFooter implements FooterApi {
               onRows: footer.syncRows,
               onLayout: footer.syncLayout,
               onStatus: footer.setStatus,
-              onSubagentSelect: options.onSubagentSelect,
+              onSubagentSelect: footer.handleSubagentSelectInternal,
               onQueuedRemove: footer.handleQueuedRemove,
             })
           },
@@ -683,11 +690,13 @@ export class RunFooter implements FooterApi {
 
   private handleInputClear = (): void => {
     this.clearInterruptTimer()
+    this.clearInterruptAllTimer()
     this.clearExitTimer()
-    if (this.state().interrupt === 0 && this.state().exit === 0) {
+    if (this.state().interrupt === 0 && this.state().exit === 0 && this.interruptAll === 0) {
       return
     }
 
+    this.interruptAll = 0
     this.patch({ interrupt: 0, exit: 0 })
   }
 
@@ -913,6 +922,15 @@ export class RunFooter implements FooterApi {
     this.interruptTimeout = undefined
   }
 
+  private clearInterruptAllTimer(): void {
+    if (!this.interruptAllTimeout) {
+      return
+    }
+
+    clearTimeout(this.interruptAllTimeout)
+    this.interruptAllTimeout = undefined
+  }
+
   private clearNoticeTimer(reset = true): void {
     if (!this.noticeTimeout) {
       if (reset) {
@@ -940,6 +958,18 @@ export class RunFooter implements FooterApi {
     }, 5000)
   }
 
+  private armInterruptAllTimer(): void {
+    this.clearInterruptAllTimer()
+    this.interruptAllTimeout = setTimeout(() => {
+      this.interruptAllTimeout = undefined
+      if (this.isGone) {
+        return
+      }
+
+      this.interruptAll = 0
+    }, 5000)
+  }
+
   private clearExitTimer(): void {
     if (!this.exitTimeout) {
       return
@@ -961,9 +991,15 @@ export class RunFooter implements FooterApi {
     }, 5000)
   }
 
+  private handleSubagentSelectInternal = (sessionID: string | undefined): void => {
+    this.selectedSubagent = sessionID
+    this.options.onSubagentSelect?.(sessionID)
+  }
+
   // Two-press interrupt: first press shows a hint ("esc again to interrupt"),
-  // second press within 5 seconds fires onInterrupt. The timer resets the
-  // counter if the user doesn't follow through.
+  // second press within 5 seconds fires focused kill.
+  // - Main view: aborts main only, promotes running subagents to background (survive)
+  // - Subagent view: kills that subagent only, returns to main
   private handleInterrupt = (): boolean => {
     if (this.isClosed || this.state().phase !== "running") {
       return false
@@ -979,8 +1015,79 @@ export class RunFooter implements FooterApi {
 
     this.clearInterruptTimer()
     this.patch({ interrupt: 0 })
-    this.setNotice("interrupting")
+
+    // Branch on selected subagent
+    if (this.selectedSubagent) {
+      const shortId = this.selectedSubagent.slice(0, 8)
+      this.setNotice(`Subagent ${shortId} interrupted — returned to main`)
+      const id = this.selectedSubagent
+      this.selectedSubagent = undefined
+      this.options.onSubagentSelect?.(undefined)
+      this.options.onInterruptSubagent?.(id)
+      return true
+    }
+
+    // Main view: promote running foreground jobs, abort main only
+    const running = this.subagent().tabs.filter((t) => t.status === "running")
+    if (running.length > 0) {
+      this.setNotice(
+        `Main interrupted — ${running.length} subagent(s) kept in background (ctrl+x to view)`,
+      )
+    } else {
+      this.setNotice("interrupting")
+    }
     this.options.onInterrupt?.()
+    return true
+  }
+
+  // Explicit subagent kill (used when subagent view ESC via footer.view path)
+  private handleInterruptSubagent = (): boolean => {
+    if (this.isClosed) {
+      return false
+    }
+
+    if (!this.selectedSubagent) {
+      return false
+    }
+
+    const shortId = this.selectedSubagent.slice(0, 8)
+    this.setNotice(`Subagent ${shortId} interrupted — returned to main`)
+    const id = this.selectedSubagent
+    this.selectedSubagent = undefined
+    this.options.onSubagentSelect?.(undefined)
+    this.clearInterruptTimer()
+    this.patch({ interrupt: 0 })
+    this.options.onInterruptSubagent?.(id)
+    return true
+  }
+
+  // Shift+A kill-all: double-press guarded, aborts main + all subagents + background jobs
+  private handleInterruptAll = (): boolean => {
+    if (this.isClosed) {
+      return false
+    }
+
+    const next = this.interruptAll + 1
+    this.interruptAll = next
+
+    if (next < 2) {
+      this.armInterruptAllTimer()
+      this.setNotice("press again to interrupt ALL (main + subagents)")
+      return true
+    }
+
+    this.clearInterruptAllTimer()
+    this.interruptAll = 0
+    this.setNotice("interrupting all")
+    // Clear main interrupt state too
+    this.clearInterruptTimer()
+    this.patch({ interrupt: 0 })
+    // Clear selected if any
+    if (this.selectedSubagent) {
+      this.selectedSubagent = undefined
+      this.options.onSubagentSelect?.(undefined)
+    }
+    this.options.onInterruptAll?.()
     return true
   }
 
@@ -990,6 +1097,7 @@ export class RunFooter implements FooterApi {
     }
 
     this.clearInterruptTimer()
+    this.clearInterruptAllTimer()
     const next = this.state().exit + 1
     this.patch({ exit: next, interrupt: 0 })
 
@@ -1090,6 +1198,7 @@ export class RunFooter implements FooterApi {
     this.destroyed = true
     this.notifyClose()
     this.clearInterruptTimer()
+    this.clearInterruptAllTimer()
     this.clearExitTimer()
     this.clearNoticeTimer()
     this.renderer.off(CliRenderEvents.DESTROY, this.handleDestroy)

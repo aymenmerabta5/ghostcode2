@@ -98,6 +98,8 @@ type RunFooterViewProps = {
   onQuestionReject: (input: QuestionReject) => void | Promise<void>
   onCycle: () => void
   onInterrupt: () => boolean
+  onInterruptSubagent?: () => boolean
+  onInterruptAll?: () => boolean
   onBackground?: () => void
   onEditorOpen: (input: { value: string }) => Promise<string | undefined>
   onInputClear: () => void
@@ -563,6 +565,34 @@ export function RunFooterView(props: RunFooterViewProps) {
     bindings: props.tuiConfig.keybinds.get("session.queued_prompts"),
   }))
 
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    enabled: active().type === "prompt" && (route().type === "composer" || route().type === "subagent"),
+    commands: [
+      {
+        name: "session.interrupt.all",
+        title: "Interrupt all including subagents",
+        category: "Session",
+        run: () => props.onInterruptAll?.(),
+      },
+    ],
+    bindings: props.tuiConfig.keybinds.get("session.interrupt.all"),
+  }))
+
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    enabled: active().type === "prompt" && route().type === "subagent",
+    commands: [
+      {
+        name: "session.interrupt",
+        title: "Interrupt subagent",
+        category: "Session",
+        run: () => props.onInterrupt(),
+      },
+    ],
+    bindings: props.tuiConfig.keybinds.get("session.interrupt"),
+  }))
+
   createEffect(() => {
     const current = route()
     if (current.type !== "subagent") {
@@ -937,6 +967,7 @@ export function RunFooterView(props: RunFooterViewProps) {
             diffStyle={props.diffStyle}
             onCycle={cycleTab}
             onClose={closeTab}
+            onInterrupt={props.onInterrupt}
           />
         </box>
       </Show>
