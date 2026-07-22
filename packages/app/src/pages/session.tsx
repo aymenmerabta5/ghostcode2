@@ -100,6 +100,7 @@ import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/sessio
 import { useUsageExceededDialogs } from "./session/usage-exceeded-dialogs"
 import { createSessionOwnership } from "./session/session-ownership"
 import { createSessionLineage } from "./session/session-lineage"
+import { BackgroundJobsPanel } from "./session/background-jobs-panel"
 
 type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
@@ -1065,7 +1066,7 @@ export default function Page() {
     }
 
     if (event.key.length === 1 && event.key !== "Unidentified" && !(event.ctrlKey || event.metaKey)) {
-      if (composer.blocked() || isChildSession()) return
+      if (composer.blocked()) return
       const input = inputRef
       if (!input) return
       input.focus()
@@ -1123,7 +1124,6 @@ export default function Page() {
   }
 
   const focusInput = () => {
-    if (isChildSession()) return
     inputRef?.focus()
   }
 
@@ -2225,6 +2225,10 @@ export default function Page() {
           </Match>
         </Switch>
       </div>
+
+      <Show when={params.id}>
+        <BackgroundJobsPanel />
+      </Show>
 
       <Show when={(params.id || !newSessionDesign()) && !mobileChanges()}>{(_) => composerRegion()}</Show>
       <Show when={!!params.id && mobileTabsBottom()}>{mobileTabs(true, true)}</Show>
