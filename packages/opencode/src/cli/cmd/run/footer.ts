@@ -1129,6 +1129,22 @@ export class RunFooter implements FooterApi {
       this.selectedSubagent = undefined
       this.options.onSubagentSelect?.(undefined)
     }
+    // Cancel any running shell background jobs via onKillJob
+    try {
+      const bgs = this.background?.() ?? []
+      for (const job of bgs) {
+        if (job.status === "running") {
+          this.options.onKillJob?.(job.id, "shell")
+        }
+      }
+    } catch {}
+    try {
+      for (const tab of this.subagent().tabs) {
+        if (tab.background && tab.status === "running") {
+          this.options.onKillJob?.(tab.sessionID, "shell")
+        }
+      }
+    } catch {}
     this.options.onInterruptAll?.()
     return true
   }

@@ -2713,12 +2713,22 @@ export type WorkflowPhase = {
   title: string
   detail?: string
   model?: string
+  budget?:
+    | number
+    | {
+        usd?: number
+        tokens?: number
+      }
 }
 
 export type WorkflowArgument = {
   type?: string
   default?: unknown
   description?: string
+}
+
+export type WorkflowGuideMeta = {
+  maxLines?: number
 }
 
 export type WorkflowMeta = {
@@ -2729,6 +2739,10 @@ export type WorkflowMeta = {
   arguments?: {
     [key: string]: WorkflowArgument
   }
+  phaseValidation?: "strict" | "warn"
+  allowNondeterminism?: boolean
+  tools?: Array<string>
+  guide?: WorkflowGuideMeta
 }
 
 export type WorkflowInfo = {
@@ -2752,6 +2766,10 @@ export type WorkflowLogEntry = {
   time: number
   phase?: string
   message: string
+  child?: {
+    run: string
+    workflow: string
+  }
 }
 
 export type WorkflowAgentRun = {
@@ -2781,8 +2799,16 @@ export type WorkflowAgentRun = {
   }
   error?: string
   cached?: boolean
-  kind?: "agent" | "question"
+  kind?: "agent" | "question" | "tool" | "guide:append" | "guide:set"
   answer?: string
+  cache_key?: string
+  child?: {
+    run: string
+    workflow: string
+  }
+  branch?: string
+  effort?: string
+  agentType?: string
 }
 
 export type WorkflowRun = {
@@ -2807,6 +2833,13 @@ export type WorkflowRun = {
     options?: Array<string>
     asked_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
+  phase_data?: {
+    [key: string]: unknown
+  }
+  state?: {
+    [key: string]: unknown
+  }
+  guide?: Array<string>
 }
 
 export type WorkflowSavePayload = {
@@ -7762,6 +7795,122 @@ export type EventSubscribeResponses = {
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
 
+export type BackgroundListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/background"
+}
+
+export type BackgroundListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type BackgroundListError = BackgroundListErrors[keyof BackgroundListErrors]
+
+export type BackgroundListResponses = {
+  /**
+   * List of background jobs
+   */
+  200: Array<{
+    id: string
+    type: string
+    title?: string
+    status: "running" | "completed" | "error" | "cancelled"
+    started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    output?: string
+    error?: string
+    metadata?: {
+      [key: string]: unknown
+    }
+  }>
+}
+
+export type BackgroundListResponse = BackgroundListResponses[keyof BackgroundListResponses]
+
+export type BackgroundGetData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/background/{id}"
+}
+
+export type BackgroundGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Not found
+   */
+  404: NotFoundError
+}
+
+export type BackgroundGetError = BackgroundGetErrors[keyof BackgroundGetErrors]
+
+export type BackgroundGetResponses = {
+  /**
+   * Background job info
+   */
+  200: {
+    id: string
+    type: string
+    title?: string
+    status: "running" | "completed" | "error" | "cancelled"
+    started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    output?: string
+    error?: string
+    metadata?: {
+      [key: string]: unknown
+    }
+  }
+}
+
+export type BackgroundGetResponse = BackgroundGetResponses[keyof BackgroundGetResponses]
+
+export type BackgroundCancelData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/background/{id}/cancel"
+}
+
+export type BackgroundCancelErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type BackgroundCancelError = BackgroundCancelErrors[keyof BackgroundCancelErrors]
+
+export type BackgroundCancelResponses = {
+  /**
+   * Cancelled
+   */
+  200: boolean
+}
+
+export type BackgroundCancelResponse = BackgroundCancelResponses[keyof BackgroundCancelResponses]
+
 export type ConfigGetData = {
   body?: never
   path?: never
@@ -11730,6 +11879,7 @@ export type WorkflowExportData = {
   query?: {
     directory?: string
     workspace?: string
+    markdown?: "true" | "false"
   }
   url: "/workflow/run/{id}/export"
 }

@@ -389,11 +389,27 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
         })
         .catch(() => {})
 
-      // For shell background jobs, try experimental background cancel? For now,
-      // aborting main + children covers task subagents. Shell jobs with
-      // parentSessionId = main will be left unless explicit cancel endpoint exists.
-      // Kill-all intention is best-effort; future server endpoint will handle shell jobs.
-      void Promise.all([abortMain, abortChildren])
+      // Cancel shell background jobs (best-effort): shell dev servers, etc.
+      const abortBackground = (async () => {
+        try {
+          const sdkAny = ctx.sdk as any
+          const bgApi = sdkAny.background ?? sdkAny.client?.background
+          if (!bgApi?.list) return
+          const res = await bgApi.list().catch(() => null)
+          const jobs: Array<{ id: string; status: string }> = res?.data ?? res ?? []
+          if (!Array.isArray(jobs)) return
+          const running = jobs.filter((j) => j.status === "running")
+          await Promise.all(
+            running.map((job) =>
+              bgApi
+                .cancel({ id: job.id })
+                .catch(() => sdkAny.session?.abort?.({ sessionID: job.id }).catch(() => {})),
+            ),
+          )
+        } catch {}
+      })().catch(() => {})
+
+      void Promise.all([abortMain, abortChildren, abortBackground])
         .catch(() => {})
         .finally(() => {
           state.aborting = false
@@ -406,9 +422,23 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     onKillJob: (id, kind) => {
       if (!hasSession(input, state)) return
       log?.write("job.kill", { id, kind })
-      // For task subagents, abort session. For shell, same abort attempt (no-op if not session)
-      // Future: call background cancel endpoint when available
+      const sdkAny = ctx.sdk as any
+      const bgApi = sdkAny.background ?? sdkAny.client?.background
+      if (kind === "shell") {
+        if (bgApi?.cancel) {
+          void bgApi
+            .cancel({ id })
+            .catch(() => ctx.sdk.session.abort({ sessionID: id }).catch(() => {}))
+        } else {
+          void ctx.sdk.session.abort({ sessionID: id }).catch(() => {})
+        }
+        return
+      }
       void ctx.sdk.session.abort({ sessionID: id }).catch(() => {})
+      // Also try background cancel for task jobs that may have been promoted
+      if (bgApi?.cancel) {
+        void bgApi.cancel({ id }).catch(() => {})
+      }
     },
     onSubagentSelect: (sessionID) => {
       state.selectSubagent?.(sessionID)

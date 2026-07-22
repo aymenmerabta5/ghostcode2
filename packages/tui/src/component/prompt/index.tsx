@@ -527,17 +527,27 @@ export function Prompt(props: PromptProps) {
             void sdk.client.session.abort({ sessionID: id }).catch(() => {})
           }
 
-          // Try to background-cancel via experimental API if any foreground tasks
-          // (best-effort, not fatal if fails)
-          void sdk.client.experimental.session
-            .background({
-              sessionID: rootID,
-              workspace: undefined as any,
-            })
-            .catch(() => {})
+          // Also cancel shell background jobs (dev servers, etc.)
+          void (async () => {
+            try {
+              const sdkAny = sdk.client as any
+              const bgApi = sdkAny.background
+              if (bgApi?.list) {
+                const res = await bgApi.list().catch(() => null)
+                const jobs: Array<{ id: string; status: string }> = res?.data ?? res ?? []
+                if (Array.isArray(jobs)) {
+                  for (const job of jobs) {
+                    if (job.status === "running") {
+                      void bgApi.cancel({ id: job.id }).catch(() => {})
+                    }
+                  }
+                }
+              }
+            } catch {}
+          })()
 
           toast.show({
-            message: `Interrupted all: ${toAbort.size} session(s)`,
+            message: `Interrupted all: ${toAbort.size} session(s) + background jobs`,
             variant: "info",
             duration: 3000,
           })

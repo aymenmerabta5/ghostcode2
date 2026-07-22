@@ -15,6 +15,12 @@ import type {
   AuthRemoveResponses,
   AuthSetErrors,
   AuthSetResponses,
+  BackgroundCancelErrors,
+  BackgroundCancelResponses,
+  BackgroundGetErrors,
+  BackgroundGetResponses,
+  BackgroundListErrors,
+  BackgroundListResponses,
   CommandListErrors,
   CommandListResponses,
   Config as Config3,
@@ -1435,6 +1441,102 @@ export class Event extends HeyApiClient {
     )
     return (options?.client ?? this.client).sse.get<EventSubscribeResponses, unknown, ThrowOnError>({
       url: "/event",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class Background extends HeyApiClient {
+  /**
+   * List background jobs
+   *
+   * List all running background jobs (task subagents and shell dev servers) from BackgroundJob.Service.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<BackgroundListResponses, BackgroundListErrors, ThrowOnError>({
+      url: "/background",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get background job
+   *
+   * Get a background job by id, including output and status.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<BackgroundGetResponses, BackgroundGetErrors, ThrowOnError>({
+      url: "/background/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Cancel background job
+   *
+   * Cancel a running background job (task subagent or shell).
+   */
+  public cancel<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<BackgroundCancelResponses, BackgroundCancelErrors, ThrowOnError>({
+      url: "/background/{id}/cancel",
       ...options,
       ...params,
     })
@@ -5421,13 +5523,14 @@ export class Workflow extends HeyApiClient {
   /**
    * Export workflow run transcripts
    *
-   * Export a run's transcripts as JSONL files.
+   * Export a run's transcripts as JSON bundle plus optional markdown rendering (markdown=true).
    */
   public export<ThrowOnError extends boolean = false>(
     parameters: {
       id: string
       directory?: string
       workspace?: string
+      markdown?: "true" | "false"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -5439,6 +5542,7 @@ export class Workflow extends HeyApiClient {
             { in: "path", key: "id" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "query", key: "markdown" },
           ],
         },
       ],
@@ -7535,6 +7639,11 @@ export class OpencodeClient extends HeyApiClient {
   private _event?: Event
   get event(): Event {
     return (this._event ??= new Event({ client: this.client }))
+  }
+
+  private _background?: Background
+  get background(): Background {
+    return (this._background ??= new Background({ client: this.client }))
   }
 
   private _config?: Config2
