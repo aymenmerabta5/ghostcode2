@@ -12,6 +12,7 @@ import { Config } from "@/config/config"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -85,6 +86,7 @@ export const TaskTool = Tool.define(
     const sessions = yield* Session.Service
     const scope = yield* Scope.Scope
     const database = yield* Database.Service
+    const flags = yield* RuntimeFlags.Service.pipe(Effect.catch(() => Effect.succeed({ experimentalBackgroundSubagents: false } as any)))
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -92,6 +94,38 @@ export const TaskTool = Tool.define(
     ) {
       const cfg = yield* config.get()
       const runInBackground = params.background === true
+
+      // Restore opencode vanilla: main locked 100% for subagents by default, background requires experimental flag
+      // This is the hard lock you asked for — prevents 12+12 duplicate spam
+      const flagVal = yield* flags
+      // @ts-ignore - experimentalBackgroundSubagents may be boolean or undefined
+      if (runInBackground && !(flagVal as any).experimentalBackgroundSubagents) {
+        return {
+          title: "Background subagents disabled",
+          metadata: { error: true } as any,
+          output:
+            "Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true. By default main is locked 100% when spawning subagents (foreground). Remove background:true to run foreground and wait, or set the env flag to allow background.",
+        }
+      }
+
+      // Duplicate-title guard: prevent same description running twice for same parent session (fixes 12+12)
+      {
+        const jobs = yield* background.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+        const duplicate = (jobs as any[]).find(
+          (j: any) =>
+            j.status === "running" &&
+            j.type === "task" &&
+            j.title === params.description &&
+            (j.metadata as any)?.parentSessionId === ctx.sessionID,
+        )
+        if (duplicate) {
+          return {
+            title: `Task already running: ${params.description}`,
+            metadata: { error: true, jobId: duplicate.id } as any,
+            output: `Task with same description "${params.description}" is already running as ${duplicate.id} for this session. Wait for it via background_list / task_output instead of spawning duplicate. Main is locked 100% for subagents by default — use foreground and wait for result before spawning again.`,
+          }
+        }
+      }
 
       // Depth guard: prevent fork bomb from nested subagents (max 2 levels)
       // Walk parent chain counting ancestors; if depth >=2, return error result not defect

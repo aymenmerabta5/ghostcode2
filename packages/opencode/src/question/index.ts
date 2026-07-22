@@ -90,6 +90,19 @@ const layer = Layer.effect(
       tool?: Tool
     }) {
       const pending = (yield* InstanceState.get(state)).pending
+
+      // DEDUP: If same session already has pending question with identical text, return same deferred instead of duplicate popup
+      // This fixes question tool duplication (same as 12+12 task duplication)
+      const incomingTexts = input.questions.map((q) => q.question).join("|")
+      for (const [existingId, entry] of pending.entries()) {
+        if (entry.info.sessionID !== input.sessionID) continue
+        const existingTexts = entry.info.questions.map((q) => q.question).join("|")
+        if (existingTexts === incomingTexts) {
+          yield* Effect.logInfo("deduping duplicate question", { existingId, sessionID: input.sessionID })
+          return yield* Deferred.await(entry.deferred)
+        }
+      }
+
       const id = QuestionID.ascending()
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })
 

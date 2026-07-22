@@ -1,8 +1,10 @@
-import { Effect, Schema } from "effect"
+import { Effect, Schema, Scope } from "effect"
 import * as Tool from "./tool"
 import { Workflow } from "@/workflow/workflow"
 import type { TaskPromptOps } from "@/tool/task"
 import { SessionID } from "@/session/schema"
+import { Session } from "@/session/session"
+import { EffectBridge } from "@/effect/bridge"
 import DESCRIPTION from "./workflow.txt"
 
 export const Parameters = Schema.Struct({
@@ -96,9 +98,77 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, never>(
               return { title: "error", output: err instanceof Error ? err.message : String(err), metadata: {} } satisfies Tool.ExecuteResult<Metadata>
             }
             const run = result.success
+
+            // Notify main agent directly when workflow finishes — output report to main agent (same as subagent behavior)
+            // This ensures main gets final report without needing to poll inspect manually
+            if (promptOps) {
+              const sessions = yield* Session.Service.pipe(Effect.catch(() => Effect.succeed(undefined as any)), Effect.orDie)
+              const scope = yield* Scope.Scope.pipe(Effect.catch(() => Effect.succeed(undefined as any)), Effect.orDie)
+              const notifyCompletion = Effect.gen(function* () {
+                const waitResult = yield* workflows.wait({ id: run.id as Workflow.RunID }).pipe(Effect.ignore, Effect.orDie)
+                const completedRun = (waitResult as any)?.run ?? (yield* workflows.get(run.id as Workflow.RunID).pipe(Effect.catch(() => Effect.succeed(undefined as any)), Effect.orDie))
+                if (!completedRun) return
+                const r = completedRun as any
+                const completed = (r.agents ?? []).filter((a: any) => a.status === "completed").length
+                const failed = (r.agents ?? []).filter((a: any) => a.status === "failed").length
+                let resultSection = ""
+                if (r.result !== undefined) {
+                  const res: unknown = r.result
+                  if (typeof res === "string") {
+                    resultSection = res.slice(0, 100_000)
+                  } else if (res !== null && typeof res === "object" && !Array.isArray(res)) {
+                    const obj = res as Record<string, unknown>
+                    const finalReport = [obj.finalReport, obj.report, obj.summary].find((v): v is string => typeof v === "string" && v.length > 0)
+                    if (finalReport) resultSection = finalReport.slice(0, 100_000)
+                    else resultSection = JSON.stringify(res, null, 2).slice(0, 15000)
+                  } else {
+                    resultSection = JSON.stringify(res, null, 2).slice(0, 15000)
+                  }
+                }
+                let parentAgent = ctx.agent
+                if (sessions) {
+                  const currentParent = yield* (sessions as any).get(ctx.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined as any)), Effect.orDie)
+                  parentAgent = (currentParent as any)?.agent ?? ctx.agent
+                }
+                const injectedText = [
+                  `<workflow id="${r.id}" workflow="${r.workflow}" status="${r.status}">`,
+                  `<summary>Workflow completed: ${r.workflow} — ${r.status} (${completed} completed, ${failed} failed)</summary>`,
+                  resultSection ? `<result>\n${resultSection}\n</result>` : "",
+                  `</workflow>`,
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+                if (scope) {
+                  yield* (promptOps as any)
+                    .prompt({
+                      sessionID: ctx.sessionID,
+                      agent: parentAgent,
+                      parts: [{ type: "text", synthetic: true, text: injectedText }],
+                    })
+                    .pipe(Effect.ignore, Effect.forkIn(scope as any, { startImmediately: true }))
+                } else {
+                  yield* (promptOps as any)
+                    .prompt({
+                      sessionID: ctx.sessionID,
+                      agent: parentAgent,
+                      parts: [{ type: "text", synthetic: true, text: injectedText }],
+                    })
+                    .pipe(Effect.ignore, Effect.orDie)
+                }
+              })
+              // Fork notification in background — main locked 100% via pursue loop waiting, but report will auto-inject when done
+              const scopeForFork = yield* Scope.Scope.pipe(Effect.catch(() => Effect.succeed(undefined as any)), Effect.orDie)
+              if (scopeForFork) {
+                yield* notifyCompletion.pipe(Effect.forkIn(scopeForFork as any, { startImmediately: true }), Effect.orDie)
+              } else {
+                // Fallback: run without forking in scope, just ignore
+                yield* notifyCompletion.pipe(Effect.ignore, Effect.orDie)
+              }
+            }
+
             return {
               title: `${run.workflow} started`,
-              output: `Started workflow '${run.workflow}' — run ID: ${run.id}\nStatus: ${run.status}\nPhases: ${run.definition?.meta.phases?.map((p: any) => typeof p === "string" ? p : p.title).join(" → ") ?? "(none)"}`,
+              output: `Started workflow '${run.workflow}' — run ID: ${run.id}\nStatus: ${run.status}\nPhases: ${run.definition?.meta.phases?.map((p: any) => typeof p === "string" ? p : p.title).join(" → ") ?? "(none)"}\n\nMain is locked 100% for this workflow — you will be notified directly when it completes with its report. Do NOT do its work yourself, only wait and poll inspect if needed.`,
               metadata: { runID: run.id, workflow: run.workflow, status: run.status },
             } satisfies Tool.ExecuteResult<Metadata>
           }

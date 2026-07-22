@@ -57,6 +57,9 @@ import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Goal } from "./goal"
+import { BackgroundJob } from "@/background/job"
+import { Question } from "@/question"
+import { Workflow } from "@/workflow/workflow"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1395,47 +1398,118 @@ const layer = Layer.effect(
       )
     })
 
-    const pursue: (input: { sessionID: SessionID }) => Effect.Effect<void> = Effect.fn("SessionPrompt.pursue")(
-      function* (input) {
-        if (pursuing.has(input.sessionID)) return
-        pursuing.add(input.sessionID)
-        yield* Effect.ensuring(
-          Effect.gen(function* () {
-            let step = 0
-            while (step < GOAL_MAX_STEPS) {
-              const goal = yield* goals.get(input.sessionID)
-              if (!goal || goal.status !== "active") break
-              const budget = goal.budgetTokens ?? GOAL_DEFAULT_BUDGET_TOKENS
-              if (goal.tokensUsed >= budget) {
-                yield* goals.pause(input.sessionID)
-                break
+    // Main locked 100% for subagents/workflows — opencode vanilla behavior
+    // Only shell dev servers (type=shell) are free, task and workflows block pursue loop
+    const pursue: any = Effect.fn("SessionPrompt.pursue")(function* (input: { sessionID: SessionID }) {
+      if (pursuing.has(input.sessionID)) return
+      pursuing.add(input.sessionID)
+      const bg = yield* BackgroundJob.Service
+      const questionSvc = yield* Question.Service
+      const workflowSvc = yield* Workflow.Service.pipe(
+        Effect.catch(() => Effect.succeed(undefined as any)),
+        Effect.orDie,
+      )
+      yield* Effect.ensuring(
+        Effect.gen(function* () {
+          let step = 0
+          while (step < GOAL_MAX_STEPS) {
+            // FORCE LOCK: Before next iteration, wait for running task jobs and workflows and questions for same session
+            if (step > 0) {
+              // Wait for task subagents
+              const jobs = yield* bg
+                .list()
+                .pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.orDie)
+              const runningTasks = (jobs as any[]).filter(
+                (j: any) =>
+                  j.status === "running" &&
+                  j.type === "task" &&
+                  (j.metadata as any)?.parentSessionId === input.sessionID,
+              )
+              if (runningTasks.length > 0) {
+                yield* Effect.logInfo("pursue waiting for task jobs", {
+                  sessionID: input.sessionID,
+                  count: runningTasks.length,
+                })
+                for (const job of runningTasks) {
+                  yield* bg
+                    .wait({ id: job.id })
+                    .pipe(Effect.timeoutOption(5 * 60 * 1000), Effect.ignore, Effect.catch(() => Effect.void), Effect.orDie)
+                }
               }
 
-              const text =
-                step === 0
-                  ? `You are now autonomously pursuing this session's goal:\n\n${goal.text}\n\nWork toward it using the available tools. When it is fully achieved, call the goal tool with action "complete" and a concise verification of what was accomplished. If you become blocked or need input from the user, call the goal tool with action "pause".`
-                  : `The session goal is not yet complete:\n\n${goal.text}\n\nKeep working toward it. When it is done, call the goal tool with action "complete" (include a short verification). If you are blocked, call it with action "pause".`
-
-              const start = Date.now()
-              const result = yield* prompt({
-                sessionID: input.sessionID,
-                parts: [{ type: "text", text }],
-              }).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              if (!result) break
-
-              const info = result.info
-              if (info.role === "assistant" && info.tokens) {
-                const t = info.tokens
-                const used = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
-                yield* goals.recordUsage({ sessionID: input.sessionID, tokens: used, durationMs: Date.now() - start })
+              // Wait for workflows
+              if (workflowSvc) {
+                const runs = yield* (workflowSvc as any)
+                  .runs()
+                  .pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.orDie)
+                const runningWf = (runs as any[]).filter((r: any) => r.status === "running" && r.session_id === input.sessionID)
+                if (runningWf.length > 0) {
+                  yield* Effect.logInfo("pursue waiting for workflows", {
+                    sessionID: input.sessionID,
+                    count: runningWf.length,
+                  })
+                  for (const wf of runningWf) {
+                    yield* (workflowSvc as any)
+                      .wait({ id: wf.id, timeout: 5 * 60 * 1000 })
+                      .pipe(Effect.ignore, Effect.catch(() => Effect.void), Effect.orDie)
+                  }
+                }
               }
-              step++
+
+              // Wait for pending questions
+              const pendingQs = yield* questionSvc
+                .list()
+                .pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.orDie)
+              const pendingForSession = (pendingQs as any[]).filter((q: any) => q.sessionID === input.sessionID)
+              if (pendingForSession.length > 0) {
+                yield* Effect.logInfo("pursue waiting for questions", {
+                  sessionID: input.sessionID,
+                  count: pendingForSession.length,
+                })
+                let waited = 0
+                while (waited < 10 * 60 * 1000) {
+                  const still = yield* questionSvc
+                    .list()
+                    .pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.orDie)
+                  if (!(still as any[]).some((q: any) => q.sessionID === input.sessionID)) break
+                  yield* Effect.sleep(2000)
+                  waited += 2000
+                }
+              }
             }
-          }),
-          Effect.sync(() => pursuing.delete(input.sessionID)),
-        )
-      },
-    )
+
+            const goal = yield* goals.get(input.sessionID)
+            if (!goal || goal.status !== "active") break
+            const budget = goal.budgetTokens ?? GOAL_DEFAULT_BUDGET_TOKENS
+            if (goal.tokensUsed >= budget) {
+              yield* goals.pause(input.sessionID)
+              break
+            }
+
+            const text =
+              step === 0
+                ? `You are now autonomously pursuing this session's goal:\n\n${goal.text}\n\nWork toward it using the available tools. When it is fully achieved, call the goal tool with action "complete" and a concise verification of what was accomplished. If you become blocked or need input from the user, call the goal tool with action "pause".`
+                : `The session goal is not yet complete:\n\n${goal.text}\n\nKeep working toward it. If you previously spawned reviewer subagents or other task subagents that are still running (check background_list), wait for them to complete instead of spawning duplicate ones. If you asked a question and are waiting for answer, do NOT ask it again. When it is done, call the goal tool with action "complete" (include a short verification). If you are blocked, call it with action "pause".`
+
+            const start = Date.now()
+            const result = yield* prompt({
+              sessionID: input.sessionID,
+              parts: [{ type: "text", text }],
+            }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (!result) break
+
+            const info = result.info
+            if (info.role === "assistant" && info.tokens) {
+              const t = info.tokens
+              const used = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
+              yield* goals.recordUsage({ sessionID: input.sessionID, tokens: used, durationMs: Date.now() - start })
+            }
+            step++
+          }
+        }).pipe(Effect.orDie),
+        Effect.sync(() => pursuing.delete(input.sessionID)),
+      )
+    })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
@@ -2105,6 +2179,9 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    BackgroundJob.node,
+    Question.node,
+    Workflow.node,
   ],
 })
 
