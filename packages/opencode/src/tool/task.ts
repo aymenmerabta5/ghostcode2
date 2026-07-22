@@ -94,7 +94,7 @@ export const TaskTool = Tool.define(
       const runInBackground = params.background === true
 
       // Depth guard: prevent fork bomb from nested subagents (max 2 levels)
-      // Walk parent chain counting ancestors; if depth >=2, fail
+      // Walk parent chain counting ancestors; if depth >=2, return error result not defect
       {
         let depth = 0
         let curParentID: SessionID | undefined = ctx.sessionID
@@ -106,9 +106,11 @@ export const TaskTool = Tool.define(
           curParentID = current.parentID
           depth++
           if (depth >= 2) {
-            return yield* Effect.fail(
-              new Error("Subagent nesting too deep (max 2) to avoid fork bomb. Use direct tools instead."),
-            )
+            return {
+              title: "Subagent nesting too deep",
+              metadata: { error: true } as any,
+              output: "Subagent nesting too deep (max 2) to avoid fork bomb. Use direct tools instead.",
+            }
           }
         }
       }
@@ -127,13 +129,26 @@ export const TaskTool = Tool.define(
 
       const next = yield* agent.get(params.subagent_type)
       if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
+        return {
+          title: `Unknown agent type: ${params.subagent_type}`,
+          metadata: { error: true, subagent_type: params.subagent_type } as any,
+          output: `Unknown agent type: ${params.subagent_type} is not a valid agent type`,
+        }
       }
 
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
-      const parent = yield* sessions.get(ctx.sessionID)
+      const parent = yield* sessions
+        .get(ctx.sessionID)
+        .pipe(Effect.catchCause(() => Effect.succeed(undefined as any)))
+      if (!parent) {
+        return {
+          title: "Parent session not found",
+          metadata: { error: true } as any,
+          output: `Parent session not found: ${ctx.sessionID}`,
+        }
+      }
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -169,11 +184,25 @@ export const TaskTool = Tool.define(
           ],
         }))
 
-      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
+      const msgResult = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
         Effect.provideService(Database.Service, database),
-        Effect.orDie,
+        Effect.catchCause(() => Effect.succeed(undefined)),
       )
-      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
+      if (!msgResult) {
+        return {
+          title: "Task message not found",
+          metadata: { error: true } as any,
+          output: "Task message not found — cannot determine variant or model.",
+        }
+      }
+      const msg = msgResult
+      if (msg.info.role !== "assistant") {
+        return {
+          title: "Not an assistant message",
+          metadata: { error: true } as any,
+          output: "Not an assistant message",
+        }
+      }
       const variant = msg.info.variant
 
       const model = next.model ?? {
@@ -193,7 +222,13 @@ export const TaskTool = Tool.define(
       })
 
       const ops = ctx.extra?.promptOps as TaskPromptOps
-      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
+      if (!ops) {
+        return {
+          title: "Task misconfigured",
+          metadata: { error: true } as any,
+          output: "TaskTool requires promptOps in ctx.extra",
+        }
+      }
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
@@ -324,8 +359,30 @@ export const TaskTool = Tool.define(
               background.waitForPromotion(nextSession.id),
             )
             if (result?.metadata?.background === true) return backgroundResult()
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+            if (result?.status === "error") {
+              return {
+                title: params.description,
+                metadata: { ...metadata, error: true } as any,
+                output: renderOutput({
+                  sessionID: nextSession.id,
+                  state: "error",
+                  summary: `Task failed: ${params.description}`,
+                  text: result.error ?? "Task failed",
+                }),
+              }
+            }
+            if (result?.status === "cancelled") {
+              return {
+                title: params.description,
+                metadata: { ...metadata, error: true } as any,
+                output: renderOutput({
+                  sessionID: nextSession.id,
+                  state: "error",
+                  summary: `Task cancelled: ${params.description}`,
+                  text: "Task cancelled",
+                }),
+              }
+            }
             return {
               title: params.description,
               metadata,
@@ -351,8 +408,7 @@ export const TaskTool = Tool.define(
     return {
       description: [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n"),
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
-        run(params, ctx).pipe(Effect.orDie),
-    }
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) => run(params, ctx) as any,
+    } as any
   }),
 )

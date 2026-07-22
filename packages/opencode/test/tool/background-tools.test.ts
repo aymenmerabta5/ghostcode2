@@ -268,13 +268,11 @@ describe("tool.background_kill", () => {
       projectRoot,
       Effect.gen(function* () {
         const def = yield* init(BackgroundKillTool)
-        const exit = yield* runTool(def, { task_id: "non-existent-job-id-xyz" } as any).pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (Exit.isFailure(exit)) {
-          const msg = String(exit.cause)
-          expect(msg).toContain("Job not found")
-          expect(msg).toContain("background_list")
-        }
+        const result = yield* runTool(def, { task_id: "non-existent-job-id-xyz" } as any)
+        // After fix, job not found returns error result, not Effect failure (tool.ts catchAll converts)
+        expect((result.metadata as any).error).toBe(true)
+        expect(result.output).toContain("Job not found")
+        expect(result.output).toContain("background_list")
       }),
     ),
   )
@@ -533,13 +531,10 @@ describe("tool.task_output / background_output", () => {
       projectRoot,
       Effect.gen(function* () {
         const def = yield* init(TaskOutputTool)
-        const exit = yield* runTool(def, { task_id: "does-not-exist-12345" } as any).pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (Exit.isFailure(exit)) {
-          const msg = String(exit.cause)
-          expect(msg).toContain("Job not found")
-          expect(msg).toContain("background_list")
-        }
+        const result = yield* runTool(def, { task_id: "does-not-exist-12345" } as any)
+        expect((result.metadata as any).error).toBe(true)
+        expect(result.output).toContain("Job not found")
+        expect(result.output).toContain("background_list")
       }),
     ),
   )

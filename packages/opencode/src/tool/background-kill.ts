@@ -8,18 +8,6 @@ export const Parameters = Schema.Struct({
   reason: Schema.optional(Schema.String).annotate({ description: "Optional reason for cancellation" }),
 })
 
-function resolveId(jobs: { id: string }[], input: string) {
-  // Exact match first
-  const exact = jobs.find((j) => j.id === input)
-  if (exact) return exact.id
-  // Prefix match (e.g., first 8 chars shown in list)
-  const prefixed = jobs.filter((j) => j.id.startsWith(input))
-  if (prefixed.length === 1) return prefixed[0].id
-  // If ambiguous, return undefined and let caller handle
-  if (prefixed.length > 1) return prefixed[0].id
-  return undefined
-}
-
 export const BackgroundKillTool = Tool.define(
   "background_kill",
   Effect.gen(function* () {
@@ -31,13 +19,38 @@ export const BackgroundKillTool = Tool.define(
       execute: (params: Schema.Schema.Type<typeof Parameters>) =>
         Effect.gen(function* () {
           const all = yield* bg.list()
-          const targetId = resolveId(all, params.task_id) ?? params.task_id
+
+          const exact = all.find((j) => j.id === params.task_id)
+          let targetId: string | undefined
+          if (exact) {
+            targetId = exact.id
+          } else {
+            const prefixed = all.filter((j) => j.id.startsWith(params.task_id))
+            if (prefixed.length === 0) {
+              return {
+                title: "Job not found",
+                metadata: { error: true, task_id: params.task_id },
+                output: `Job not found: ${params.task_id}. Use background_list to see running jobs.`,
+              } as any
+            }
+            if (prefixed.length > 1) {
+              return {
+                title: "Ambiguous job ID",
+                metadata: { error: true, task_id: params.task_id },
+                output: `Ambiguous job ID: ${params.task_id} matches ${prefixed.length} jobs: ${prefixed.map((j) => j.id.slice(0, 8)).join(", ")}. Use more characters to disambiguate.`,
+              } as any
+            }
+            targetId = prefixed[0].id
+          }
 
           const result = yield* bg.cancel(targetId)
 
           if (!result) {
-            // Try again with prefix resolved from list snapshot that might have changed
-            return yield* Effect.fail(new Error(`Job not found: ${params.task_id}. Use background_list to see running jobs`))
+            return {
+              title: "Job not found",
+              metadata: { error: true, task_id: params.task_id },
+              output: `Job not found: ${params.task_id}. Use background_list to see running jobs.`,
+            } as any
           }
 
           const wasRunning = result.status === "cancelled"
@@ -65,7 +78,7 @@ export const BackgroundKillTool = Tool.define(
             },
             output,
           }
-        }).pipe(Effect.orDie),
-    }
+        }),
+    } as any
   }),
 )

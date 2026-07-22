@@ -150,6 +150,13 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               output: err.message,
             } as any),
           ),
+          Effect.catch((error: any) =>
+            Effect.succeed({
+              title: id,
+              metadata: { error: true },
+              output: error instanceof Error ? error.message : String(error),
+            } as any),
+          ),
           Effect.orDie,
           Effect.withSpan("Tool.execute", { attributes: attrs }),
         )

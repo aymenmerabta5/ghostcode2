@@ -597,35 +597,27 @@ describe("tool.task", () => {
         .pipe(Effect.exit)
       expect(Exit.isSuccess(exitChild)).toBe(true)
 
-      // depth 2 (grandchild) should fail with fork bomb guard
-      const exitGrandchild = yield* def
-        .execute(
-          {
-            description: "from grandchild",
-            prompt: "test",
-            subagent_type: "general",
-            background: true,
-          },
-          {
-            sessionID: grandchild.id,
-            messageID: grandchildAssistant.id,
-            agent: "build",
-            abort: new AbortController().signal,
-            extra: { promptOps: stubOps() },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.exit)
-
-      expect(Exit.isFailure(exitGrandchild)).toBe(true)
-      if (Exit.isFailure(exitGrandchild)) {
-        const cause = exitGrandchild.cause
-        // Check error message contains expected guard text
-        const defectString = String(cause)
-        expect(defectString).toContain("Subagent nesting too deep")
-      }
+      // depth 2 (grandchild) should return error result, not defect (session stays alive)
+      const grandchildResult = yield* def.execute(
+        {
+          description: "from grandchild",
+          prompt: "test",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: grandchild.id,
+          messageID: grandchildAssistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps() },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      expect((grandchildResult.metadata as any).error).toBe(true)
+      expect(grandchildResult.output).toContain("Subagent nesting too deep")
 
       // Cleanup
       yield* sessions.remove(grandchild.id).pipe(Effect.ignore)
@@ -653,38 +645,38 @@ describe("tool.task", () => {
       const l3Asst = yield* seedAssistantIn(l3.id)
 
       const tryExecute = (sid: SessionID, mid: MessageID) =>
-        def
-          .execute(
-            {
-              description: "depth test",
-              prompt: "test",
-              subagent_type: "general",
-            },
-            {
-              sessionID: sid,
-              messageID: mid,
-              agent: "build",
-              abort: new AbortController().signal,
-              extra: { promptOps: stubOps() },
-              messages: [],
-              metadata: () => Effect.void,
-              ask: () => Effect.void,
-            },
-          )
-          .pipe(Effect.exit)
+        def.execute(
+          {
+            description: "depth test",
+            prompt: "test",
+            subagent_type: "general",
+          },
+          {
+            sessionID: sid,
+            messageID: mid,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
 
-      // chat depth 0 -> allowed
-      expect(Exit.isSuccess(yield* tryExecute(chat.id, assistant.id))).toBe(true)
+      // chat depth 0 -> allowed (no error)
+      const mainResult = yield* tryExecute(chat.id, assistant.id)
+      expect((mainResult.metadata as any).error).toBeUndefined()
       // l1 depth 1 -> allowed
-      expect(Exit.isSuccess(yield* tryExecute(l1.id, l1Asst.id))).toBe(true)
-      // l2 depth 2 -> blocked
-      const l2Exit = yield* tryExecute(l2.id, l2Asst.id)
-      expect(Exit.isFailure(l2Exit)).toBe(true)
-      if (Exit.isFailure(l2Exit)) expect(String(l2Exit.cause)).toContain("Subagent nesting too deep")
+      const l1Result = yield* tryExecute(l1.id, l1Asst.id)
+      expect((l1Result.metadata as any).error).toBeUndefined()
+      // l2 depth 2 -> blocked returns error result not defect
+      const l2Result = yield* tryExecute(l2.id, l2Asst.id)
+      expect((l2Result.metadata as any).error).toBe(true)
+      expect(String(l2Result.output)).toContain("Subagent nesting too deep")
       // l3 depth 3 -> blocked
-      const l3Exit = yield* tryExecute(l3.id, l3Asst.id)
-      expect(Exit.isFailure(l3Exit)).toBe(true)
-      if (Exit.isFailure(l3Exit)) expect(String(l3Exit.cause)).toContain("Subagent nesting too deep")
+      const l3Result = yield* tryExecute(l3.id, l3Asst.id)
+      expect((l3Result.metadata as any).error).toBe(true)
+      expect(String(l3Result.output)).toContain("Subagent nesting too deep")
 
       yield* sessions.remove(l3.id).pipe(Effect.ignore)
       yield* sessions.remove(l2.id).pipe(Effect.ignore)

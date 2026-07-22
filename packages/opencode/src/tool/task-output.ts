@@ -77,14 +77,6 @@ function sliceFull(text: string, filter?: string): { content: string; truncated:
   return { content: processed, truncated: false }
 }
 
-function resolveId(jobs: { id: string }[], input: string) {
-  const exact = jobs.find((j) => j.id === input)
-  if (exact) return exact.id
-  const prefixed = jobs.filter((j) => j.id.startsWith(input) || j.id.slice(0, 8) === input)
-  if (prefixed.length >= 1) return prefixed[0].id
-  return undefined
-}
-
 function formatOutput(input: {
   id: string
   title?: string
@@ -155,11 +147,36 @@ function makeExecute(id: string) {
 
             // Resolve prefix via list
             const all = yield* bg.list()
-            const resolved = resolveId(all, params.task_id) ?? params.task_id
+            const exact = all.find((j) => j.id === params.task_id)
+            let resolvedId: string
+            if (exact) {
+              resolvedId = exact.id
+            } else {
+              const prefixed = all.filter((j) => j.id.startsWith(params.task_id) || j.id.slice(0, 8) === params.task_id)
+              if (prefixed.length === 0) {
+                return {
+                  title: "Job not found",
+                  metadata: { error: true, task_id: params.task_id },
+                  output: `Job not found: ${params.task_id}. Use background_list to see running jobs.`,
+                } as any
+              }
+              if (prefixed.length > 1) {
+                return {
+                  title: "Ambiguous job ID",
+                  metadata: { error: true, task_id: params.task_id },
+                  output: `Ambiguous job ID: ${params.task_id} matches ${prefixed.length} jobs: ${prefixed.map((j) => j.id.slice(0, 8)).join(", ")}. Use more characters to disambiguate.`,
+                } as any
+              }
+              resolvedId = prefixed[0].id
+            }
 
-            let job = yield* bg.get(resolved)
+            let job = yield* bg.get(resolvedId)
             if (!job) {
-              return yield* Effect.fail(new Error(`Job not found: ${params.task_id}. Use background_list to see running jobs`))
+              return {
+                title: "Job not found",
+                metadata: { error: true, task_id: params.task_id },
+                output: `Job not found: ${params.task_id}. Use background_list to see running jobs.`,
+              } as any
             }
 
             const prepare = (rawOutput: string) => {
@@ -279,7 +296,11 @@ function makeExecute(id: string) {
             // Completed during wait
             const finalInfo = waited.info ?? (yield* bg.get(job.id))
             if (!finalInfo) {
-              return yield* Effect.fail(new Error(`Job not found after wait: ${params.task_id}`))
+              return {
+                title: "Job not found",
+                metadata: { error: true, task_id: params.task_id },
+                output: `Job not found after wait: ${params.task_id}. Use background_list to see running jobs.`,
+              } as any
             }
             const raw = finalInfo.output ?? finalInfo.error ?? ""
             const { detectedPorts, detectedUrls, finalOutput } = prepare(raw)
@@ -310,8 +331,8 @@ function makeExecute(id: string) {
               },
               output: out,
             }
-          }).pipe(Effect.orDie),
-      }
+          }),
+      } as any
     }),
   )
 }
