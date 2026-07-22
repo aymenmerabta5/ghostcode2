@@ -29,6 +29,9 @@ import z from "zod"
 import { Plugin } from "../plugin"
 import { Provider } from "@/provider/provider"
 
+import { BackgroundListTool } from "./background-list"
+import { BackgroundKillTool } from "./background-kill"
+import { BackgroundOutputTool, TaskOutputTool } from "./task-output"
 import { WebSearchTool } from "./websearch"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
@@ -115,6 +118,10 @@ const layer = Layer.effect(
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const backgroundList = yield* BackgroundListTool
+    const backgroundKill = yield* BackgroundKillTool
+    const taskOutput = yield* TaskOutputTool
+    const backgroundOutput = yield* BackgroundOutputTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
@@ -217,15 +224,19 @@ const layer = Layer.effect(
           write: Tool.init(writetool),
           task: Tool.init(task),
           fetch: Tool.init(webfetch),
-            todo: Tool.init(todo),
-            goal: Tool.init(goal),
-            workflow: Tool.init(workflow),
-            search: Tool.init(websearch),
+          todo: Tool.init(todo),
+          goal: Tool.init(goal),
+          workflow: Tool.init(workflow),
+          search: Tool.init(websearch),
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
+          backgroundList: Tool.init(backgroundList),
+          backgroundKill: Tool.init(backgroundKill),
+          taskOutput: Tool.init(taskOutput),
+          backgroundOutput: Tool.init(backgroundOutput),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
@@ -242,12 +253,16 @@ const layer = Layer.effect(
             tool.write,
             tool.task,
             tool.fetch,
-              tool.todo,
-              tool.goal,
-              tool.workflow,
-              tool.search,
+            tool.todo,
+            tool.goal,
+            tool.workflow,
+            tool.search,
             tool.skill,
             tool.patch,
+            tool.backgroundList,
+            tool.backgroundKill,
+            tool.taskOutput,
+            tool.backgroundOutput,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),

@@ -150,7 +150,7 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
+  it.instance("exposes task background parameter by default (experimental flag removed)", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
@@ -162,8 +162,21 @@ describe("tool.registry", () => {
         agent: build,
       })).find((tool) => tool.id === "task")
 
-      expect(task?.jsonSchema).toBeDefined()
-      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+      if (!task) throw new Error("task tool not found")
+      const schema = ToolJsonSchema.fromTool(task)
+      expect((schema.properties as Record<string, unknown> | undefined)?.background).toBeDefined()
+    }),
+  )
+
+  it.instance("registry includes new background tools", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+
+      expect(ids).toContain("background_list")
+      expect(ids).toContain("background_kill")
+      expect(ids).toContain("task_output")
+      expect(ids).toContain("background_output")
     }),
   )
 
