@@ -84,6 +84,7 @@ type Wait = {
   tick: number
   armed: boolean
   live: boolean
+  sessionID: string
   onVisibleOutput?: (anchor: LocalReplayAnchor) => void
   done: Deferred.Deferred<void, unknown>
 }
@@ -799,10 +800,10 @@ function createLayer(input: StreamInput) {
           )
         })
 
-        const idle = Effect.fn("RunStreamTransport.idle")((fallback: boolean) =>
+        const idle = Effect.fn("RunStreamTransport.idle")((fallback: boolean, sessionID: string) =>
           Effect.promise(() => input.sdk.session.status()).pipe(
             Effect.map((out) => {
-              const item = out.data?.[input.sessionID]
+              const item = out.data?.[sessionID]
               return !item || item.type === "idle"
             }),
             Effect.orElseSucceed(() => fallback),
@@ -826,7 +827,7 @@ function createLayer(input: StreamInput) {
 
         const touch = (event: Event) => {
           const next = state.wait
-          if (!next || !active(event, input.sessionID)) {
+          if (!next || !active(event, next.sessionID)) {
             return
           }
 
@@ -838,7 +839,7 @@ function createLayer(input: StreamInput) {
             return
           }
 
-          if (!(yield* idle(fallback)) || state.wait !== next) {
+          if (!(yield* idle(fallback, next.sessionID)) || state.wait !== next) {
             return
           }
 
@@ -848,16 +849,16 @@ function createLayer(input: StreamInput) {
         })
 
         const mark = Effect.fn("RunStreamTransport.mark")(function* (event: Event) {
-          if (
-            event.type !== "session.status" ||
-            event.properties.sessionID !== input.sessionID ||
-            event.properties.status.type !== "idle"
-          ) {
+          const next = state.wait
+          if (!next) {
             return
           }
 
-          const next = state.wait
-          if (!next) {
+          if (
+            event.type !== "session.status" ||
+            event.properties.sessionID !== next.sessionID ||
+            event.properties.status.type !== "idle"
+          ) {
             return
           }
 
@@ -943,6 +944,29 @@ function createLayer(input: StreamInput) {
             traceTabs(input.trace, prev, listSubagentTabs(state.subagent))
           }
           releaseBlocker(event)
+
+          // When targeting a selected subagent, surface its latest commit via onVisibleOutput
+          // so scroll anchoring and visible handling mirrors main session behavior.
+          if (changed && state.wait && state.wait.sessionID !== input.sessionID) {
+            const eventSessionID = sid(event)
+            if (eventSessionID && eventSessionID === state.wait.sessionID) {
+              const detail = state.subagent.details.get(eventSessionID)
+              const last = detail?.frames.at(-1)?.commit
+              if (last) {
+                state.wait.onVisibleOutput?.({
+                  kind: last.kind,
+                  text: last.text,
+                  phase: last.phase,
+                  messageID: last.messageID,
+                  partID: last.partID,
+                  toolState: last.toolState,
+                  ...(last.partID && detail.data.visible.has(last.partID)
+                    ? { visible: detail.data.visible.get(last.partID) }
+                    : {}),
+                })
+              }
+            }
+          }
 
           syncFooter(next.commits, next.footer?.patch, changed ? currentSubagentState() : undefined)
 
@@ -1199,15 +1223,23 @@ function createLayer(input: StreamInput) {
             return
           }
 
+          const targetID = state.selectedSubagent ?? input.sessionID
           const item: Wait = {
             tick: state.tick,
             armed: false,
             live: false,
+            sessionID: targetID,
             onVisibleOutput: next.onVisibleOutput,
             done: yield* Deferred.make<void, unknown>(),
           }
           state.wait = item
           state.data.announced = false
+          if (targetID !== input.sessionID) {
+            const detail = state.subagent.details.get(targetID)
+            if (detail) {
+              detail.data.announced = false
+            }
+          }
 
           const turn = new AbortController()
           const stop = () => {
@@ -1218,7 +1250,7 @@ function createLayer(input: StreamInput) {
           yield* poll(item, turn.signal).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
 
           const req = {
-            sessionID: input.sessionID,
+            sessionID: targetID,
             messageID: next.prompt.messageID,
             agent: next.agent,
             model: next.model,
@@ -1234,7 +1266,7 @@ function createLayer(input: StreamInput) {
             next.prompt.mode === "shell"
               ? Effect.sync(() => {
                   input.trace?.write("send.shell", {
-                    sessionID: input.sessionID,
+                    sessionID: targetID,
                     command: next.prompt.text,
                   })
                 }).pipe(
@@ -1245,7 +1277,7 @@ function createLayer(input: StreamInput) {
                           Effect.promise(() =>
                             input.sdk.session.shell(
                               {
-                                sessionID: input.sessionID,
+                                sessionID: targetID,
                                 agent,
                                 model: next.model,
                                 command: next.prompt.text,
@@ -1259,7 +1291,7 @@ function createLayer(input: StreamInput) {
                         Effect.tap(() =>
                           Effect.sync(() => {
                             input.trace?.write("send.shell.ok", {
-                              sessionID: input.sessionID,
+                              sessionID: targetID,
                             })
                             item.armed = true
                             item.live = true
@@ -1274,13 +1306,13 @@ function createLayer(input: StreamInput) {
                 )
               : command
                 ? Effect.sync(() => {
-                    input.trace?.write("send.command", { sessionID: input.sessionID, command: command.name })
+                    input.trace?.write("send.command", { sessionID: targetID, command: command.name })
                   }).pipe(
                     Effect.andThen(
                       Effect.promise(() =>
                         input.sdk.session.command(
                           {
-                            sessionID: input.sessionID,
+                            sessionID: targetID,
                             messageID: next.prompt.messageID,
                             agent: next.agent,
                             model: next.model ? `${next.model.providerID}/${next.model.modelID}` : undefined,
@@ -1300,7 +1332,7 @@ function createLayer(input: StreamInput) {
                         Effect.tap(() =>
                           Effect.sync(() => {
                             input.trace?.write("send.command.ok", {
-                              sessionID: input.sessionID,
+                              sessionID: targetID,
                               command: command.name,
                             })
                             item.armed = true
@@ -1327,7 +1359,7 @@ function createLayer(input: StreamInput) {
                     Effect.tap(() =>
                       Effect.sync(() => {
                         input.trace?.write("send.prompt.ok", {
-                          sessionID: input.sessionID,
+                          sessionID: targetID,
                         })
                         item.armed = true
                       }),
@@ -1344,7 +1376,11 @@ function createLayer(input: StreamInput) {
                 return Effect.void
               }
 
-              if (!input.footer.isClosed && !state.data.announced) {
+              const waitIsMain = item.sessionID === input.sessionID
+              const targetDetailAnnounced = waitIsMain
+                ? state.data.announced
+                : (state.subagent.details.get(item.sessionID)?.data.announced ?? false)
+              if (!input.footer.isClosed && !targetDetailAnnounced) {
                 input.trace?.write("ui.patch", {
                   phase: "running",
                   status: "waiting for assistant",
@@ -1391,7 +1427,7 @@ function createLayer(input: StreamInput) {
               }
 
               input.trace?.write("send.prompt.error", {
-                sessionID: input.sessionID,
+                sessionID: targetID,
                 error: formatUnknownError(error),
               })
               return Effect.fail(error)
@@ -1399,7 +1435,7 @@ function createLayer(input: StreamInput) {
             Effect.ensuring(
               Effect.sync(() => {
                 input.trace?.write("turn.end", {
-                  sessionID: input.sessionID,
+                  sessionID: targetID,
                 })
                 next.signal?.removeEventListener("abort", stop)
                 abort.signal.removeEventListener("abort", stop)
