@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Stream, Schema } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -19,10 +19,32 @@ import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
-import { ShellPrompt, type Parameters } from "./shell/prompt"
+import { ShellPrompt } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { PositiveInt } from "@opencode-ai/core/schema"
+import { BackgroundJob } from "@/background/job"
 
-export { Parameters } from "./shell/prompt"
+const BACKGROUND_STARTED = [
+  "The task is working in the background. You will be notified automatically when it finishes.",
+  "Use background_list to see running jobs, background_output {task_id} for logs, background_kill {task_id} to stop.",
+].join("\n")
+
+export const Parameters = Schema.Struct({
+  command: Schema.String.annotate({ description: "The command to execute" }),
+  timeout: Schema.optional(PositiveInt).annotate({ description: "Optional timeout in milliseconds" }),
+  workdir: Schema.optional(Schema.String).annotate({
+    description:
+      "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands.",
+  }),
+  background: Schema.optional(Schema.Boolean).annotate({
+    description: "Run in background, returns jobId immediately. Use for long-running dev servers like `bun run dev`",
+  }),
+  description: Schema.optional(Schema.String).annotate({
+    description: "Human readable description for background job",
+  }),
+})
+
+export type Parameters = Schema.Schema.Type<typeof Parameters>
 
 const MAX_METADATA_LENGTH = 30_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
@@ -344,6 +366,7 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
+    const background = yield* BackgroundJob.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
@@ -547,16 +570,16 @@ export const ShellTool = Tool.define(
 
           if (exit.kind === "abort") {
             aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
           }
           if (exit.kind === "timeout") {
             expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
           }
 
           return exit.kind === "exit" ? exit.code : null
         }),
-      ).pipe(Effect.orDie)
+      )
 
       const meta: string[] = []
       if (expired) {
@@ -605,8 +628,8 @@ export const ShellTool = Tool.define(
 
         return {
           description: prompt.description,
-          parameters: prompt.parameters,
-          execute: (params: Parameters, ctx: Tool.Context) =>
+          parameters: Parameters,
+          execute: (params: Parameters, ctx: Tool.Context): Effect.Effect<Tool.ExecuteResult<any>> =>
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
@@ -615,7 +638,6 @@ export const ShellTool = Tool.define(
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
-              const timeout = params.timeout ?? defaultTimeoutMs
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
@@ -628,16 +650,58 @@ export const ShellTool = Tool.define(
                 }),
               )
 
-              return yield* run(
+              const env = yield* shellEnv(ctx, cwd)
+
+              if (params.background) {
+                const title = params.description ?? params.command.slice(0, 50)
+                const bgCtx: Tool.Context = {
+                  ...ctx,
+                  abort: new AbortController().signal,
+                  metadata: () => Effect.void,
+                }
+                const info = yield* background.start({
+                  type: "shell",
+                  title,
+                  metadata: {
+                    command: params.command,
+                    cwd,
+                    background: true,
+                  },
+                  run: run(
+                    {
+                      shell,
+                      command: params.command,
+                      cwd,
+                      env,
+                      timeout: 24 * 60 * 60 * 1000,
+                    },
+                    bgCtx,
+                  ).pipe(Effect.map((r) => r.output)),
+                })
+                return {
+                  title: params.command,
+                  metadata: {
+                    command: params.command,
+                    cwd,
+                    background: true,
+                    jobId: info.id,
+                    title: info.title ?? title,
+                  },
+                  output: `${BACKGROUND_STARTED}\n\nBackground shell started: ${info.id}\nTitle: ${info.title ?? title}\nCommand: ${params.command}\nUse background_list to see, background_output {task_id:${info.id}} to get logs, background_kill {task_id:${info.id}} to stop`,
+                } as Tool.ExecuteResult<any>
+              }
+
+              const timeout = params.timeout ?? defaultTimeoutMs
+              return (yield* run(
                 {
                   shell,
                   command: params.command,
                   cwd,
-                  env: yield* shellEnv(ctx, cwd),
+                  env,
                   timeout,
                 },
                 ctx,
-              )
+              )) as Tool.ExecuteResult<any>
             }),
         }
       })

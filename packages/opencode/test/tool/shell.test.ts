@@ -20,6 +20,7 @@ import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { BackgroundJob } from "@/background/job"
 import { InstanceStore } from "@/project/instance-store"
 
 const shellLayer = Layer.mergeAll(
@@ -32,6 +33,7 @@ const shellLayer = Layer.mergeAll(
       Config.node,
       Agent.node,
       RuntimeFlags.node,
+      BackgroundJob.node,
     ]),
   ),
   testInstanceStoreLayer,
