@@ -291,6 +291,7 @@ export function Prompt(props: PromptProps) {
     mode: "normal" | "shell"
     extmarkToPartIndex: Map<number, number>
     interrupt: number
+    interruptAll: number
     placeholder: number
   }>({
     placeholder: randomIndex(list().length),
@@ -301,6 +302,7 @@ export function Prompt(props: PromptProps) {
     mode: "normal",
     extmarkToPartIndex: new Map(),
     interrupt: 0,
+    interruptAll: 0,
   })
 
   createEffect(
@@ -417,11 +419,137 @@ export function Prompt(props: PromptProps) {
           }, 5000)
 
           if (store.interrupt >= 2) {
-            void sdk.client.session.abort({
-              sessionID: props.sessionID,
-            })
-            setStore("interrupt", 0)
+            const current = sync.session.get(props.sessionID)
+            const isSubagentView = !!current?.parentID
+
+            if (isSubagentView) {
+              // Subagent view: kill that subagent only and return to parent
+              const parentID = current?.parentID
+              void sdk.client.session.abort({
+                sessionID: props.sessionID,
+              })
+              setStore("interrupt", 0)
+              toast.show({
+                message: `Subagent ${props.sessionID.slice(0, 8)} interrupted — returned to main`,
+                variant: "info",
+                duration: 3000,
+              })
+              if (parentID) {
+                route.navigate({ type: "session", sessionID: parentID })
+              }
+            } else {
+              // Main view: abort main only, keep children alive (promote to background)
+              // Invariant: interrupting main NEVER stops subagents unless Shift+A
+              void sdk.client.session.abort({
+                sessionID: props.sessionID,
+              })
+              setStore("interrupt", 0)
+              const childCount = sync.data.session.filter((s) => s.parentID === props.sessionID).length
+              if (childCount > 0) {
+                toast.show({
+                  message: `Main interrupted — ${childCount} subagent(s) kept in background`,
+                  variant: "info",
+                  duration: 3000,
+                })
+              }
+            }
           }
+          dialog.clear()
+        },
+      },
+      {
+        title: "Interrupt all including subagents",
+        name: "session.interrupt.all",
+        category: "Session",
+        hidden: true,
+        run: () => {
+          if (auto()?.visible) return
+          if (!input.focused) return
+          if (store.mode === "shell") {
+            setStore("mode", "normal")
+            return
+          }
+          if (!props.sessionID) return
+
+          setStore("interruptAll", store.interruptAll + 1)
+
+          setTimeout(() => {
+            setStore("interruptAll", 0)
+          }, 5000)
+
+          if (store.interruptAll < 2) {
+            toast.show({
+              message: "Press again to interrupt ALL (main + subagents)",
+              variant: "warning",
+              duration: 2000,
+            })
+            dialog.clear()
+            return
+          }
+
+          // Double-press: kill all
+          // Find root session by walking parent chain
+          let rootID = props.sessionID
+          let cur = sync.session.get(rootID)
+          while (cur?.parentID) {
+            rootID = cur.parentID
+            cur = sync.session.get(rootID)
+          }
+
+          // Collect all related sessions (root + all descendants)
+          const toAbort = new Set<string>()
+          toAbort.add(rootID)
+
+          // BFS for descendants
+          const queue = [rootID]
+          const visited = new Set<string>([rootID])
+          while (queue.length > 0) {
+            const parent = queue.shift()!
+            for (const s of sync.data.session) {
+              if (s.parentID === parent && !visited.has(s.id)) {
+                visited.add(s.id)
+                toAbort.add(s.id)
+                queue.push(s.id)
+              }
+            }
+          }
+
+          // Also ensure current branch is included if not covered (e.g., viewing deeper subagent)
+          if (!toAbort.has(props.sessionID)) {
+            toAbort.add(props.sessionID)
+            // its children
+            for (const s of sync.data.session) {
+              if (s.parentID === props.sessionID) toAbort.add(s.id)
+            }
+          }
+
+          for (const id of toAbort) {
+            void sdk.client.session.abort({ sessionID: id }).catch(() => {})
+          }
+
+          // Try to background-cancel via experimental API if any foreground tasks
+          // (best-effort, not fatal if fails)
+          void sdk.client.experimental.session
+            .background({
+              sessionID: rootID,
+              workspace: undefined as any,
+            })
+            .catch(() => {})
+
+          toast.show({
+            message: `Interrupted all: ${toAbort.size} session(s)`,
+            variant: "info",
+            duration: 3000,
+          })
+
+          setStore("interruptAll", 0)
+          setStore("interrupt", 0)
+
+          // If viewing child, return to root after kill-all
+          if (props.sessionID !== rootID) {
+            route.navigate({ type: "session", sessionID: rootID })
+          }
+
           dialog.clear()
         },
       },
@@ -579,6 +707,7 @@ export function Prompt(props: PromptProps) {
       "prompt.stash.list",
       "prompt.skills",
       "session.interrupt",
+      "session.interrupt.all",
       "workspace.set",
       "session.move",
     ]),
@@ -1713,6 +1842,13 @@ export function Prompt(props: PromptProps) {
                   esc{" "}
                   <span style={{ fg: store.interrupt > 0 ? theme.primary : theme.textMuted }}>
                     {store.interrupt > 0 ? "again to interrupt" : "interrupt"}
+                  </span>
+                </text>
+                <text fg={store.interruptAll > 0 ? theme.primary : theme.text}>
+                  {" "}
+                  shift+a{" "}
+                  <span style={{ fg: store.interruptAll > 0 ? theme.primary : theme.textMuted }}>
+                    {store.interruptAll > 0 ? "again to kill all" : "kill all"}
                   </span>
                 </text>
               </box>

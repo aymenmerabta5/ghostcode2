@@ -234,13 +234,12 @@ export function Session() {
     return children().flatMap((x) => sync.data.question[x.id] ?? [])
   })
   const visible = createMemo(() => {
-    // Subagents normally hide the prompt (read-only transcript view).
-    // Workflow subagents are an exception: the operator should be able to
-    // steer them (talk to subagent) via the prompt, as the detail view's
-    // [P] Prompt does. Allow prompt when workflowRunID is present.
-    const isSub = !!session()?.parentID
-    const isWorkflowSub = !!route.workflowRunID
-    return (!isSub || isWorkflowSub) && permissions().length === 0 && questions().length === 0
+    // Task 11: allow prompt when viewing child subagent session.
+    // Previously subagents hid prompt (read-only) except workflow subagents.
+    // Now subagents are interactive - allow steering them via prompt.
+    // This matches CLI TUI where selected child can be messaged.
+    // Gate only by permissions/questions; subagent vs main vs workflow all allow prompt.
+    return permissions().length === 0 && questions().length === 0
   })
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
