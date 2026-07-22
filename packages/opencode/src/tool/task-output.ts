@@ -1,7 +1,16 @@
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { BackgroundJob } from "@/background/job"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import DESCRIPTION from "./task-output.txt"
+
+const OUTPUT_PATH_RE = /Full output saved to:\s*([^\s]+)/
+
+function extractOutputPath(text: string | undefined): string | undefined {
+  if (!text) return undefined
+  const m = text.match(OUTPUT_PATH_RE)
+  return m?.[1]
+}
 
 export const Parameters = Schema.Struct({
   task_id: Schema.String.annotate({ description: "ID of the job (supports prefix matching)" }),
@@ -36,7 +45,6 @@ function detectPortsAndUrls(text: string) {
 
   URL_RE.lastIndex = 0
   while ((m = URL_RE.exec(text)) !== null) {
-    // Trim trailing punctuation that often follows URLs in logs
     const cleaned = m[0].replace(/[),.;!]+$/, "")
     urls.add(cleaned)
   }
@@ -133,6 +141,7 @@ function makeExecute(id: string) {
     id,
     Effect.gen(function* () {
       const bg = yield* BackgroundJob.Service
+      const fs = yield* FSUtil.Service
 
       return {
         description: DESCRIPTION,
@@ -145,7 +154,7 @@ function makeExecute(id: string) {
             const tailLines = Math.max(1, Math.min(1000, rawTail))
             const full = params.full ?? false
 
-            // Resolve prefix via list
+            // Resolve prefix via list with ambiguous handling
             const all = yield* bg.list()
             const exact = all.find((j) => j.id === params.task_id)
             let resolvedId: string
@@ -179,6 +188,20 @@ function makeExecute(id: string) {
               } as any
             }
 
+            const getFullRaw = (info: typeof job, fallback: string) =>
+              Effect.gen(function* () {
+                if (!full) return fallback
+                const metaPath = (info.metadata as any)?.outputPath as string | undefined
+                const extracted = extractOutputPath(info.output) ?? extractOutputPath(info.error) ?? extractOutputPath(fallback)
+                const candidate = metaPath ?? extracted
+                if (!candidate) return fallback
+                const content = yield* fs.readFileString(candidate).pipe(
+                  Effect.catch(() => Effect.succeed(undefined as string | undefined)),
+                )
+                if (content !== undefined) return content
+                return fallback
+              })
+
             const prepare = (rawOutput: string) => {
               const detected = detectPortsAndUrls(rawOutput)
               let finalOutput: string
@@ -195,7 +218,8 @@ function makeExecute(id: string) {
 
             // If not running, return immediately
             if (job.status !== "running") {
-              const raw = job.output ?? job.error ?? ""
+              const baseRaw = job.output ?? job.error ?? ""
+              const raw = yield* getFullRaw(job, baseRaw)
               const { detectedPorts, detectedUrls, finalOutput } = prepare(raw)
               const out = formatOutput({
                 id: job.id,
@@ -227,7 +251,8 @@ function makeExecute(id: string) {
 
             // Running
             if (timeout === 0) {
-              const raw = job.output ?? ""
+              const baseRaw = job.output ?? ""
+              const raw = yield* getFullRaw(job, baseRaw)
               const { detectedPorts, detectedUrls, finalOutput } = prepare(raw)
               const out = formatOutput({
                 id: job.id,
@@ -261,9 +286,9 @@ function makeExecute(id: string) {
             const waited = yield* bg.wait({ id: job.id, timeout })
 
             if (waited.timedOut) {
-              // Still running
               const current = waited.info ?? (yield* bg.get(job.id)) ?? job
-              const raw = current.output ?? ""
+              const baseRaw = current.output ?? ""
+              const raw = yield* getFullRaw(current, baseRaw)
               const { detectedPorts, detectedUrls, finalOutput } = prepare(raw)
               const out = formatOutput({
                 id: current.id,
@@ -293,7 +318,6 @@ function makeExecute(id: string) {
               }
             }
 
-            // Completed during wait
             const finalInfo = waited.info ?? (yield* bg.get(job.id))
             if (!finalInfo) {
               return {
@@ -302,7 +326,8 @@ function makeExecute(id: string) {
                 output: `Job not found after wait: ${params.task_id}. Use background_list to see running jobs.`,
               } as any
             }
-            const raw = finalInfo.output ?? finalInfo.error ?? ""
+            const baseRaw = finalInfo.output ?? finalInfo.error ?? ""
+            const raw = yield* getFullRaw(finalInfo, baseRaw)
             const { detectedPorts, detectedUrls, finalOutput } = prepare(raw)
             const out = formatOutput({
               id: finalInfo.id,

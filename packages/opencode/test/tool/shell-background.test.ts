@@ -126,7 +126,8 @@ describe("tool.shell background param", () => {
           description: "test sleep",
         })
         const elapsed = Date.now() - start
-        expect(elapsed).toBeLessThan(3000)
+        // After startup failure detection fix, background start waits up to 5s to detect early failure
+        expect(elapsed).toBeLessThan(8000)
         expect((result.metadata as any).background).toBe(true)
         const jobId = (result.metadata as any).jobId as string
         expect(jobId).toBeTruthy()

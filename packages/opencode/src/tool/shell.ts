@@ -629,7 +629,7 @@ export const ShellTool = Tool.define(
         return {
           description: prompt.description,
           parameters: Parameters,
-          execute: (params: Parameters, ctx: Tool.Context): Effect.Effect<Tool.ExecuteResult<any>> =>
+          execute: ((params: Parameters, ctx: Tool.Context) =>
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
@@ -678,6 +678,44 @@ export const ShellTool = Tool.define(
                     bgCtx,
                   ).pipe(Effect.map((r) => r.output)),
                 })
+
+                // Wait 5s for early failure detection (e.g., command not found)
+                const earlyResult = yield* background
+                  .wait({ id: info.id, timeout: 5000 })
+                  .pipe(Effect.catch(() => Effect.succeed(undefined as any)))
+
+                if (earlyResult && !earlyResult.timedOut && earlyResult.info) {
+                  const early = earlyResult.info
+                  if (early.status === "error") {
+                    return {
+                      title: params.command,
+                      metadata: {
+                        command: params.command,
+                        cwd,
+                        background: true,
+                        jobId: info.id,
+                        title: info.title ?? title,
+                        error: true,
+                      },
+                      output: `Background shell failed to start: ${early.error ?? early.output ?? "unknown error"}\nCommand: ${params.command}\nJob ID: ${info.id}\nStatus: ${early.status}`,
+                    } as Tool.ExecuteResult<any>
+                  }
+                  if (early.status === "completed" && early.error) {
+                    return {
+                      title: params.command,
+                      metadata: {
+                        command: params.command,
+                        cwd,
+                        background: true,
+                        jobId: info.id,
+                        title: info.title ?? title,
+                        error: true,
+                      },
+                      output: `Background shell failed to start: ${early.error}\nCommand: ${params.command}\nJob ID: ${info.id}\nStatus: ${early.status}\nOutput: ${early.output ?? ""}`,
+                    } as Tool.ExecuteResult<any>
+                  }
+                }
+
                 return {
                   title: params.command,
                   metadata: {
@@ -702,8 +740,8 @@ export const ShellTool = Tool.define(
                 },
                 ctx,
               )) as Tool.ExecuteResult<any>
-            }),
-        }
+            }) as any) as any,
+        } as any
       })
   }),
 )
