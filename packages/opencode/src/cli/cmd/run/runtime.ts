@@ -403,6 +403,13 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
       if (!hasSession(input, state)) return
       void ctx.sdk.experimental.session.background({ sessionID: state.sessionID }).catch(() => {})
     },
+    onKillJob: (id, kind) => {
+      if (!hasSession(input, state)) return
+      log?.write("job.kill", { id, kind })
+      // For task subagents, abort session. For shell, same abort attempt (no-op if not session)
+      // Future: call background cancel endpoint when available
+      void ctx.sdk.session.abort({ sessionID: id }).catch(() => {})
+    },
     onSubagentSelect: (sessionID) => {
       state.selectSubagent?.(sessionID)
       log?.write("subagent.select", {

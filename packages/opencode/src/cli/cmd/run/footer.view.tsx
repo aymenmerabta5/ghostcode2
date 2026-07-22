@@ -112,6 +112,18 @@ type RunFooterViewProps = {
   onLayout: (input: { route: FooterPromptRoute; autocomplete: boolean; subagentRows: number }) => void
   onStatus: (text: string) => void
   onSubagentSelect?: (sessionID: string | undefined) => void
+  onSubagentKill?: (sessionID: string) => void
+  onJobKill?: (id: string, kind: "task" | "shell") => void
+  background?: () => Array<{
+    id: string
+    type: string
+    title?: string
+    status: string
+    started_at: number
+    completed_at?: number
+    output?: string
+    metadata?: Record<string, unknown>
+  }>
   onQueuedRemove: (messageID: string) => Promise<boolean>
 }
 
@@ -712,9 +724,18 @@ export function RunFooterView(props: RunFooterViewProps) {
                           <RunSubagentSelectBody
                             theme={theme}
                             tabs={tabs}
+                            background={props.background as any}
                             current={selected}
                             onClose={closePanel}
                             onSelect={openTab}
+                            onKill={(id, kind) => {
+                              if (kind === "task") {
+                                props.onSubagentKill?.(id)
+                                props.onJobKill?.(id, kind)
+                              } else {
+                                props.onJobKill?.(id, kind)
+                              }
+                            }}
                             onRows={setSubagentMenuRows}
                           />
                         </Match>

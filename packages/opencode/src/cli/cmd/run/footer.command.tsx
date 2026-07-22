@@ -39,9 +39,71 @@ type SkillEntry = PanelEntry & {
   name: string
 }
 
+type BackgroundJobInfo = {
+  id: string
+  type: string
+  title?: string
+  status: string
+  started_at: number
+  completed_at?: number
+  output?: string
+  error?: string
+  metadata?: Record<string, unknown>
+}
+
 type SubagentEntry = PanelEntry & {
+  id: string
+  shortId: string
+  kind: "task" | "shell"
   sessionID: string
   current: boolean
+  status: FooterSubagentTab["status"] | string
+  rawTab?: FooterSubagentTab
+  rawJob?: BackgroundJobInfo
+}
+
+const PORT_REGEX = /(localhost|127\.0\.0\.1|0\.0\.0\.0):\d{2,5}/
+const URL_REGEX = /https?:\/\/[^\s]+/
+
+function shortIdFor(id: string): string {
+  return id.slice(0, 8)
+}
+
+function detectPort(text: string | undefined): string | undefined {
+  if (!text) return undefined
+  const pm = text.match(PORT_REGEX)
+  if (pm) return pm[0]
+  const um = text.match(URL_REGEX)
+  if (um) return um[0].slice(0, 48)
+  return undefined
+}
+
+function lastOutputLine(text: string | undefined): string {
+  if (!text) return ""
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  return lines[lines.length - 1] ?? ""
+}
+
+function truncateStr(str: string, len: number): string {
+  if (str.length <= len) return str
+  return str.slice(0, len - 1) + "…"
+}
+
+function formatDuration(ms: number): string {
+  if (ms <= 0) return "0s"
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  if (ms < 3_600_000) {
+    const m = Math.floor(ms / 60_000)
+    const s = Math.floor((ms % 60_000) / 1000)
+    return s > 0 ? `${m}m${s}s` : `${m}m`
+  }
+  const h = Math.floor(ms / 3_600_000)
+  const m = Math.floor((ms % 3_600_000) / 60_000)
+  return m > 0 ? `${h}h${m}m` : `${h}h`
 }
 
 type QueuedEntry = PanelEntry & {
@@ -576,27 +638,95 @@ export function RunCommandMenuBody(props: {
 export function RunSubagentSelectBody(props: {
   theme: Accessor<RunFooterTheme>
   tabs: Accessor<FooterSubagentTab[]>
+  background?: Accessor<BackgroundJobInfo[] | undefined>
   current: Accessor<string | undefined>
   onClose: () => void
   onSelect: (sessionID: string) => void
+  onKill?: (id: string, kind: "task" | "shell") => void
   onRows?: (rows: number) => void
 }) {
   let field: InputRenderable | undefined
   const [query, setQuery] = createSignal("")
-  const entries = createMemo<SubagentEntry[]>(() =>
-    props.tabs().map((item) => {
+  const entries = createMemo<SubagentEntry[]>(() => {
+    const now = Date.now()
+    const taskItems: SubagentEntry[] = props.tabs().map((item) => {
+      const sid = item.sessionID
+      const sId = shortIdFor(sid)
+      const icon = item.status === "running" ? "🤖" : "●"
       const title = item.description || item.title || item.label
+      const typeLabel = item.label
+      // Approximate duration: for running, time since last update; for completed, no duration (could be unknown)
+      const dur =
+        item.status === "running" && item.lastUpdatedAt > 0
+          ? formatDuration(now - item.lastUpdatedAt)
+          : undefined
+      const tail = item.toolCalls ? `${item.toolCalls} calls` : undefined
+      const statusLbl = subagentStatusLabel(item.status)
+      const footerParts = [typeLabel.toLowerCase(), statusLbl]
+      if (dur) footerParts.push(dur)
+      if (tail) footerParts.push(tail)
       return {
+        id: sid,
+        shortId: sId,
+        kind: "task",
+        sessionID: sid,
+        current: props.current() === sid,
+        status: item.status,
+        display: `${icon} ${sId} ${title}`,
+        description: typeLabel,
+        footer: footerParts.join(" · "),
+        keywords: `${sid} ${sId} ${title} ${typeLabel} ${item.status} ${tail ?? ""} task ${item.description} ${item.title ?? ""} ${item.label}`,
         category: "",
-        display: title,
-        description: title === item.label ? undefined : item.label,
-        footer: subagentStatusLabel(item.status),
-        keywords: `${item.label} ${item.description} ${item.title ?? ""} ${item.status}`,
-        sessionID: item.sessionID,
-        current: props.current() === item.sessionID,
+        rawTab: item,
       }
-    }),
-  )
+    })
+
+    const bgJobs = props.background?.() ?? []
+    const shellItems: SubagentEntry[] = bgJobs.map((job) => {
+      const sId = shortIdFor(job.id)
+      const icon = "▣"
+      const title = job.title || (job.metadata?.command as string)?.slice(0, 50) || job.id
+      const typeLabel = job.type === "shell" ? "shell" : job.type
+      const endMs = job.completed_at ?? (job.status === "running" ? now : job.started_at)
+      const durMs = Math.max(0, endMs - job.started_at)
+      const dur = formatDuration(durMs)
+      const port = detectPort(job.output)
+      const last = lastOutputLine(job.output)
+      const tailRaw = port ? port : last ? truncateStr(last, 40) : ""
+      const footerParts = [typeLabel, job.status]
+      if (dur) footerParts.push(dur)
+      if (tailRaw) footerParts.push(tailRaw)
+      return {
+        id: job.id,
+        shortId: sId,
+        kind: "shell",
+        sessionID: job.id,
+        current: false,
+        status: job.status,
+        display: `${icon} ${sId} ${title}`,
+        description: typeLabel,
+        footer: footerParts.join(" · "),
+        keywords: `${job.id} ${sId} ${title} ${typeLabel} ${job.status} ${job.output?.slice(-200) ?? ""} shell`,
+        category: "",
+        rawJob: job,
+      }
+    })
+
+    const all = [...taskItems, ...shellItems].sort((a, b) => {
+      const aRun = a.status === "running" ? 1 : 0
+      const bRun = b.status === "running" ? 1 : 0
+      if (bRun !== aRun) return bRun - aRun
+      const aTime = a.rawTab?.lastUpdatedAt ?? a.rawJob?.started_at ?? 0
+      const bTime = b.rawTab?.lastUpdatedAt ?? b.rawJob?.started_at ?? 0
+      return bTime - aTime
+    })
+
+    // If Task 9 added background Map to SubagentData and it was merged into tabs as virtual entries,
+    // they will already be in tabs. The above handles explicit background prop. To also handle
+    // case where tabs already contain shell-like entries (from Task 9 merge), we keep them as-is.
+    return all
+  })
+
   const items = createMemo<SubagentEntry[]>(() => match(query(), entries()))
   const menu = createFooterMenuState({ count: () => items().length, limit: SUBAGENT_LIST_ROWS })
   const select = () => {
@@ -605,7 +735,13 @@ export function RunSubagentSelectBody(props: {
       return
     }
 
-    props.onSelect(item.sessionID)
+    if (item.kind === "task") {
+      props.onSelect(item.sessionID)
+      return
+    }
+
+    // Shell jobs are not promptable sessions; close panel. Future could show logs.
+    props.onClose()
   }
 
   createEffect(() => {
@@ -633,6 +769,15 @@ export function RunSubagentSelectBody(props: {
       return
     }
 
+    const item = items()[menu.selected()] as SubagentEntry | undefined
+    const ctrl = event.ctrl && !event.meta && !event.shift && !event.super
+
+    if (item && (event.name === "delete" || (ctrl && event.name === "d"))) {
+      event.preventDefault()
+      props.onKill?.(item.sessionID ?? item.id, item.kind)
+      return
+    }
+
     handleKey({ event, menu, field: () => field, setQuery, select, close: props.onClose })
   })
 
@@ -642,7 +787,7 @@ export function RunSubagentSelectBody(props: {
       query={query()}
       count={items().length}
       total={entries().length}
-      placeholder="Search"
+      placeholder="Search · ctrl+d kill"
       theme={props.theme}
       inputRef={(input) => {
         field = input

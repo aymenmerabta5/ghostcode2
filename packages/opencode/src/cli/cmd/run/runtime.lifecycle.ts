@@ -76,6 +76,7 @@ export type LifecycleInput = {
   onInterruptSubagent?: (sessionID: string) => void
   onInterruptAll?: () => void
   onBackground?: () => void
+  onKillJob?: (id: string, kind: "task" | "shell") => void
   onSubagentSelect?: (sessionID: string | undefined) => void
 }
 
@@ -258,6 +259,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       onInterruptSubagent: input.onInterruptSubagent,
       onInterruptAll: input.onInterruptAll,
       onBackground: input.onBackground,
+      onKillJob: input.onKillJob,
       onEditorOpen: async ({ value }) => {
         if (closed || renderer.isDestroyed) {
           return
