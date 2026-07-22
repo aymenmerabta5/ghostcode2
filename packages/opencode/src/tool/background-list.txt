@@ -1,0 +1,15 @@
+List all running background jobs (both task subagents and shell dev servers).
+
+No params required. Returns markdown table with:
+- id (first 8 chars of job ID, full IDs listed below table)
+- type (task or shell)
+- title (description of job)
+- status (running, completed, error, cancelled)
+- duration (seconds since started)
+- tail (last 100 chars of output)
+
+Use background_output {task_id} to see full logs for a specific job.
+Use background_kill {task_id} to stop a job.
+
+Shows both active and recently completed jobs that are still in registry.
+If no jobs: "No background jobs"

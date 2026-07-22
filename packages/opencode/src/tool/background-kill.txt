@@ -1,0 +1,11 @@
+Stop a background job (task subagent or shell dev server) by its ID.
+
+Params:
+- task_id: ID of the job to kill (from background_list). Supports prefix matching on first 8 chars.
+- reason: Optional reason for cancellation shown in confirmation.
+
+Returns confirmation with final status. If job already completed/cancelled, notes that.
+If job not found, fails with guidance to use background_list.
+
+Killing a shell job terminates its child process (via scope close).
+Killing a task subagent cancels its session and notifies parent.

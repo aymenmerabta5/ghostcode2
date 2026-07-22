@@ -1,0 +1,31 @@
+Waits for a background job (task subagent or shell dev server) and returns its output.
+
+Use this to get logs from a job started with background:true. It blocks until the job finishes or timeout is reached. Unified for both task and shell jobs.
+
+Tool aliases: task_output, background_output — same behavior.
+
+Params:
+- task_id: ID of the job (from background_list, or full job ID). Supports prefix matching on first 8 chars.
+- timeout: How long to wait in ms (default 120000, max 600000). Use 0 to peek without waiting.
+- tail: Number of last lines to return (default 100, max 1000). Ignored if full=true.
+- full: If true, returns full output bounded to 50k chars instead of tail.
+- filter: Optional substring to filter output lines (case-insensitive).
+
+Behavior:
+- If job not running (completed/error/cancelled), returns immediately its final output.
+- If running and timeout==0, peeks current snapshot without waiting.
+- If running and times out, returns current output + guidance that job is still running.
+
+Detected ports/URLs:
+- Extracts localhost:port, 127.0.0.1:port, 0.0.0.0:port via regex \b(localhost|127\.0\.0\.1|0\.0\.0\.0):\d{2,5}
+- Extracts http(s) URLs via https?:\/\/\S+
+- Includes in metadata and output as "Detected ports" / "Detected URLs".
+
+Output format: task id, title, type, status, duration, tail/full, detected, then actual logs.
+
+IMPORTANT ANTI-POLL GUIDANCE:
+- DO NOT call this tool in a loop to poll for completion.
+- Use once with a long timeout (default 120s), or peek with timeout 0.
+- DO NOT say "hurry up", "are you done", or nag subagents.
+- If job still running after timeout, work on other non-overlapping tasks until notified. You will be notified automatically when background tasks finish.
+- Do not duplicate the background job's work while it is running.
