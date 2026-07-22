@@ -1,2 +1,1 @@
-Intent A - alpha change
-Intent B - beta change
+initial content 
