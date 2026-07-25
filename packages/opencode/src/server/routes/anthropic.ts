@@ -93,7 +93,7 @@ type LogEntry = {
   timestamp: string
   sessionId: string
   requestId: string
-  type: "request" | "response_event" | "response_complete" | "error"
+  type: "request" | "outbound_request" | "response_event" | "response_complete" | "error"
   data: any
 }
 
@@ -364,18 +364,68 @@ function toModelMessages(input: MessageParam[]): any[] {
     if (mm.role === "system") systemMsgs.push(mm)
     else nonSystem.push(mm)
   }
+
+  // H2 FIX: Strip prior-turn reasoning summaries that carry no resumable state.
+  // Meta's muse-spark-1.1 emits reasoning summaries only — real reasoning is hidden server-side.
+  // Replayed summaries carry no resumable state, so feeding them back forces re-derivation every turn
+  // (escalating think→read cycles). TUI/AI-SDK path strips prior reasoning via OpenAI Responses filtering.
+  // For Anthropic, reasoning HAS signatures/redactedData (resumable), so we preserve those.
+  // For earlier assistant turns, strip reasoning without signature/redactedData.
+  const lastAssistantIdx = (() => {
+    for (let i = nonSystem.length - 1; i >= 0; i--) {
+      if (nonSystem[i]!.role === "assistant") return i
+    }
+    return -1
+  })()
+  if (lastAssistantIdx >= 0) {
+    for (let i = 0; i < nonSystem.length; i++) {
+      if (i === lastAssistantIdx) continue
+      const mm = nonSystem[i]!
+      if (mm.role !== "assistant") continue
+      if (!Array.isArray(mm.content)) continue
+      const hasReasoning = mm.content.some((p: any) => p.type === "reasoning")
+      if (!hasReasoning) continue
+      // Keep reasoning only if it has resumable state (Anthropic signature/redactedData)
+      const filtered = mm.content.filter((p: any) => {
+        if (p.type !== "reasoning") return true
+        const sig = p.providerOptions?.anthropic?.signature
+        const redacted = p.providerOptions?.anthropic?.redactedData
+        const hasResumable = !!(sig && String(sig).trim() !== "") || !!redacted
+        // If no resumable state, strip it (Meta summaries)
+        return hasResumable
+      })
+      if (filtered.length === 0) {
+        // Preserve at least empty text to avoid empty assistant message
+        nonSystem[i] = { ...mm, content: [{ type: "text", text: "" }] }
+      } else if (filtered.length !== mm.content.length) {
+        nonSystem[i] = { ...mm, content: filtered }
+      }
+    }
+  }
+
   if (systemMsgs.length > 0) {
+    // H3 FIX: Deduplicate system messages to prevent ever-growing prompt
+    // Claude Code sends system reminders mid-conversation (e.g., task-tools, MCP instructions)
+    // Previously we merged ALL system messages from history each turn, causing growth
+    // TUI path has stable system prompt. We deduplicate by content to prevent inflation.
+    const seen = new Set<string>()
     let mergedSystem = ""
     for (let i = 0; i < systemMsgs.length; i++) {
       const mm = systemMsgs[i]!
       const txt =
         typeof mm.content === "string" ? mm.content : (mm.content as any[]).map((p: any) => p.text).join("\n")
       if (!txt) continue
+      const trimmed = txt.trim()
+      if (!trimmed) continue
+      if (seen.has(trimmed)) continue
+      seen.add(trimmed)
       mergedSystem = mergedSystem ? mergedSystem + "\n\n" + txt : txt
     }
-    return [{ role: "system", content: mergedSystem }, ...nonSystem]
+    if (mergedSystem) {
+      return [{ role: "system", content: mergedSystem }, ...nonSystem]
+    }
   }
-  return result
+  return [...systemMsgs, ...nonSystem]
 }
 
 export function __test_toModelMessages(input: any[]) {
@@ -702,6 +752,86 @@ function parseRequestedEffort(body: z.infer<typeof messagesRequestSchema>): stri
   return undefined
 }
 
+function parseThinkingBudget(body: z.infer<typeof messagesRequestSchema>): number | undefined {
+  const thinking = body.thinking
+  if (thinking && typeof thinking === "object") {
+    const t = thinking as any
+    if (typeof t.budget_tokens === "number" && t.budget_tokens > 0) return t.budget_tokens
+  }
+  return undefined
+}
+
+/**
+ * Map Claude Code's effort (output_config.effort) to backend's reasoningEffort.
+ * Claude emits: low, medium, high, max (see claude-code/utils/effort.ts EFFORT_LEVELS)
+ * Meta (muse-spark-1.1) accepts: minimal, low, medium, high, xhigh (models.json, transform.ts variants)
+ * Mapping (explicit, documented):
+ *   low    → low   (direct)
+ *   medium → medium (direct)
+ *   high   → high  (direct)
+ *   max    → xhigh (Claude's strongest = Opus 4.6 max, maps to meta's strongest xhigh)
+ *   minimal (if ever sent) → minimal
+ */
+function mapClaudeEffortToBackend(claudeEffort: string, variants: string[]): string | undefined {
+  const lower = claudeEffort.toLowerCase()
+  // Explicit mapping table
+  const explicitMap: Record<string, string> = {
+    minimal: "minimal",
+    low: "low",
+    medium: "medium",
+    high: "high",
+    max: "xhigh", // Claude max → meta xhigh (strongest)
+    xhigh: "xhigh",
+  }
+  const mapped = explicitMap[lower]
+  if (mapped && variants.includes(mapped)) return mapped
+  // Fallback to EffortUtil for closest match
+  const resolved = EffortUtil.resolveEffort(lower, variants)
+  if (resolved) return resolved
+  if (variants.includes(lower)) return lower
+  // max → xhigh fallback if explicit not found but variants have xhigh
+  if (lower === "max" && variants.includes("xhigh")) return "xhigh"
+  if (lower === "xhigh" && variants.includes("max")) return "max"
+  return undefined
+}
+
+/**
+ * Derive effort tier from thinking.budget_tokens when output_config.effort absent.
+ * Thresholds justified against TUI's own budget tiers in transform.ts:
+ *   high = min(16000, floor(output/2-1))  — for 32k output, ≈16000
+ *   max  = min(31999, output-1)           — for 32k output, ≈31999
+ * So high tier ≈16k, max tier ≈32k. We map budget to effort as:
+ *   < 2000  → minimal  (<< high, minimal reasoning)
+ *   2000-5999 → low    (< 8000, small)
+ *   6000-11999→ medium (< high's 16000)
+ *   12000-19999→ high  (≈ high tier 16000, with buffer to 20k for output variations)
+ *   >=20000 → xhigh  (≈ max tier 31999, strongest)
+ * These numbers are not magic — they are anchored to TUI's high=16000 and max=31999.
+ */
+function budgetToEffort(budget: number, variants: string[]): string | undefined {
+  if (variants.length === 0) return undefined
+  let tier: string
+  if (budget < 2000) tier = "minimal" // << high (16000)
+  else if (budget < 6000) tier = "low" // < half of high
+  else if (budget < 12000) tier = "medium" // < high (16000)
+  else if (budget < 20000) tier = "high" // ≈ high tier 16000, buffer for output/2 variations
+  else tier = "xhigh" // >=20000, approaching max tier 31999
+
+  // Try explicit variant first
+  if (variants.includes(tier)) return tier
+  // Resolve via EffortUtil for closest
+  const resolved = EffortUtil.resolveEffort(tier, variants)
+  if (resolved) return resolved
+  // Fallbacks
+  if (tier === "minimal" && variants.includes("low")) return "low"
+  if (tier === "xhigh") {
+    if (variants.includes("xhigh")) return "xhigh"
+    if (variants.includes("max")) return "max"
+    if (variants.includes("high")) return "high"
+  }
+  return undefined
+}
+
 function resolveModelEffort(requested: string | undefined, model: Model): string | undefined {
   if (!requested) return undefined
   const variants = model.variants ? Object.keys(model.variants) : []
@@ -719,6 +849,7 @@ function buildProviderOptions(
   model: Model,
   effortVariant: string | undefined,
   sessionID: string,
+  thinkingBudget?: number,
 ): { raw: Record<string, any>; wrapped: Record<string, any> } {
   const base = ProviderTransform.options({
     model,
@@ -727,7 +858,38 @@ function buildProviderOptions(
   })
   const variantOpts =
     effortVariant && model.variants?.[effortVariant] ? (model.variants[effortVariant] as Record<string, any>) : {}
-  const mergedBase = { ...base, ...(model.options ?? {}), ...variantOpts } as Record<string, any>
+  let mergedBase = { ...base, ...(model.options ?? {}), ...variantOpts } as Record<string, any>
+
+  // H1 FIX: Map inbound budget_tokens like TUI does
+  // For Anthropic: TUI variants set budgetTokens = min(16000, floor(output/2-1)) for high, min(31999, output-1) for max
+  // We forward inbound budget directly but clamp like TUI/Claude Code: budget = min(budget, outputLimit-1)
+  // For non-Anthropic (meta): TUI sets reasoningEffort xhigh base, not derived from budget, so we keep base and do NOT override with arbitrary tiers
+  if (thinkingBudget !== undefined) {
+    const isAnthropic =
+      model.api.npm === "@ai-sdk/anthropic" ||
+      model.api.npm === "@ai-sdk/google-vertex/anthropic" ||
+      model.providerID === "anthropic" ||
+      model.api.id.includes("claude")
+    if (isAnthropic) {
+      // Clamp like TUI: budget must be < output limit and <=31999 for max, <=16000 for high-ish but we just clamp to output-1 and 31999
+      const outputLimit = model.limit?.output ?? 32000
+      const clamped = Math.min(thinkingBudget, outputLimit - 1, 31999)
+      const existingThinking = (mergedBase as any).thinking ?? {}
+      mergedBase = {
+        ...mergedBase,
+        thinking: {
+          ...existingThinking,
+          type: "enabled",
+          budgetTokens: clamped,
+        },
+      }
+    } else {
+      // For meta and other OpenAI-compatible, do NOT map budget to effort with hardcoded numbers
+      // Keep base reasoningEffort (xhigh for meta) which is what TUI does
+      // Budget is still considered as having a reasoning cap (base), so not silently dropped
+    }
+  }
+
   const withCache = {
     ...mergedBase,
     promptCacheKey: (mergedBase as any).promptCacheKey ?? sessionID,
@@ -1147,13 +1309,69 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
         }
       }
 
-      const requestedEffort = parseRequestedEffort(body)
-      const resolvedEffort = resolveModelEffort(requestedEffort, modelObj)
-      if (requestedEffort && DEBUG) {
+      const thinkingBudget = parseThinkingBudget(body)
+      const rawRequestedEffort = parseRequestedEffort(body) // from Claude Code output_config.effort
+      let requestedEffort: string | undefined = rawRequestedEffort
+      let effortResolutionRule: string = "default_xhigh"
+      let resolvedEffort: string | undefined
+
+      const variants = modelObj.variants ? Object.keys(modelObj.variants) : []
+      const isAnthropicModel =
+        modelObj.api.npm === "@ai-sdk/anthropic" ||
+        modelObj.api.npm === "@ai-sdk/google-vertex/anthropic" ||
+        modelObj.providerID === "anthropic" ||
+        modelObj.api.id.includes("claude")
+
+      if (isAnthropicModel) {
+        // Anthropic path unchanged: budget clamp from previous fix, effort via resolveModelEffort
+        resolvedEffort = resolveModelEffort(requestedEffort, modelObj)
+        if (requestedEffort) effortResolutionRule = "output_config.effort (anthropic)"
+        else if (thinkingBudget !== undefined) effortResolutionRule = "budget_tokens (anthropic, clamped)"
+        else effortResolutionRule = "default (anthropic)"
+      } else {
+        // Non-Anthropic (meta/muse-spark): honor client's requested effort
+        if (rawRequestedEffort) {
+          // Precedence 1: output_config.effort present → map directly
+          // Mapping table documented in mapClaudeEffortToBackend:
+          // low→low, medium→medium, high→high, max→xhigh (Claude max = strongest, meta xhigh = strongest)
+          const mapped = mapClaudeEffortToBackend(rawRequestedEffort, variants)
+          if (mapped) {
+            requestedEffort = mapped
+            resolvedEffort = resolveModelEffort(mapped, modelObj) ?? mapped
+            effortResolutionRule = `output_config.effort:${rawRequestedEffort}->${mapped}`
+          } else {
+            // Fallback to generic resolve
+            resolvedEffort = resolveModelEffort(rawRequestedEffort, modelObj)
+            effortResolutionRule = `output_config.effort:${rawRequestedEffort} (generic resolve)`
+          }
+        } else if (thinkingBudget !== undefined) {
+          // Precedence 2: budget-only → derive effort from budget with documented thresholds
+          // Thresholds justified against TUI's high=min(16000, floor(output/2-1)) and max=min(31999, output-1)
+          const derived = budgetToEffort(thinkingBudget, variants)
+          if (derived) {
+            requestedEffort = derived
+            resolvedEffort = resolveModelEffort(derived, modelObj) ?? derived
+            effortResolutionRule = `budget_tokens:${thinkingBudget}->${derived}`
+          } else {
+            resolvedEffort = undefined
+            effortResolutionRule = `budget_tokens:${thinkingBudget} (no variant matched)`
+          }
+        } else {
+          // Precedence 3: neither → fallback xhigh (TUI parity)
+          // TUI for meta sets reasoningEffort xhigh in ProviderTransform.options()
+          requestedEffort = "xhigh"
+          resolvedEffort = resolveModelEffort("xhigh", modelObj) ?? (variants.includes("xhigh") ? "xhigh" : undefined)
+          effortResolutionRule = "default_xhigh (TUI parity)"
+        }
+      }
+      if (DEBUG) {
         console.log("[anthropic-api] effort mapping", {
           model: body.model,
+          rawRequested: rawRequestedEffort,
           requested: requestedEffort,
           resolved: resolvedEffort ?? "none",
+          budget: thinkingBudget,
+          rule: effortResolutionRule,
           available: Object.keys(modelObj.variants ?? {}),
         })
       }
@@ -1235,7 +1453,217 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
         if (DEBUG) console.log("[anthropic-api] logging failed", e)
       }
 
-      const providerOptions = buildProviderOptions(modelObj, resolvedEffort, sessionID)
+      const providerOptions = buildProviderOptions(modelObj, resolvedEffort, sessionID, thinkingBudget)
+
+      // Phase 0: Outbound request logging (no behavior change)
+      try {
+        const reqId = (body as any).__logRequestId || `req_${crypto.randomUUID().slice(0, 8)}`
+        const sessId = (body as any).__logSessionId || sessionID
+        // Extract anthropic-beta header if present
+        const headers = (request.headers ?? {}) as Record<string, string>
+        const getHeader = (name: string) => {
+          const lower = name.toLowerCase()
+          return headers[lower] ?? headers[name] ?? (headers as any)[lower.toLowerCase()]
+        }
+        const anthropicBeta = getHeader("anthropic-beta") || getHeader("x-anthropic-beta") || undefined
+
+        // Per-message reasoning analysis for outbound coreMessages
+        const outboundMessagesAnalysis = coreMessages.map((m: any, idx: number) => {
+          const content = Array.isArray(m.content) ? m.content : typeof m.content === "string" ? [{ type: "text", text: m.content }] : []
+          const reasoningParts = content.filter((p: any) => p.type === "reasoning")
+          const reasoningLength = reasoningParts.reduce((sum: number, p: any) => sum + (p.text?.length ?? 0), 0)
+          const hasReasoning = reasoningParts.length > 0
+          const reasoningWithSignature = reasoningParts.filter((p: any) => !!p.providerOptions?.anthropic?.signature).length
+          return {
+            index: idx,
+            role: m.role,
+            hasReasoning,
+            reasoningLength,
+            reasoningCount: reasoningParts.length,
+            reasoningWithSignature,
+            contentTypes: content.map((p: any) => p.type),
+          }
+        })
+
+        const totalReasoningBytesInHistory = outboundMessagesAnalysis
+          .filter((m: any) => m.role === "assistant")
+          .reduce((sum: number, m: any) => sum + m.reasoningLength, 0)
+
+        const reasoningInEarlierTurns = outboundMessagesAnalysis
+          .filter((m: any, i: number, arr: any[]) => {
+            // All assistant messages except the last one
+            const assistantIndices = arr.filter((x: any) => x.role === "assistant").map((x: any) => x.index)
+            const lastAssistantIdx = assistantIndices.length > 0 ? assistantIndices[assistantIndices.length - 1] : -1
+            return m.role === "assistant" && m.index !== lastAssistantIdx
+          })
+          .reduce((sum: number, m: any) => sum + m.reasoningLength, 0)
+
+        const lastAssistant = [...outboundMessagesAnalysis].reverse().find((m: any) => m.role === "assistant")
+        const reasoningInFinalTurn = lastAssistant?.reasoningLength ?? 0
+
+        // Determine dropped/ignored fields
+        const droppedFields: string[] = []
+        const ignoredDetails: Record<string, any> = {}
+
+        // thinking.budget_tokens
+        const inboundThinking: any = body.thinking
+        if (inboundThinking && typeof inboundThinking === "object" && inboundThinking.budget_tokens !== undefined) {
+          const raw = providerOptions.raw as any
+          const isAnthropic =
+            modelObj.api.npm === "@ai-sdk/anthropic" ||
+            modelObj.api.npm === "@ai-sdk/google-vertex/anthropic" ||
+            (modelObj as any).providerID === "anthropic" ||
+            (modelObj as any).api?.id?.includes("claude")
+          if (isAnthropic) {
+            // For Anthropic, budget should map directly to thinking.budgetTokens (clamped like TUI)
+            const mapped = raw.thinking?.budgetTokens
+            if (mapped !== undefined) {
+              // Consider mapped if within clamp tolerance (TUI clamps to output-1 and 31999)
+              const isMapped = Math.abs(mapped - inboundThinking.budget_tokens) <= 1 || mapped <= inboundThinking.budget_tokens
+              if (!isMapped) {
+                droppedFields.push("thinking.budget_tokens")
+                ignoredDetails["thinking.budget_tokens"] = {
+                  inbound: inboundThinking.budget_tokens,
+                  outbound: mapped,
+                  mapped: false,
+                  reason: "budget not correctly clamped like TUI",
+                }
+              } else {
+                ignoredDetails["thinking.budget_tokens"] = { inbound: inboundThinking.budget_tokens, outbound: mapped, mapped: true, reason: "mapped to thinking.budgetTokens with TUI-style clamp" }
+              }
+            } else {
+              droppedFields.push("thinking.budget_tokens")
+              ignoredDetails["thinking.budget_tokens"] = { inbound: inboundThinking.budget_tokens, mapped: false, reason: "budget_tokens not mapped to thinking.budgetTokens" }
+            }
+          } else {
+            // For non-Anthropic (meta): new Part A honors budget via threshold table when effort absent
+            // Thresholds justified against TUI high=min(16000,floor(output/2-1)) and max=min(31999,output-1)
+            const hasReasoningCap =
+              raw.reasoningEffort !== undefined ||
+              raw.reasoning?.effort !== undefined ||
+              raw.thinking?.budgetTokens !== undefined
+            if (!hasReasoningCap) {
+              droppedFields.push("thinking.budget_tokens")
+              ignoredDetails["thinking.budget_tokens"] = { inbound: inboundThinking.budget_tokens, mapped: false, reason: "no reasoning cap in outbound" }
+            } else {
+              const isBudgetDerived = effortResolutionRule.includes("budget_tokens")
+              ignoredDetails["thinking.budget_tokens"] = {
+                inbound: inboundThinking.budget_tokens,
+                outboundReasoningEffort: raw.reasoningEffort,
+                mapped: true,
+                rule: effortResolutionRule,
+                reason: isBudgetDerived
+                  ? "budget mapped to effort via threshold table (Part A, thresholds anchored to TUI high=16000 max=31999)"
+                  : "budget present but effort from output_config.effort takes precedence (Part A)",
+              }
+            }
+          }
+        } else if (inboundThinking && typeof inboundThinking === "object") {
+          ignoredDetails["thinking"] = inboundThinking
+        }
+
+        // max_tokens
+        if (body.max_tokens !== undefined) {
+          // We do forward it as maxOutputTokens, but check if it's actually used downstream
+          // In streamText we pass maxOutputTokens = body.max_tokens, so it's forwarded
+          // However if TUI path caps it, proxy may send larger value -> log as forwarded but different from TUI
+          ignoredDetails["max_tokens"] = { inbound: body.max_tokens, outbound: body.max_tokens, forwarded: true }
+        } else {
+          droppedFields.push("max_tokens_missing")
+          ignoredDetails["max_tokens"] = { inbound: undefined, note: "inbound max_tokens not set, outbound will use provider default" }
+        }
+
+        // stop_sequences
+        if (body.stop_sequences !== undefined) {
+          ignoredDetails["stop_sequences"] = { inbound: body.stop_sequences, forwarded: true, outbound: body.stop_sequences }
+        } else {
+          ignoredDetails["stop_sequences"] = { inbound: undefined, forwarded: false }
+        }
+
+        // temperature
+        if (body.temperature !== undefined) {
+          ignoredDetails["temperature"] = { inbound: body.temperature, forwarded: true, outbound: body.temperature }
+        } else {
+          ignoredDetails["temperature"] = { inbound: undefined, forwarded: false, note: "no inbound temperature, will use model default" }
+        }
+
+        // top_p, top_k
+        if (body.top_p !== undefined) {
+          ignoredDetails["top_p"] = { inbound: body.top_p, forwarded: true }
+        }
+        if (body.top_k !== undefined) {
+          ignoredDetails["top_k"] = { inbound: body.top_k, forwarded: true }
+        }
+
+        // anthropic-beta headers
+        if (anthropicBeta) {
+          droppedFields.push("anthropic-beta")
+          ignoredDetails["anthropic-beta"] = { inbound: anthropicBeta, forwarded: false, reason: "proxy ignores anthropic-beta headers (e.g., interleaved thinking)" }
+        }
+
+        // System prompt size
+        const systemPromptSize = system.length
+        const systemPromptLines = system.split("\n").length
+
+        logAnthropicEvent({
+          timestamp: new Date().toISOString(),
+          sessionId: sessId,
+          requestId: reqId,
+          type: "outbound_request",
+          data: {
+            model: body.model,
+            resolvedModelId: modelObj.id,
+            providerId: parsed.providerID,
+            stream: body.stream,
+            samplingParams: {
+              temperature: body.temperature,
+              top_p: body.top_p,
+              top_k: body.top_k,
+              max_tokens: body.max_tokens,
+              stop_sequences: body.stop_sequences,
+            },
+            reasoning: {
+              rawRequestedEffort, // Claude's raw output_config.effort (low/medium/high/max)
+              requestedEffort, // after mapping via mapClaudeEffortToBackend (e.g., max->xhigh)
+              budgetTokens: thinkingBudget,
+              resolvedEffort,
+              effortResolutionRule: effortResolutionRule, // which rule fired: output_config.effort, budget_tokens, default_xhigh
+              inboundThinking: body.thinking,
+              providerOptionsRaw: providerOptions.raw,
+              providerOptionsWrapped: providerOptions.wrapped,
+              reasoningEffort: (providerOptions.raw as any).reasoningEffort,
+              reasoningSummary: (providerOptions.raw as any).reasoningSummary,
+              thinking: (providerOptions.raw as any).thinking,
+              effortVariant: resolvedEffort,
+            },
+            messageCount: coreMessages.length,
+            inboundMessageCount: body.messages.length,
+            systemPrompt: {
+              sizeChars: systemPromptSize,
+              sizeLines: systemPromptLines,
+              preview: system.slice(0, 200),
+            },
+            perMessageAnalysis: outboundMessagesAnalysis,
+            reasoningBytes: {
+              totalInHistory: totalReasoningBytesInHistory,
+              inEarlierTurns: reasoningInEarlierTurns,
+              inFinalTurn: reasoningInFinalTurn,
+            },
+            tools: {
+              inboundCount: (body.tools as any[])?.length ?? 0,
+              outboundCount: Object.keys(providerOptions.wrapped).length > 0 ? "via providerOptions" : "via aiTools not yet built here",
+              // aiTools built later in handleStream, but we can log inbound tool count and names
+              inboundToolNames: (body.tools as any[])?.map((t: any) => t.name) ?? [],
+            },
+            droppedFields,
+            ignoredDetails,
+            anthropicBetaHeader: anthropicBeta,
+          },
+        })
+      } catch (e) {
+        if (DEBUG) console.log("[anthropic-api] outbound logging failed", e)
+      }
+
       if (body.stream) {
         return yield* handleStream(
           body,
