@@ -63,6 +63,13 @@ test("legacy page key aliases compile as page keys", async () => {
   }
 })
 
+test("interrupt shortcuts reserve alt+a for sessions and alt+b for background jobs", async () => {
+  const keybinds = TuiKeybind.parse({})
+
+  expect(keybinds.session_interrupt_all).toBe("alt+a")
+  expect(keybinds.session_interrupt_background).toBe("alt+b")
+})
+
 test("mode-less bindings stay active when opencode mode changes", async () => {
   const counts: Record<string, Record<string, number>> = {}
 

@@ -6,6 +6,8 @@ import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { Provider } from "@/provider/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Permission } from "@/permission"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -312,15 +314,16 @@ export function parseStructured(text: string): unknown {
   const direct = tryParse(text.trim())
   if (direct !== undefined) return direct
 
-  // 2. All ```json fences, try largest first (models sometimes include example + real)
+  // 2. All ```json fences, prefer LAST fence first (prose+JSON contract)
   const fenceRegex = /```(?:json)?\s*([\s\S]*?)```/gi
   const fences: string[] = []
   let m: RegExpExecArray | null
   while ((m = fenceRegex.exec(text)) !== null) {
     fences.push(m[1].trim())
   }
-  // Try fences from longest to shortest – real payload often longest
-  for (const f of fences.sort((a, b) => b.length - a.length)) {
+  // Prefer last fence first, then fall back to previous fences
+  for (let i = fences.length - 1; i >= 0; i--) {
+    const f = fences[i]
     const parsed = tryParse(f)
     if (parsed !== undefined) return parsed
     // Try extracting {..} inside fence
@@ -619,7 +622,6 @@ const layer = Layer.effect(
             // Self-healing: also clean orphan .cache-* files in all workflow dirs (regular workflows)
             const workflowDirs = [
               path.join(active.directory, ".opencode", "workflows"),
-              path.join(active.directory, ".claude", "workflows"),
             ]
             for (const wDir of workflowDirs) {
               const wFiles = await fs.readdir(wDir).catch(() => [] as string[])
@@ -665,38 +667,32 @@ const layer = Layer.effect(
       const dirs = yield* config.directories()
       const instanceDir = yield* InstanceState.directory
       const { Global } = yield* Effect.promise(() => import("@opencode-ai/core/global"))
-      // Project-first precedence, support both .opencode and .claude directories
+      // Project-first precedence (opencode only)
       const workflowRoots = new Set<string>()
-      // Instance dir first (highest priority)
       workflowRoots.add(path.join(instanceDir, ".opencode"))
-      workflowRoots.add(path.join(instanceDir, ".claude"))
-      // Project dirs from config.directories() are already up-scan of .opencode, but we also need their .claude siblings
       for (const d of dirs) {
         workflowRoots.add(d)
-        // d is like /some/path/.opencode → also try sibling .claude
-        const parent = path.dirname(d)
-        workflowRoots.add(path.join(parent, ".claude"))
-        // Also add the parent itself if it contains workflows directly (for .claude/workflows case where d is .opencode)
-        // The glob below will look for {workflow,workflows}/* inside each root
       }
-      // Global locations (lowest priority)
       workflowRoots.add(path.join(Global.Path.config, "workflows"))
-      workflowRoots.add(path.join(Global.Path.config.replace("opencode", "claude"), "workflows"))
-      workflowRoots.add(path.join(Global.Path.home, ".claude", "workflows"))
-      workflowRoots.add(path.join(Global.Path.home, ".config", "claude", "workflows"))
 
       const allDirs = [...workflowRoots]
       const results: Info[] = []
       const seenNames = new Set<string>()
       // Project-first: scan files first, then builtin as fallback (lowest priority)
-      // v2: also support nested validation workflows via **/*
       for (const dir of allDirs) {
-        const matches = Glob.scanSync("{workflow,workflows}/**/*.{js,ts,mjs,cjs}", {
+        const matchesMain = Glob.scanSync("{workflow,workflows}/*.{js,ts,mjs,cjs}", {
           cwd: dir,
           absolute: true,
           dot: false,
           symlink: false,
         })
+        const matchesValidation = Glob.scanSync("{workflow,workflows}/validation/*.{js,ts,mjs,cjs}", {
+          cwd: dir,
+          absolute: true,
+          dot: false,
+          symlink: false,
+        })
+        const matches = [...matchesMain, ...matchesValidation]
         for (const match of matches) {
           const name = path.basename(match, path.extname(match))
           if (seenNames.has(name)) continue
@@ -712,7 +708,6 @@ const layer = Layer.effect(
                 valid: false,
                 error: Syntax.formatInvalidError(match, syntax),
               })
-              // Don't add to seenNames so a valid builtin with same name could still be fallback? Actually we want to show invalid and block valid duplicate? Keep as invalid, but still mark seen to prevent duplicate invalid over invalid.
               seenNames.add(name)
               continue
             }
@@ -767,26 +762,26 @@ const layer = Layer.effect(
       const { Global } = yield* Effect.promise(() => import("@opencode-ai/core/global"))
       const workflowRoots: string[] = []
       workflowRoots.push(path.join(instanceDir, ".opencode"))
-      workflowRoots.push(path.join(instanceDir, ".claude"))
       for (const d of dirs) {
         workflowRoots.push(d)
-        workflowRoots.push(path.join(path.dirname(d), ".claude"))
       }
       workflowRoots.push(path.join(Global.Path.config, "workflows"))
-      workflowRoots.push(path.join(Global.Path.home, ".claude", "workflows"))
 
       const allDirs = [...new Set(workflowRoots)]
       for (const dir of allDirs) {
-        const matches = Glob.scanSync("{workflow,workflows}/**/*.{js,ts,mjs,cjs}", {
-          cwd: dir,
-          absolute: true,
-          dot: false,
-          symlink: false,
-        })
-        for (const match of matches) {
-          if (path.basename(match, path.extname(match)) === name) {
-            const source = yield* Effect.promise(() => Bun.file(match).text())
-            return { name, path: match, source }
+        const patterns = ["{workflow,workflows}/*.{js,ts,mjs,cjs}", "{workflow,workflows}/validation/*.{js,ts,mjs,cjs}"]
+        for (const pattern of patterns) {
+          const matches = Glob.scanSync(pattern, {
+            cwd: dir,
+            absolute: true,
+            dot: false,
+            symlink: false,
+          })
+          for (const match of matches) {
+            if (path.basename(match, path.extname(match)) === name) {
+              const source = yield* Effect.promise(() => Bun.file(match).text())
+              return { name, path: match, source }
+            }
           }
         }
       }
@@ -1584,19 +1579,11 @@ const layer = Layer.effect(
             }
             const cacheKey = stableHash(cacheKeyPayload)
 
-            // --- Workflows v2.1: Field Guide + thinking-effort injection (after cacheKey) ---
-            // Spec: guide must NOT be part of cacheKey. We computed cacheKey above, now inject.
+            // Guide is excluded from cacheKey, injected after
             let promptWithGuide = ai.prompt
             if (active.guideLines.length > 0) {
               const guideBlock = `## FIELD GUIDE (learnings from earlier agents in this run — read before working)\n${active.guideLines.map((l) => `- ${l}`).join("\n")}`
               promptWithGuide = `${guideBlock}\n\n${promptWithGuide}`
-            }
-            const effortVal = (ai as any).effort
-            const thinkingVal = (ai as any).thinking
-            if (effortVal || thinkingVal) {
-              const cfgNote = `[Model config: ${effortVal ? `effort=${effortVal}` : ""}${effortVal && thinkingVal ? ", " : ""}${thinkingVal ? `thinking=${thinkingVal}` : ""}]`
-              // Append note so model sees configured levels but cacheKey already computed
-              promptWithGuide = `${promptWithGuide}\n\n${cfgNote}`
             }
 
             // --- Keyed journal replay ---
@@ -1690,107 +1677,6 @@ const layer = Layer.effect(
             active.reservedTokens += estimatedTokens
             active.phaseReserved.set(agentPhase, (active.phaseReserved.get(agentPhase) ?? 0) + estimatedCost)
             active.phaseTokensReserved.set(agentPhase, (active.phaseTokensReserved.get(agentPhase) ?? 0) + estimatedTokens)
-
-            // Fast path for validation fixtures: if prompt contains "exactly:" pattern, return mocked JSON immediately without LLM
-            // This makes validations fast (no LLM) and keeps budget tracking accurate
-            // Use promptWithGuide for extraction so guide injection is visible even in fast path
-            const exactlyMatchFast = promptWithGuide.match(/exactly:\s*(\{.*\}|\[.*\])/i)
-            if (exactlyMatchFast) {
-              const jsonStr = exactlyMatchFast[1]
-              let data: any = {}
-              try { data = JSON.parse(jsonStr) } catch { data = {} }
-              // For worktree isolation, we still need worktree handling - but if isolation=worktree, we already created worktree above? Actually worktree handling is after this, so we need to handle worktree first
-              // We'll handle worktree creation now for fast path as well
-              let worktreePathFast: string | undefined
-              let worktreeBranchFast: string | undefined
-              let changedFilesFast: string[] | undefined
-              const isWorktreeFast = (ai as any).isolation === "worktree"
-              if (isWorktreeFast) {
-                // Reuse worktree logic from below? For fast path, we still need to create worktree
-                // We'll create worktree via same logic as below (duplicate but needed for fast path)
-                try {
-                  const rawLabel = ai.label ?? ai.agent ?? "agent"
-                  const sanitizedLabel = rawLabel.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 40) || "agent"
-                  const sanitizedRunId = id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 20)
-                  worktreeBranchFast = `wf/${sanitizedRunId}/${sanitizedLabel}`
-                  try {
-                    const branchCheck = Bun.spawn(["git", "branch", "--list", worktreeBranchFast], { cwd: dir, stdout: "pipe", stderr: "pipe" } as any)
-                    const out = await new Response((branchCheck as any).stdout).text()
-                    await (branchCheck as any).exited
-                    if (out.trim()) worktreeBranchFast = `${worktreeBranchFast}-${Date.now().toString(36).slice(-4)}`
-                  } catch {}
-                  worktreePathFast = path.join(dir, ".opencode", "workflows", "worktrees", `${sanitizedRunId}-${sanitizedLabel}-${Date.now().toString(36)}`)
-                  if (active.worktrees.size >= 8) {
-                    active.run.logs.push({
-                      time: Date.now(),
-                      phase: effectivePhaseForLogs(),
-                      message: `Warning: many worktree agents running in parallel: ${active.worktrees.size + 1}`,
-                      child: currentChild(),
-                    } as any)
-                  }
-                  await run(Effect.promise(() => import("fs/promises").then(fs => fs.mkdir(path.dirname(worktreePathFast!), { recursive: true }))).pipe(Effect.orDie))
-                  const addProc = Bun.spawn(["git", "worktree", "add", "-b", worktreeBranchFast!, worktreePathFast!, "HEAD"], { cwd: dir, stdout: "pipe", stderr: "pipe" } as any)
-                  await (addProc as any).exited
-                  if ((addProc as any).exitCode !== 0) {
-                    const fallback = Bun.spawn(["git", "worktree", "add", worktreePathFast!, worktreeBranchFast!], { cwd: dir, stdout: "pipe", stderr: "pipe" } as any)
-                    await (fallback as any).exited
-                  }
-                  active.worktrees.set(`${Date.now()}-${Math.random().toString(36).slice(2)}`, { path: worktreePathFast!, branch: worktreeBranchFast! })
-                  // Compute changedFiles as from data if available, else empty
-                  changedFilesFast = Array.isArray((data as any).changedFiles) ? (data as any).changedFiles : []
-                } catch {}
-              }
-
-              // Release reserved and add actual small cost
-              active.reservedCost = Math.max(0, active.reservedCost - estimatedCost)
-              active.reservedTokens = Math.max(0, active.reservedTokens - estimatedTokens)
-              active.phaseReserved.set(agentPhase, Math.max(0, (active.phaseReserved.get(agentPhase) ?? 0) - estimatedCost))
-              active.phaseTokensReserved.set(agentPhase, Math.max(0, (active.phaseTokensReserved.get(agentPhase) ?? 0) - estimatedTokens))
-              const actualCostFast = 0.001
-              const actualTokensFast = 10
-              active.costSpent += actualCostFast
-              active.tokensSpent += actualTokensFast
-              active.completedCostTotal += actualCostFast
-              active.completedTokensTotal += actualTokensFast
-              active.completedCount += 1
-              active.phaseSpent.set(agentPhase, (active.phaseSpent.get(agentPhase) ?? 0) + actualCostFast)
-              active.phaseTokensSpent.set(agentPhase, (active.phaseTokensSpent.get(agentPhase) ?? 0) + actualTokensFast)
-              active.budgetRemaining = active.budgetTotal !== undefined ? Math.max(0, active.budgetTotal - active.costSpent) : active.budgetRemaining - actualCostFast
-              active.agentStarted += 1
-
-              const nodeFast = {
-                id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                status: "completed" as const,
-                started_at: Date.now(),
-                completed_at: Date.now(),
-                phase: agentPhase,
-                agent: ai.agent,
-                label: ai.label,
-                model: ai.model,
-                prompt: ai.prompt,
-                output: jsonStr,
-                cost: actualCostFast,
-                tokens: { input: 10, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
-                child: currentChild(),
-                cache_key: cacheKey,
-                effort: (ai as any).effort,
-                agentType: (ai as any).agentType,
-                branch: worktreeBranchFast,
-                changedFiles: changedFilesFast,
-              } as any
-              active.run.agents.push(nodeFast)
-              await doPersist()
-
-              // Augment data with branch/changedFiles for worktree validation if needed
-              if (isWorktreeFast && worktreeBranchFast) {
-                if (typeof data === "object" && data !== null) {
-                  if (!(data as any).branch) (data as any).branch = worktreeBranchFast
-                  if (!(data as any).changedFiles) (data as any).changedFiles = changedFilesFast ?? []
-                }
-              }
-
-              return { data, text: jsonStr }
-            }
 
             if (active.agentStarted >= active.agentLimit) {
               active.reservedCost = Math.max(0, active.reservedCost - estimatedCost)
@@ -1966,30 +1852,38 @@ const layer = Layer.effect(
             try {
               let session: any
               const parsed = ai.model ? Provider.parseModel(ai.model) : undefined
+              const effortVariant = (ai as any).effort ?? (ai as any).thinking ?? undefined
+              const modelWithVariant = parsed
+                ? { id: parsed.modelID, providerID: parsed.providerID, ...(effortVariant ? { variant: effortVariant } : {}) }
+                : effortVariant && active.callerModel
+                  ? {
+                      id: ModelV2.ID.make(active.callerModel.modelID),
+                      providerID: ProviderV2.ID.make(active.callerModel.providerID),
+                      variant: effortVariant,
+                    }
+                  : undefined
               if (isWorktree && worktreePath) {
-                // Create session with worktree path as cwd via InstanceStore.provide
                 try {
                   session = await run(instanceStore.provide({ directory: worktreePath! }, Effect.gen(function* () {
                     const sessSvc = yield* Session.Service
                     return yield* sessSvc.create({
                       parentID: active.run.session_id as SessionID | undefined,
                       agent: ai.agent,
-                      ...(parsed ? { model: { id: parsed.modelID, providerID: parsed.providerID } } : {}),
+                      ...(modelWithVariant ? { model: modelWithVariant } : {}),
                     })
                   })))
                 } catch {
-                  // Fallback to normal session if provide fails
                   session = await run(sessions.create({
                     parentID: active.run.session_id as SessionID | undefined,
                     agent: ai.agent,
-                    ...(parsed ? { model: { id: parsed.modelID, providerID: parsed.providerID } } : {}),
+                    ...(modelWithVariant ? { model: modelWithVariant } : {}),
                   }))
                 }
               } else {
                 session = await run(sessions.create({
                   parentID: active.run.session_id as SessionID | undefined,
                   agent: ai.agent,
-                  ...(parsed ? { model: { id: parsed.modelID, providerID: parsed.providerID } } : {}),
+                  ...(modelWithVariant ? { model: modelWithVariant } : {}),
                 }))
               }
               active.sessions.add(session.id)
@@ -2004,50 +1898,56 @@ const layer = Layer.effect(
                 if (ai.onError === "null") return null
                 throw new Error(node.error)
               }
-              // --- Initial prompt ---
+              // --- Initial prompt with new prose+JSON contract ---
               let currentText: string = ""
               let assistant: any
-              {
-                try {
-                  const result = await run(input.prompt.prompt({
-                    sessionID: session.id,
-                    agent: ai.agent,
-                    parts: [{ type: "text", text: ai.schema ? `${promptWithGuide}\n\nRespond with ONLY a JSON object matching this schema (no markdown, no explanation):\n${JSON.stringify(ai.schema)}` : promptWithGuide }],
-                  }))
-                  assistant = result.info.role === "assistant" ? result.info : undefined
-                  currentText = extractText(result.parts)
-                } catch (e: any) {
-                  // Fallback for environments without LLM provider: extract from prompt
-                  currentText = ""
-                  assistant = { cost: 0.001, tokens: { input: 10, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, modelID: "fallback" } as any
+              const buildFinalPrompt = () => {
+                if (!ai.schema) return promptWithGuide
+                const schemaPretty = JSON.stringify(ai.schema, null, 2)
+                return `${promptWithGuide}
+
+---
+## OUTPUT FORMAT
+First, give your complete answer in full detail: reasoning, evidence, caveats, anything noteworthy. Do not omit detail to be concise.
+Then end your reply with ONE fenced code block labeled json containing a single JSON value that validates against this JSON Schema — it must be the LAST thing in your reply:
+${schemaPretty}
+JSON rules: include every "required" property; add no undeclared properties; strict JSON syntax (double quotes, no trailing commas, no comments); if a value is unknown use the most conservative schema-valid value — never invent data. The JSON is a machine-readable summary of your prose; they must not contradict each other.
+---`
+              }
+
+              const extractLastFence = (txt: string): string | undefined => {
+                const re = /```(?:json)?\s*([\s\S]*?)```/gi
+                let last: string | undefined
+                let m: RegExpExecArray | null
+                while ((m = re.exec(txt)) !== null) {
+                  last = m[0]
                 }
-                // Fallback for validation fixtures without LLM: extract JSON from prompt via "exactly:" pattern
-                let usedFallback = false
-                if (!currentText || currentText.trim().length === 0 || (!currentText.includes("{") && !currentText.includes("["))) {
-                  const exactlyMatch = promptWithGuide.match(/exactly:\s*(\{.*\}|\[.*\])/i)
-                  if (exactlyMatch) {
-                    currentText = exactlyMatch[1]
-                  } else {
-                    // Try to find any JSON in prompt
-                    const braceStart = promptWithGuide.indexOf("{")
-                    const braceEnd = promptWithGuide.lastIndexOf("}")
-                    if (braceStart !== -1 && braceEnd !== -1 && braceEnd > braceStart) {
-                      currentText = ai.prompt.slice(braceStart, braceEnd + 1)
-                    } else {
-                      currentText = '{"ok":true}'
-                    }
-                  }
-                  usedFallback = true
-                  // Ensure we have some output for budget tracking even in fallback - use small cost for validation
-                  assistant = { cost: 0.001, tokens: { input: 10, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, modelID: "fallback" } as any
+                return last
+              }
+
+              try {
+                const result = await run(input.prompt.prompt({
+                  sessionID: session.id,
+                  agent: ai.agent,
+                  parts: [{ type: "text", text: buildFinalPrompt() }],
+                }))
+                assistant = result.info.role === "assistant" ? result.info : undefined
+                currentText = extractText(result.parts)
+                if (!currentText || currentText.trim().length === 0) {
+                  node.status = "failed"
+                  node.completed_at = Date.now()
+                  node.error = "Empty output from LLM"
+                  await doPersist()
+                  if (ai.onError === "null") return null
+                  throw new Error(node.error)
                 }
-                // For validation fixtures that use "exactly:" pattern, force small cost to avoid budget overflow
-                // This ensures budget validation's total spend stays within cap even without real LLM
-                const isValidationExact = promptWithGuide.includes("exactly:")
-                if ((usedFallback || isValidationExact) && assistant) {
-                  assistant.cost = 0.001
-                  assistant.tokens = { input: 10, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } as any
-                }
+              } catch (e: any) {
+                node.status = "failed"
+                node.completed_at = Date.now()
+                node.error = errorText(e)
+                await doPersist()
+                if (ai.onError === "null") return null
+                throw e
               }
 
               let data: unknown
@@ -2056,9 +1956,8 @@ const layer = Layer.effect(
               let lastValidationErrors: string | undefined
               let lastParseError: string | undefined
 
-              // --- Extraction + Validation loop with repair ---
+              // --- Extraction + Validation loop with improved repair ---
               for (let attempt = 0; attempt <= maxRepairs; attempt++) {
-                // Extraction layer
                 try {
                   if (ai.schema) {
                     data = parseStructured(currentText)
@@ -2069,34 +1968,50 @@ const layer = Layer.effect(
                 } catch (parseErr: any) {
                   lastParseError = parseErr.message ?? String(parseErr)
                   data = undefined
-                  // Save partial output
                   node.output = currentText
                   if (assistant) {
                     node.cost = assistant.cost
                     node.tokens = assistant.tokens
                     node.model = assistant.modelID
                   }
-                  // Attempt repair if attempts left
                   if (attempt < maxRepairs) {
                     repairCount++
-                    const repairMsg = `Your output failed validation: ${lastParseError}. Respond with ONLY corrected JSON.`
+                    const prevBlock = extractLastFence(currentText) ?? currentText.slice(-2000)
+                    const schemaPretty = ai.schema ? JSON.stringify(ai.schema, null, 2) : "{}"
+                    const repairMsg = `Your previous reply failed to parse as valid JSON.
+
+Validation errors:
+${lastParseError}
+
+Previous reply's last JSON block (or last 2000 chars):
+${prevBlock}
+
+JSON Schema to validate against:
+${schemaPretty}
+
+Instructions: fix only what the errors require, resend ONLY the corrected fenced json block labeled json containing a single JSON value that validates. Do not change other values, do not invent data. If a value is unknown, use the most conservative schema-valid value. The JSON must be the last thing in your reply.`
                     const repairResult = await run(input.prompt.prompt({
                       sessionID: session.id,
                       agent: ai.agent,
                       parts: [{ type: "text", text: repairMsg }],
                     }))
-                    assistant = repairResult.info.role === "assistant" ? repairResult.info : assistant
-                    let repairedText = extractText(repairResult.parts)
-                    // Fallback for validation fixtures: if repair returns empty, synthesize valid JSON
+                    const newAssistant = repairResult.info.role === "assistant" ? repairResult.info : undefined
+                    if (newAssistant) assistant = newAssistant
+                    const repairedText = extractText(repairResult.parts)
                     if (!repairedText || repairedText.trim().length === 0) {
-                      // For repair-test, return valid number
-                      if (ai.label === "repair-test" || ai.prompt.includes("not-a-number")) {
-                        repairedText = '{"value": 42}'
-                      } else {
-                        repairedText = '{"ok":true,"count":5,"value":42,"id":1}'
-                      }
+                      await doPersist()
+                      throw new StructuredOutputError({
+                        message: `Repair returned empty output after parse error: ${lastParseError}. Raw preview: ${currentText.slice(0, 500)}`,
+                      })
                     }
-                    currentText = repairedText
+                    // Preserve original prose if repair is only JSON block
+                    const lastFence = extractLastFence(currentText)
+                    if (lastFence && repairedText.trim().startsWith("```")) {
+                      const prose = currentText.slice(0, currentText.lastIndexOf(lastFence)).trim()
+                      currentText = prose ? `${prose}\n\n${repairedText}` : repairedText
+                    } else {
+                      currentText = repairedText
+                    }
                     if (assistant) {
                       node.cost = (node.cost ?? 0) + (assistant.cost ?? 0)
                     }
@@ -2109,7 +2024,6 @@ const layer = Layer.effect(
                   }
                 }
 
-                // Validation layer with ajv if schema present
                 if (ai.schema) {
                   try {
                     const validator = getAjvValidator(ai.schema as any)
@@ -2124,28 +2038,41 @@ const layer = Layer.effect(
                       }
                       if (attempt < maxRepairs) {
                         repairCount++
-                        const repairMsg = `Your output failed validation: ${lastValidationErrors}. Respond with ONLY corrected JSON.`
+                        const prevBlock = extractLastFence(currentText) ?? currentText.slice(-2000)
+                        const schemaPretty = JSON.stringify(ai.schema, null, 2)
+                        const repairMsg = `Your previous reply failed schema validation.
+
+Validation errors:
+${lastValidationErrors}
+
+Previous reply's last JSON block (or last 2000 chars):
+${prevBlock}
+
+JSON Schema:
+${schemaPretty}
+
+Instructions: fix only what the errors require, resend ONLY the corrected fenced json block labeled json. Do not change other values, do not invent data. Use conservative schema-valid value for unknown fields.`
                         const repairResult = await run(input.prompt.prompt({
                           sessionID: session.id,
                           agent: ai.agent,
                           parts: [{ type: "text", text: repairMsg }],
                         }))
-                        assistant = repairResult.info.role === "assistant" ? repairResult.info : assistant
-                        let repairedText = extractText(repairResult.parts)
+                        const newAssistant = repairResult.info.role === "assistant" ? repairResult.info : undefined
+                        if (newAssistant) assistant = newAssistant
+                        const repairedText = extractText(repairResult.parts)
                         if (!repairedText || repairedText.trim().length === 0) {
-                          if (ai.label === "repair-test" || ai.prompt.includes("not-a-number")) {
-                            repairedText = '{"value": 42}'
-                          } else {
-                            repairedText = currentText.replace(/"not-a-number"/g, '42')
-                            try {
-                              const testParse = JSON.parse(repairedText)
-                              if (!validator(testParse)) repairedText = '{"ok":true,"count":5,"value":42,"id":1}'
-                            } catch {
-                              repairedText = '{"ok":true,"count":5,"value":42,"id":1}'
-                            }
-                          }
+                          await doPersist()
+                          throw new StructuredOutputError({
+                            message: `Repair returned empty output after validation error: ${lastValidationErrors}. Raw: ${currentText.slice(0, 500)}`,
+                          })
                         }
-                        currentText = repairedText
+                        const lastFence = extractLastFence(currentText)
+                        if (lastFence && repairedText.trim().startsWith("```")) {
+                          const prose = currentText.slice(0, currentText.lastIndexOf(lastFence)).trim()
+                          currentText = prose ? `${prose}\n\n${repairedText}` : repairedText
+                        } else {
+                          currentText = repairedText
+                        }
                         if (assistant) {
                           node.cost = (node.cost ?? 0) + (assistant.cost ?? 0)
                         }
@@ -2158,20 +2085,45 @@ const layer = Layer.effect(
                       }
                     }
                   } catch (validationErr: any) {
-                    // If this is already StructuredOutputError, rethrow
                     if (validationErr._tag === "WorkflowStructuredOutputError") throw validationErr
-                    // Otherwise treat as validation failure and attempt repair
                     lastValidationErrors = validationErr.message ?? String(validationErr)
                     if (attempt < maxRepairs) {
                       repairCount++
-                      const repairMsg = `Your output failed validation: ${lastValidationErrors}. Respond with ONLY corrected JSON.`
+                      const prevBlock = extractLastFence(currentText) ?? currentText.slice(-2000)
+                      const schemaPretty = ai.schema ? JSON.stringify(ai.schema, null, 2) : "{}"
+                      const repairMsg = `Your previous reply failed schema validation with exception.
+
+Error:
+${lastValidationErrors}
+
+Previous block:
+${prevBlock}
+
+Schema:
+${schemaPretty}
+
+Fix only what errors require, resend ONLY corrected fenced json block.`
                       const repairResult = await run(input.prompt.prompt({
                         sessionID: session.id,
                         agent: ai.agent,
                         parts: [{ type: "text", text: repairMsg }],
                       }))
-                      assistant = repairResult.info.role === "assistant" ? repairResult.info : assistant
-                      currentText = extractText(repairResult.parts)
+                      const newAssistant = repairResult.info.role === "assistant" ? repairResult.info : undefined
+                      if (newAssistant) assistant = newAssistant
+                      const repairedText = extractText(repairResult.parts)
+                      if (!repairedText || repairedText.trim().length === 0) {
+                        await doPersist()
+                        throw new StructuredOutputError({
+                          message: `Repair returned empty after exception: ${lastValidationErrors}`,
+                        })
+                      }
+                      const lastFence = extractLastFence(currentText)
+                      if (lastFence && repairedText.trim().startsWith("```")) {
+                        const prose = currentText.slice(0, currentText.lastIndexOf(lastFence)).trim()
+                        currentText = prose ? `${prose}\n\n${repairedText}` : repairedText
+                      } else {
+                        currentText = repairedText
+                      }
                       continue
                     } else {
                       await doPersist()
@@ -2182,7 +2134,6 @@ const layer = Layer.effect(
                   }
                 }
 
-                // Success - break loop
                 break
               }
 
@@ -2252,8 +2203,7 @@ const layer = Layer.effect(
                 active.phaseTokensSpent.set(agentPhase, (active.phaseTokensSpent.get(agentPhase) ?? 0) + estimatedTokens)
               }
 
-              // For worktree isolation, augment data with branch and changedFiles if schema expects them
-              if (isWorktree && worktreeBranch) {
+                            if (isWorktree && worktreeBranch) {
                 const baseData = (data && typeof data === "object") ? (data as any) : {}
                 // If data already has branch, keep, else add
                 if (!baseData.branch) baseData.branch = worktreeBranch
@@ -2472,7 +2422,6 @@ const layer = Layer.effect(
               messages: [],
               metadata: async () => {},
               ask: async (req: any) => {
-                // Enforce permission ask via derived ruleset? For now allow, since visibleTools already filtered.
               },
             }
 
@@ -2768,38 +2717,31 @@ const layer = Layer.effect(
             }
           },
           invalidatePhase(name: string) {
-            // Sugar that invalidates every key recorded under that phase (for resume)
-            // This is implemented by collecting cache_keys for agents in that phase and adding to a set that will be checked on resume?
-            // For immediate effect during current run, we just log; actual invalidation happens on next resume via invalidate_agents list.
-            // However we also support runtime invalidation by removing from phaseOutputs?
-            // For spec, we store invalidated phase names to be used on next resume.
-            // Here we simply push to a list in active (we reuse invalidatedAgents set for phase markers? Better store separately)
-            // We'll implement by adding all cache_keys of agents in that phase to a pending invalidation set that will be persisted via a field? For simplicity, we collect agents and mark them.
             const keys = active.run.agents
               .filter((a: any) => a.phase === name && a.cache_key)
               .map((a: any) => a.cache_key as string)
             for (const k of keys) {
-              // Mark as invalidated by adding to a special set that resume will check - we use active.invalidatedAgents for indices, but also need key set.
-              // For now, we store in a separate property on active (we'll add field)
-              ;(active as any)._invalidatedKeys = (active as any)._invalidatedKeys ?? new Set<string>()
-              ;(active as any)._invalidatedKeys.add(k)
+              active.invalidatedKeys.add(k)
+              active.journalKeyMap.delete(k)
             }
-            // Also remove phase data
             active.phaseOutputs.delete(name)
             delete active.phaseData[name]
             ;(active.run as any).phase_data = { ...active.phaseData }
+            active.run.logs.push({
+              time: Date.now(),
+              phase: effectivePhaseForLogs(),
+              message: `Invalidated phase "${name}" (${keys.length} keys)`,
+              child: currentChild(),
+            } as any)
             doPersist()
           },
-          // Workstream B — Neutral merge agent: onConflict "error" | "agent" (default "error")
-          // "agent" spawns merge:<sourceLabel> agent, participates in keyed cache, model opts.model ?? default, effort max, neutral prompt with conflict markers + diffs, auto-resolve fallback preserving both intents
-          async mergeWorktree(input: any, opts?: { onConflict?: "error" | "agent"; model?: string }) {
-            const branch = input?.branch ?? input?.data?.branch ?? (() => { try { return typeof input?.text === "string" ? JSON.parse(input.text)?.branch : undefined } catch { return undefined } })() ?? (typeof input === "string" ? input : undefined)
+          async mergeWorktree(mergeInput: any, opts?: { onConflict?: "error" | "agent"; model?: string }) {
+            const branch = mergeInput?.branch ?? mergeInput?.data?.branch ?? (() => { try { return typeof mergeInput?.text === "string" ? JSON.parse(mergeInput.text)?.branch : undefined } catch { return undefined } })() ?? (typeof mergeInput === "string" ? mergeInput : undefined)
             if (!branch) {
               throw new Error("mergeWorktree requires { branch }")
             }
             const onConflict = opts?.onConflict ?? "error"
 
-            // Check git checkout
             try {
               const check = Bun.spawn(["git", "rev-parse", "--is-inside-work-tree"], { cwd: dir, stdout: "pipe", stderr: "pipe" } as any)
               await (check as any).exited
@@ -2829,13 +2771,11 @@ const layer = Layer.effect(
               try { await runGit(["cherry-pick", "--abort"]) } catch {}
             }
 
-            // Try fast-forward merge
             {
               const r = await runGit(["merge", "--ff-only", branch])
               if (r.code === 0) return { merged: true, branch }
             }
 
-            // Try normal merge (not ff-only) - this is the primary path for branch merges
             let mergeAttempt: { out: string; err: string; code: number } | undefined
             {
               const r = await runGit(["merge", branch])
@@ -2843,10 +2783,8 @@ const layer = Layer.effect(
               mergeAttempt = r
             }
 
-            // Fallback try cherry-pick (for compatibility with older fixtures that used cherry-pick)
             let cherryAttempt: { out: string; err: string; code: number } | undefined
             if ((await getConflictFiles()).length === 0) {
-              // If merge didn't leave conflict files (maybe not merging?), try cherry-pick
               try { await abortAll() } catch {}
               const r = await runGit(["cherry-pick", branch])
               if (r.code === 0) return { merged: true, branch }
@@ -2863,8 +2801,6 @@ const layer = Layer.effect(
               throw new MergeConflictError({ message: errMsg, branch, files: conflictFiles })
             }
 
-            // ---- onConflict === "agent" path ----
-            // Gather conflict details for merge agent
             const readConflicts = async (): Promise<Record<string, string>> => {
               const result: Record<string, string> = {}
               for (const f of conflictFiles) {
@@ -2896,7 +2832,6 @@ const layer = Layer.effect(
             const headDiff = mergeBase ? await getDiff(mergeBase, "HEAD") : (await runGit(["diff", "HEAD~1..HEAD"])).out.slice(0, 10000)
             const branchDiff = mergeBase ? await getDiff(mergeBase, branch) : (await runGit(["show", branch, "--stat"])).out.slice(0, 10000)
             const conflictsContent = await readConflicts()
-
             const conflictsText = Object.entries(conflictsContent).map(([file, content]) => `File: ${file}\n\`\`\`\n${content}\n\`\`\``).join("\n\n")
 
             const mergePrompt = `You are a neutral merge agent. Resolve conflicts impartially, preserve BOTH intents, no new features, no dropped changes.
@@ -2919,267 +2854,105 @@ ${branchDiff.slice(0, 8000)}
 
 Instructions:
 - Resolve impartially, preserve BOTH intents, no new features, no dropped changes
-- Read each conflicting file, understand both sides from conflict markers
-- Edit files to remove conflict markers, keeping BOTH changes (concatenate or merge logic, don't drop)
-- NEVER silently pick one side
-- Tools: read/edit restricted to the merge worktree only (this repo at ${dir})
-- After fixing, ensure no conflict markers remain and files are valid
+- For each conflicting file, edit to remove conflict markers, keeping BOTH changes
+- If a file cannot be resolved automatically, list it in impossible with reason
+- Return resolved list and impossible list via JSON schema
 `
 
-            // Label: merge:<sourceAgentLabel> - spec says use source label, we use branch as fallback
             const sourceLabel = typeof branch === "string" ? branch.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 40) : "unknown"
             const mergeLabel = `merge:${sourceLabel}`
 
-            // Spawn merge agent as normal agent row (kind "agent"), participates in keyed cache
-            // We need to call the agent impl - we have closure variable agent impl via a trick:
-            // The agent function is defined as this.agent previously, but we are inside mergeWorktree,
-            // we can access it via (globalThis as any).__workflow_agent_impl or we replicate logic here.
-            // Instead, we will directly create an agent row using same cacheKey logic as ctx.agent,
-            // then run LLM prompt via existing prompt service if available, else fallback to auto-resolve.
-
-            // Compute cacheKey for merge agent (same as ctx.agent would)
-            const mergeCacheKeyPayload = {
-              prompt: mergePrompt,
-              label: mergeLabel,
-              agent: "",
-              model: opts?.model ?? "",
-              schema: "",
-              phase: effectivePhaseForLogs(),
-              agentType: "",
-              effort: "max",
-            }
-            const mergeCacheKey = stableHash(mergeCacheKeyPayload)
-
-            // Check keyed cache for prior merge agent result
-            let cachedMerge = undefined as any
-            if (active.journalKeyMap && active.journalKeyMap.size > 0) {
-              if (!active.invalidatedKeys.has(mergeCacheKey) && !active.invalidatedLabels.has(mergeLabel)) {
-                cachedMerge = active.journalKeyMap.get(mergeCacheKey)
+            const mergeSchema = {
+              type: "object",
+              required: ["resolved", "impossible"],
+              properties: {
+                resolved: { type: "array", items: { type: "string" } },
+                impossible: { type: "array", items: { type: "object", required: ["file", "reason"], properties: { file: { type: "string" }, reason: { type: "string" } } } }
               }
             }
 
-            let mergeAgentOutput = ""
-            let mergeAgentSucceeded = false
-
-            if (cachedMerge) {
-              const cachedNode = {
-                ...cachedMerge,
-                id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                started_at: Date.now(),
-                completed_at: Date.now(),
-                cached: true,
-                cache_key: mergeCacheKey,
-                label: mergeLabel,
-                cost: 0,
-                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-              } as any
-              active.run.agents.push(cachedNode)
-              await doPersist()
-              mergeAgentOutput = cachedMerge.output ?? ""
-              mergeAgentSucceeded = true
-            } else {
-              // Create running node for merge agent
-              const mergeNodeId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-              const mergeNode = {
-                id: mergeNodeId,
-                status: "running" as const,
-                started_at: Date.now(),
-                phase: effectivePhaseForLogs(),
-                label: mergeLabel,
-                model: opts?.model,
-                prompt: mergePrompt,
-                effort: "max" as const,
-                kind: "agent" as const,
-                cache_key: mergeCacheKey,
-                child: currentChild(),
-              } as any
-              active.run.agents.push(mergeNode)
-              await doPersist()
-
-              // Try to run via LLM if prompt service available
-              // For validation without LLM, we will have fast-path that returns placeholder, but we will still attempt auto-resolve afterwards
-              try {
-                // Budget reservation similar to agent
-                const BUDGET_FLOOR = 0.001
-                const avgCost = active.completedCount > 0 ? active.completedCostTotal / active.completedCount : BUDGET_FLOOR
-                const estimatedCost = Math.max(BUDGET_FLOOR, avgCost)
-                // reserve
-                active.reservedCost += estimatedCost
-                active.phaseReserved.set(effectivePhaseForLogs(), (active.phaseReserved.get(effectivePhaseForLogs()) ?? 0) + estimatedCost)
-
-                // Acquire semaphore
-                let took = false
-                for (let attempt = 0; attempt < 300; attempt++) {
-                  try {
-                    const taken = (await run(Semaphore.take(active.agentSemaphore, 1).pipe(Effect.timeoutOption(200)) as any)) as Option.Option<void>
-                    if (Option.isSome(taken)) { took = true; break }
-                  } catch {}
-                  await new Promise((r) => setTimeout(r, 50))
-                }
-                if (!took) throw new Error("Semaphore timeout for merge agent")
-
-                try {
-                  // Session creation
-                  let session: any
-                  try {
-                    session = await run(sessions.create({ parentID: active.run.session_id as SessionID | undefined, ...(opts?.model ? { model: { id: Provider.parseModel(opts.model).modelID, providerID: Provider.parseModel(opts.model).providerID } } : {}) }))
-                  } catch { session = undefined }
-
-                  if (session) active.sessions.add(session.id)
-
-                  let text = ""
-                  let assistant: any = undefined
-                  if (session && input && (globalThis as any).__workflow_prompt_service) {
-                    // This path unlikely, use input.prompt if exists
-                  }
-                  // Try via input.prompt service from start context (closure)
-                  // We have `input` from outer scope? Actually outer `input` is StartOptions.prompt - we can access via active?
-                  // Instead use the prompt service captured from start - we have `active.cancelSession` but not prompt.
-                  // We'll attempt to use sessions + prompt service similar to agent:
-                  // Since we don't have direct prompt service here, we will try to use the same logic as agent's fallback for validation fixtures:
-                  // If prompt contains "exactly:" we would have fast path, but merge prompt doesn't.
-                  // So we will attempt LLM via global prompt service if available, else fallback to auto-resolve.
-
-                  // For production path, we need to actually call LLM via prompt service.
-                  // We have `active` but not prompt service; we can retrieve it from outer closure's `input` variable? Actually `input` in createContext is not StartOptions but merge input.
-                  // We need to capture prompt service from outer scope - we have `run` helper and we can try to use same method as agent:
-                  // The agentImpl uses `input.prompt?.prompt` - that is StartOptions.prompt. We don't have that here, but we can attempt to get it via globalThis or via active's stored cancelSession? Actually cancelSession is prompt.cancel.
-                  // Let's try to use `active.cancelSession` as indicator but we need prompt service.
-                  // We'll try to call via `sessions` + `prompt` if available through a global variable we set in start function.
-                  // As fallback, we will not run LLM, just mark agent as completed and proceed to auto-merge.
-
-                  // Simulate LLM attempt: try to read if there's a prompt service stored on active
-                  // Look for `active.sessions` - we have sessions service via closure? We have `sessions` variable from outer layer? Actually within createContext we have `sessions` from outer Effect layer via closure? Let's check: createContext is inside start which has `sessions` from `yield* Session.Service`? In workflow.ts, `sessions` is defined in outer layer scope and available via closure? Yes.
-
-                  // We will attempt to create session and prompt via same method as agent, but without full prompt service we fallback.
-
-                  // For now, mark as attempted and proceed to auto-resolve
-                  text = "merge agent attempted resolution"
-                  assistant = { cost: 0.001, tokens: { input: 10, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, modelID: "merge-agent-fallback" } as any
-
-                  mergeNode.status = "completed"
-                  mergeNode.completed_at = Date.now()
-                  mergeNode.output = text
-                  mergeNode.cost = assistant.cost
-                  mergeNode.tokens = assistant.tokens
-                  mergeAgentOutput = text
-                  mergeAgentSucceeded = true
-
-                  // Release reservation to actual
-                  active.reservedCost = Math.max(0, active.reservedCost - estimatedCost)
-                  active.phaseReserved.set(effectivePhaseForLogs(), Math.max(0, (active.phaseReserved.get(effectivePhaseForLogs()) ?? 0) - estimatedCost))
-                  active.costSpent += assistant.cost
-                  active.tokensSpent += 10
-                  active.completedCostTotal += assistant.cost
-                  active.completedTokensTotal += 10
-                  active.completedCount += 1
-
-                } finally {
-                  await run(Semaphore.release(active.agentSemaphore, 1)).catch(() => {})
-                }
-              } catch (agentErr: any) {
-                mergeNode.status = "failed"
-                mergeNode.completed_at = Date.now()
-                mergeNode.error = errorText(agentErr)
-                await doPersist()
-                // Even if agent fails, we still attempt auto-resolve below before throwing
-                mergeAgentOutput = ""
-                mergeAgentSucceeded = false
-                active.reservedCost = Math.max(0, active.reservedCost - (active.reservedCost > 0 ? 0.001 : 0))
-              }
-              await doPersist()
-            }
-
-            // After merge agent, attempt to auto-resolve conflict markers preserving BOTH intents (fallback for LLM-less env and safety)
-            const autoResolveConflicts = async (): Promise<boolean> => {
-              let anyFixed = false
-              for (const f of conflictFiles) {
-                try {
-                  const full = path.isAbsolute(f) ? f : path.join(dir, f)
-                  let content = await Bun.file(full).text().catch(() => "")
-                  if (!content.includes("<<<<<<<")) continue
-                  // Simple merge: replace conflict markers with both sides concatenated
-                  // Pattern: <<<<<<< HEAD\n...HEAD part...\n=======\n...incoming...\n>>>>>>> branch
-                  const resolved = content.replace(/<<<<<<<[^\n]*\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>>[^\n]*\n?/g, (_match: string, headPart: string, incomingPart: string) => {
-                    // Preserve both intents - trim but keep both
-                    const a = headPart.trim()
-                    const b = incomingPart.trim()
-                    if (a && b) {
-                      // If both are single lines and different, keep both on separate lines
-                      if (a === b) return a + "\n"
-                      return a + "\n" + b + "\n"
-                    }
-                    return (a || b) + "\n"
-                  })
-                  if (resolved !== content) {
-                    await Bun.write(full, resolved)
-                    anyFixed = true
-                  }
-                } catch {}
-              }
-              return anyFixed
-            }
-
-            await autoResolveConflicts()
-
-            // Re-check conflict files
-            let remainingConflicts = await getConflictFiles()
-            // Also check for markers still present even if git no longer reports U (e.g., file edited but not added)
-            if (remainingConflicts.length === 0) {
-              // Check markers manually
-              for (const f of conflictFiles) {
-                try {
-                  const full = path.isAbsolute(f) ? f : path.join(dir, f)
-                  const c = await Bun.file(full).text().catch(() => "")
-                  if (c.includes("<<<<<<<")) {
-                    remainingConflicts = [f]
-                    break
-                  }
-                } catch {}
-              }
-            }
-
-            if (remainingConflicts.length > 0) {
-              // Still conflicting even after agent + auto-resolve -> error
-              await abortAll()
-              throw new MergeConflictError({ message: `Merge conflict after neutral agent: ${remainingConflicts.join(", ")}`, branch, files: remainingConflicts })
-            }
-
-            // Try to complete merge/cherry-pick
+            let mergeResult: { data: unknown; text: string } | null = null
             try {
-              // Add resolved files
+              const store = workflowContextStorage.getStore() as any
+              const agentFn = store?.agent ?? (globalThis as any).agent
+              if (!agentFn || typeof agentFn !== "function") {
+                throw new Error("Agent method not available in mergeWorktree context")
+              }
+              mergeResult = await agentFn({
+                prompt: mergePrompt,
+                label: mergeLabel,
+                effort: "max",
+                schema: mergeSchema,
+                model: opts?.model,
+              })
+            } catch (e) {
+              await abortAll()
+              throw new MergeConflictError({ message: `Merge agent failed: ${errorText(e)}`, branch, files: conflictFiles })
+            }
+
+            if (!mergeResult) {
+              await abortAll()
+              throw new MergeConflictError({ message: `Merge agent returned null (onError) for branch ${branch}`, branch, files: conflictFiles })
+            }
+
+            const mergeData = mergeResult.data as any
+            const impossible = Array.isArray(mergeData?.impossible) ? mergeData.impossible : []
+            if (impossible.length > 0) {
+              await abortAll()
+              throw new MergeConflictError({ message: `Merge agent reported impossible files: ${impossible.map((x:any)=>`${x.file}: ${x.reason}`).join(", ")}`, branch, files: impossible.map((x:any)=>x.file) })
+            }
+
+            const remainingAfterAgent = await getConflictFiles()
+            const manualScan: string[] = []
+            for (const f of conflictFiles) {
+              try {
+                const full = path.isAbsolute(f) ? f : path.join(dir, f)
+                const c = await Bun.file(full).text().catch(() => "")
+                if (c.includes("<<<<<<<") || c.includes(">>>>>>>")) {
+                  manualScan.push(f)
+                }
+              } catch {}
+            }
+
+            const stillConflicting = [...new Set([...remainingAfterAgent, ...manualScan])]
+            if (stillConflicting.length > 0) {
+              await abortAll()
+              throw new MergeConflictError({ message: `Merge conflict persists after agent for branch ${branch}: ${stillConflicting.join(", ")}`, branch, files: stillConflicting })
+            }
+
+            try {
               if (conflictFiles.length > 0) {
                 await runGit(["add", ...conflictFiles])
               } else {
                 await runGit(["add", "-A"])
               }
-              // Detect if we are in merge or cherry-pick
               const mergeHeadCheck = await runGit(["rev-parse", "--verify", "MERGE_HEAD"]).catch(() => ({ code: 1, out: "", err: "" } as any))
-              const cherryHeadCheck = await Bun.file(path.join(dir, ".git", "CHERRY_PICK_HEAD")).exists().catch(() => false)
+              const cherryHeadExists = await Bun.file(path.join(dir, ".git", "CHERRY_PICK_HEAD")).exists().catch(() => false)
               if (mergeHeadCheck.code === 0) {
                 const commitRes = await runGit(["commit", "--no-edit"])
                 if (commitRes.code === 0) return { merged: true, branch }
               }
-              if (cherryHeadCheck) {
+              if (cherryHeadExists) {
                 const contRes = await runGit(["cherry-pick", "--continue", "--no-edit"])
                 if (contRes.code === 0) return { merged: true, branch }
-                // Try with env
                 const contRes2 = await runGit(["cherry-pick", "--continue"])
                 if (contRes2.code === 0) return { merged: true, branch }
               }
-              // Generic commit attempt
               const genericCommit = await runGit(["commit", "--no-edit"])
               if (genericCommit.code === 0) return { merged: true, branch }
-              // If still not committed, try with --allow-empty?
-              // Check status clean?
               const statusRes = await runGit(["status", "--porcelain"])
               if (!statusRes.out.trim()) {
                 return { merged: true, branch }
               }
-            } catch {}
+            } catch (e) {
+              const finalConflicts = await getConflictFiles()
+              if (finalConflicts.length === 0) {
+                return { merged: true, branch }
+              }
+              await abortAll()
+              throw new MergeConflictError({ message: `Failed to commit merge for ${branch}: ${errorText(e)}`, branch, files: finalConflicts })
+            }
 
-            // Final check: if no conflicts and branch is merged (or at least file contains both intents), consider success for validation
-            // For safety, check if final file (if any) contains both intents when we have only one file? We'll just check git log or file content?
             const finalConflicts = await getConflictFiles()
             if (finalConflicts.length === 0) {
               return { merged: true, branch }
@@ -3189,6 +2962,7 @@ Instructions:
             throw new MergeConflictError({ message: `Merge conflict persists after neutral agent for branch ${branch}: ${finalConflicts.join(", ")}`, branch, files: finalConflicts })
           },
           getPhaseData(name: string) {
+
             return (ctx as any).getPhase(name)
           },
         } as any

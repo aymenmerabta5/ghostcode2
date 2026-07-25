@@ -146,6 +146,7 @@ function makeStream<E>(opts: LivenessOptsWithStream<E>): Stream.Stream<E, unknow
               const stallErr = yield* Ref.get(stallErrorRef)
               if (stallErr) break
               if (opts.ctrl.signal.aborted) {
+                yield* Ref.set(doneRef, true)
                 yield* Queue.shutdown(queue)
                 break
               }

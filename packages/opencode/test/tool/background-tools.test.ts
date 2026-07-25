@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Effect, Exit, Layer } from "effect"

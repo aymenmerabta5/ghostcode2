@@ -1,0 +1,60 @@
+Manage the session goal for autonomous pursuit with mandatory reviewer approval.
+
+This command is identical to /goal but adds a strict reviewer loop that MUST be followed before declaring victory.
+
+Usage:
+- `/goalr set <description>` — set a new active goal and start pursuing it
+- `/goalr pause` — pause the active goal (stops the autonomous loop)
+- `/goalr resume` — resume the paused goal (restarts the autonomous loop)
+- `/goalr complete [verification]` — mark the goal as completed (only after reviewer approval)
+- `/goalr clear` — remove the goal entirely
+- `/goalr show` — display the current goal and its status
+
+$ARGUMENTS
+
+## Reviewer Loop (MANDATORY - MUST be followed)
+
+You MUST NOT call goal complete until ALL of the following steps are satisfied. This is a hard requirement.
+
+1. **Implement the goal fully** using best practices and verification:
+   - Run typechecks, tests, or verifications relevant to the changes (e.g., `bun typecheck` from package dirs)
+   - Ensure changes are objectively correct, not just superficially working
+
+2. **Spawn reviewer subagents** after implementation is done:
+   - Spawn at least 2-3 independent reviewer subagents in parallel using the Task tool with explore or general subagent_type
+   - Each reviewer should be given a distinct lens:
+     - Lens 1: Correctness, logic, edge cases, bug detection
+     - Lens 2: Code quality, structure, style, adherence to AGENTS.md, conventions, security
+     - Lens 3: Completeness, missing requirements, goal alignment, testing
+   - Reviewers must read actual changed files and relevant context, not just diffs
+   - Reviewers must produce actionable feedback: either APPROVE with no comments, or list specific fixes required
+
+3. **Hard gate on completion**:
+   - You are PROHIBITED from declaring victory or calling `goal complete` until ALL spawned reviewer subagents return explicit approval without any comments or required fixes
+   - Interpretation: If ANY reviewer says "needs fix", "issue found", "should change", "consider", etc., that counts as NOT approved
+
+4. **Fix loop**:
+   - If any reviewer reports an issue or required fix, you MUST go and fix it
+   - After fixing, you MUST respawn the reviewer subagents again (new Task calls) and repeat the review
+   - Continue this loop: implement/fix → review → fix → re-review until all reviewers fully approve without any comment
+
+5. **Completion criteria**:
+   - Only when ALL reviewers in the latest round approve with zero comments/issues, you may call `goal complete` with verification that includes reviewer approval summary
+   - Include in verification: what reviewers checked, that all approved, and any changes made during reviewer loop
+
+## Workflow Summary
+
+```
+Goal set → Implement → Verify (typecheck/tests) → Spawn reviewers (2-3 parallel)
+→ If any reviewer has comments → Fix → Respawning reviewers → Repeat
+→ When all reviewers APPROVE clean → goal complete
+```
+
+## Important Rules
+
+- Use the `task` tool to spawn reviewers as subagents, not inline reasoning
+- Reviewers must be adversarial and thorough, trying to find problems
+- Do NOT skip reviewers to save time - quality over speed
+- Do NOT declare completion after first implementation without reviewers
+- If you fix issues, re-run relevant verification before next review round
+- Document the reviewer loop in your final verification

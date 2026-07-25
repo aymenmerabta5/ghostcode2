@@ -7,212 +7,354 @@ Project workflows win on name collisions.
 # QUALITY-FIRST POLICY (TOKENMAXXING — READ FIRST)
 Cost is NOT a constraint. Workflows exist to produce the best possible result, whatever it takes.
 - NEVER downgrade model, effort, agent count, or verification depth to save tokens or money.
-- Default effort is "max" for reasoning-heavy agents (planning, verification, synthesis, judging)
-  and "high" for mechanical agents (listing files, extraction, formatting). Never below "high".
-- Default to the strongest available model. Only route a phase to a smaller model when speed
-  genuinely matters more than quality for that specific step — never to save cost.
-- Verification is MANDATORY, not optional. Every finding/claim/output gets at least 3 independent
-  adversarial verifiers; a finding survives only if ≥2 support it.
-- Prefer MORE agents over longer prompts: fan out per-file, per-claim, per-angle. If in doubt
-  between 10 agents and 100 agents, use 100.
-- Iterate until dry: keep running discovery/fix rounds until 2 consecutive rounds produce nothing
-  new — never stop after one pass because "it's probably fine".
-- Add a completeness critic and/or judge panel before every final report.
-- Do NOT set budgets unless the user explicitly asks for a cap. Unbudgeted runs are the default
-  and the intended mode.
+- Effort: always use the MAXIMUM effort value your model supports. State your model name and use
+  its highest valid effort. Never below "high" for any agent.
+- Default to the strongest available model. Route to a smaller model only when speed genuinely
+  matters more than quality for that step — never to save cost.
+- Verification is MANDATORY: every finding/claim gets >=3 decorrelated adversarial verifiers;
+  a finding survives only if >=2 support it.
+- Prefer MORE agents over longer prompts. In doubt between 10 and 100 agents: use 100.
+- Iterate until dry: rounds continue until 2 consecutive rounds produce nothing new.
+- A completeness critic and/or judge panel runs before every final report.
+- Do NOT set budgets unless the user explicitly asks for a cap.
+
+# HOW TO DESIGN A WORKFLOW (THINK BEFORE YOU WRITE)
+Answer these five questions IN ORDER before writing any code. A workflow written without this
+design pass will be a linear script with agents sprinkled in — that is not a workflow.
+
+1. WHAT IS THE ATOMIC UNIT OF WORK?
+   Decompose until each agent's task is one file, one claim, one question, one route — something
+   a single agent can finish without holding the big picture. If a worker prompt needs the word
+   "then", split it into two agents or pipeline stages. The unit size determines everything else.
+
+2. WHAT DOES EACH PHASE HAND TO THE NEXT? (write this contract FIRST)
+   A workflow is a pipeline of data transformations: discover -> file list; audit -> claims;
+   verify -> surviving claims; report -> document. For each phase, write down its output shape
+   before coding. If you cannot say what a phase produces for the next one, the phase is wrong.
+   Every setPhase() call carries that output as payload; every next phase reads it with
+   getPhase() and injects it VERBATIM (JSON.stringify) into its prompts. A prompt that says
+   "based on previous findings" without the actual data forces the agent to re-explore and
+   hallucinate — this is the #1 bug in generated workflows.
+
+3. WHAT IS INDEPENDENT? (parallelize exactly that, nothing else)
+   Two tasks are parallel-safe when neither needs the other's output and neither decides a shared
+   question. Per-file audits: parallel. Design decisions: NEVER parallel — one planner agent
+   decides everything once, stores decisions in the phase payload, and every parallel worker
+   receives them verbatim with the line "Decide nothing; if the spec is ambiguous, return the
+   ambiguity in your output instead of choosing." Parallel agents that edit files need
+   isolation: "worktree".
+
+4. HOW WILL WRONG OUTPUTS BE CAUGHT?
+   Design the verify phase together with the work phase, not after it. Force workers to return
+   EVIDENCE (file, line, exact quote) so verifiers have something checkable. Write verifier
+   prompts as refutation, not confirmation:
+   - Frame: "Try to prove this claim is WRONG" — never "check whether this is right".
+   - One focus per verifier: one lens checks the artifact, one checks internal consistency,
+     one attacks from an adversarial persona or different model. Lenses must differ in INPUT
+     (what the verifier sees), not just wording — that is what decorrelates their blind spots.
+   - Every verifier prompt carries: "Do not invent problems merely to appear critical. Every
+     concern must be tied to a plausible scenario, concrete failure mode, or identifiable
+     tradeoff."
+   - Schema: { supported: boolean, reason: string, evidence?: string }. Survive on >=2 of 3.
+
+5. WHEN IS IT DONE?
+   Not after one pass. Discovery/fix loops run until 2 consecutive dry rounds. A completeness
+   critic ("what is MISSING from these findings?") runs before the final report, and the report
+   agent receives the critic's gaps.
+
+# AFTER YOU START A RUN — STOP. DO NOT WORK ALONGSIDE IT.
+Once `start` returns a run ID, the workflow owns the task. You MUST NOT begin doing the same
+work yourself in the main conversation — you would duplicate the workflow's job with worse
+coordination, conflict with its file edits, and waste the run. While a run is active:
+- Poll `inspect` to report progress; relay pending_question to the user and answer via the
+  answer action.
+- Do NOT edit files the workflow may touch; do NOT start overlapping investigations.
+- Only work in parallel on tasks fully unrelated to the run's scope.
+- If the run fails or produces a bad result: fix the workflow file and resume with resume_of
+  (completed agents replay free) — do not silently redo the work by hand.
 
 # WHAT A WORKFLOW IS
 - A file exporting a literal-only `meta` object and a `run(args, ctx)` function.
 - Runs in the background: `start` returns a run ID immediately; watch with `inspect` or the
-  /workflows dashboard. Intermediate results live in script variables and phase data — NOT in the
-  main context window.
+  /workflows dashboard. Intermediate results live in script variables and phase data — NOT in
+  the main context window.
 - Scale: up to 1000 agent() calls per run; min(16, cpuCores-2) execute concurrently, rest queue.
-  This concurrency cap is a throughput limit, not a quality limit — queue as many agents as the
+  The concurrency cap is a throughput limit, not a quality limit — queue as many agents as the
   task deserves.
 
 # WHEN TO USE
 Use a workflow when the task needs more agents than one conversation can coordinate, or when the
-orchestration itself should be a rerunnable artifact: codebase-wide audits, N-file migrations,
-research with cross-checked sources, fix-until-green loops.
-Do NOT use a workflow for a single subagent's worth of work (use the task/subagent tool) or for
-reusable instructions without orchestration (use a skill).
+orchestration should be a rerunnable artifact: codebase-wide audits, N-file migrations, research
+with cross-checked sources, fix-until-green loops.
+Do NOT use a workflow for a single subagent's worth of work (task/subagent tool) or for reusable
+instructions without orchestration (skill).
 
-# FILE FORMAT (canonical example)
-// .opencode/workflows/audit-routes.ts
+# FILE FORMAT — TWO CANONICAL SHAPES. PICK THE RIGHT ONE.
+
+| Your workflow...                  | Copy this shape | Non-negotiables                                                                 |
+|-----------------------------------|-----------------|---------------------------------------------------------------------------------|
+| only READS (audit, research, Q&A) | Example 1       | evidence (line+quote), 3 decorrelated lenses, critic                            |
+| EDITS FILES (migrate, fix, build) | Example 2       | worktrees on parallel writers, plan DRIVES fan-out, ground truth (shell), verify DIFFS never self-reports, loop-until-dry, honest NOT DONE |
+
+## Example 1 — READ-ONLY (audit-routes.ts)
+[... existing audit-routes example unchanged ...]
+
+## Example 2 — WRITE (migrate-api.ts). If your workflow edits files, copy THIS.
+// .opencode/workflows/migrate-api.ts
 export default {
-  meta: {
-    name: "audit-routes",                       // required, ^[A-Za-z0-9_-]+$, must match filename
-    description: "Audit route handlers for missing auth checks",
-    whenToUse: "When auditing API routes for auth",
-    phases: ["discover", "audit", "verify", "report"],
-    arguments: { dir: { type: "string", default: "src/routes" } },
-  },
-  async run(args, ctx) {
-    ctx.setPhase("discover")
-    const found = await ctx.agent({
-      prompt: `List every .ts file under ${args.dir}. Return {files: string[]}`,
-      schema: { type: "object", required: ["files"],
-                properties: { files: { type: "array", items: { type: "string" } } } },
-      label: "discover-files",
-      effort: "high",
-    })
+	meta: {
+		name: "migrate-api",
+		description: "Migrate every use of a deprecated API to its replacement, proven by ground truth",
+		whenToUse: "When one change must land across many files and be verifiably correct",
+		phases: ["discover", "plan", "implement", "merge", "verify", "report"],
+		arguments: {
+			oldApi: { type: "string", default: "legacyFetch" },
+			newApi: { type: "string", default: "httpClient.request" },
+			dir: { type: "string", default: "src" },
+		},
+		guide: { maxLines: 30 },
+	},
+	async run(args, ctx) {
+		// ---- discover -> {files} -------------------------------------------------
+		ctx.setPhase("discover", { dir: args.dir, oldApi: args.oldApi })
+		const found = await ctx.agent({
+			prompt: `Find every file under ${args.dir} that references ${args.oldApi}. Use grep. Be exhaustive. Return {files: string[]}`,
+			schema: { type: "object", required: ["files"], properties: { files: { type: "array", items: { type: "string" } } } },
+			label: "discover-files",
+			effort: "xhigh",
+		})
+		if (!found) throw new Error("discover failed")
 
-    ctx.setPhase("audit", { files: found.data.files })   // payload is persisted + shown in dashboard
-    const audits = (await ctx.parallel(
-      found.data.files.map(file => () =>
-        ctx.agent({
-          prompt: `Audit ${file} for missing auth checks. Be exhaustive — report every suspicion. Return {file, issues: string[]}`,
-          schema: { type: "object", required: ["file", "issues"],
-                    properties: { file: { type: "string" },
-                                  issues: { type: "array", items: { type: "string" } } } },
-          label: `audit:${file}`,
-          effort: "max",
-          onError: "null",
-        })),
-    )).filter(Boolean)
+		// ---- plan -> ONE planner decides EVERYTHING (SPLIT-BRAIN + SPEC-COLLAPSE) --
+		// Design decisions are NEVER parallel and NEVER hardcoded by the workflow author.
+		ctx.setPhase("plan", { files: found.data.files })
+		const plan = await ctx.agent({
+			prompt: `You are the ONLY decision maker. Read the code and produce an ambiguity-free spec for migrating ${args.oldApi} to ${args.newApi}. Files in scope: ${JSON.stringify(found.data.files)}. Decide ALL shared conventions once (imports, error handling, naming, edge cases) and include ONE fully worked before/after example. Anything you cannot decide from the code goes in ambiguities — do NOT guess. Return {decisions: string[], workedExample: string, filesToModify: [{file, instructions}], ambiguities: string[]}`,
+			schema: { type: "object", required: ["decisions", "workedExample", "filesToModify", "ambiguities"], properties: { decisions: { type: "array", items: { type: "string" } }, workedExample: { type: "string" }, filesToModify: { type: "array", items: { type: "object", required: ["file", "instructions"], properties: { file: { type: "string" }, instructions: { type: "string" } } } }, ambiguities: { type: "array", items: { type: "string" } } } },
+			label: "planner",
+			effort: "xhigh",
+		})
 
-    // MANDATORY verification: 3 independent adversarial verifiers per claim, survive on >=2 support
-    ctx.setPhase("verify")
-    const claims = audits.flatMap(a => a.data.issues.map(issue => ({ file: a.data.file, issue })))
-    const verified = (await ctx.parallel(
-      claims.map((c, i) => () =>
-        ctx.parallel([0, 1, 2].map(k => () =>
-          ctx.agent({
-            prompt: `Adversarially verify (lens ${k}: ${["correctness", "exploitability", "reproduction"][k]}): does ${c.file} really have issue "${c.issue}"? Read the file and try to REFUTE it.`,
-            schema: { type: "object", required: ["supported", "reason"],
-                      properties: { supported: { type: "boolean" }, reason: { type: "string" } } },
-            label: `verify:${i}:${k}`,
-            effort: "max",
-          })
-        )).then(vs => ({ ...c, votes: vs.filter(Boolean).map(v => v.data) }))),
-    )).filter(Boolean)
-    const surviving = verified.filter(v => v.votes.filter(x => x.supported).length >= 2)
+		// AMBIGUITY GATE: open questions go to the HUMAN, never into parallel workers.
+		for (const a of plan.data.ambiguities) {
+			const { answer } = await ctx.question({ question: `Planner cannot decide: ${a}` })
+			plan.data.decisions.push(`RESOLVED: ${a} -> ${answer}`)
+		}
 
-    ctx.setPhase("report")
-    const critic = await ctx.agent({
-      prompt: `Completeness critic: given these confirmed findings ${JSON.stringify(surviving)}, what is MISSING? What did the audit likely overlook?`,
-      label: "completeness-critic",
-      effort: "max",
-    })
-    const report = await ctx.agent({
-      prompt: `Write a ranked report from these verified findings: ${JSON.stringify(surviving)}. Append gaps raised by the critic: ${critic.text}. Cite files.`,
-      label: "report",
-      effort: "max",
-    })
-    return { report: report.text, verified: surviving.length, rejected: verified.length - surviving.length }
-  },
+		// ---- implement: the PLAN drives the fan-out. Zero hardcoded worker agents. --
+		ctx.setPhase("implement", { decisions: plan.data.decisions, workedExample: plan.data.workedExample, filesToModify: plan.data.filesToModify })
+		const spec = ctx.getPhase("implement") // contract read back, injected VERBATIM below
+		const implSchema = { type: "object", required: ["file", "edits", "surprises", "blockers"], properties: { file: { type: "string" }, edits: { type: "array", items: { type: "object", required: ["line", "before", "after"], properties: { line: { type: "number" }, before: { type: "string" }, after: { type: "string" } } } }, surprises: { type: "array", items: { type: "string" } }, blockers: { type: "array", items: { type: "string" } } } }
+		const implWorker = (item, prefix) => ctx.agent({
+			prompt: `Migrate ${args.oldApi} to ${args.newApi} in exactly ONE file: ${item.file}. Instructions for this file: ${item.instructions}. Conventions (already decided — follow verbatim): ${JSON.stringify(spec.decisions)}. Worked example: ${spec.workedExample}. Decide nothing; if the spec is ambiguous, return the ambiguity in your output instead of choosing — put it in blockers. Touch no other file. Out-of-scope fixes only with a "// LICENSED BREAKAGE: <reason>" comment at the site. Return {file, edits: [{line, before, after}], surprises: string[], blockers: string[]}`,
+			schema: implSchema,
+			label: `${prefix}:${item.file}`,   // unique + stable -> caching and resume
+			effort: "xhigh",
+			isolation: "worktree",             // parallel agents that EDIT FILES: always isolated
+			onError: "null",
+		}).then(r => {
+			for (const s of r?.data?.surprises ?? []) if (s.trim()) try { ctx.guide.append(s) } catch {}
+			return r
+		})
+		const first = await ctx.parallel(spec.filesToModify.map(item => () => implWorker(item, "impl")))
+		// SECOND-CHANCE SWEEP: retry exactly the nulls once; what fails twice is reported, not hidden.
+		const missed = spec.filesToModify.filter((_, i) => !first[i])
+		const second = await ctx.parallel(missed.map(item => () => implWorker(item, "impl-retry")))
+		const done = [...first.filter(Boolean), ...second.filter(Boolean)]
+		const failedTwice = spec.filesToModify.map(x => x.file).filter(f => !done.some(r => r.data.file === f))
+		const blockers = done.flatMap(r => r.data.blockers.map(b => ({ file: r.data.file, blocker: b })))
+
+		// GUIDE CURATION near the cap — compact, never silently drop.
+		if (ctx.guide.lines().length > 25) {
+			const cur = await ctx.agent({
+				prompt: `Compact these field-guide lines. Merge duplicates, keep every distinct fact: ${JSON.stringify(ctx.guide.lines())}. Return {lines: string[]}`,
+				schema: { type: "object", required: ["lines"], properties: { lines: { type: "array", items: { type: "string" } } } },
+				label: "guide-curator", effort: "xhigh",
+			})
+			if (cur) ctx.guide.set(cur.data.lines)
+		}
+
+		// ---- merge: SEQUENTIAL, explicit, conflicts to a neutral merge agent ------
+		const baseRef = (await ctx.shell("git rev-parse HEAD")).output.trim()
+		ctx.setPhase("merge", { files: done.map(r => r.data.file), baseRef })
+		for (const r of done) await ctx.mergeWorktree(r, { onConflict: "agent" }) // NEVER parallel; NEVER silent auto-merge
+
+		// ---- verify + fix: LOOP-UNTIL-DRY against REALITY, never self-reports -----
+		ctx.setPhase("verify", { files: done.map(r => r.data.file), baseRef })
+		const NO_INVENT = "Do not invent problems merely to appear critical. Every concern must be tied to a plausible scenario, concrete failure mode, or identifiable tradeoff."
+		const VOTE = { type: "object", required: ["supported", "reason"], properties: { supported: { type: "boolean" }, reason: { type: "string" }, evidence: { type: "string" } } }
+		let round = 0, dry = 0, lastChecks = []
+		while (round < 5 && dry < 2) {
+			round++
+			// GROUND TRUTH FIRST. Agents can lie; the compiler cannot.
+			const type = await ctx.shell("bun run typecheck", { timeout: 300000 })
+			// Lenses read the MERGED TREE and REAL DIFFS — a worker's {file, status, notes} is not evidence.
+			lastChecks = (await ctx.parallel(
+				spec.filesToModify.filter(x => !failedTwice.includes(x.file)).map((item, i) => async () => {
+					const diff = await ctx.shell(`git diff ${baseRef} -- ${item.file}`)
+					const votes = await ctx.parallel([
+						() => ctx.agent({ prompt: `Read the CURRENT content of ${item.file} and try to REFUTE that these instructions were fully implemented: ${item.instructions}. Conventions: ${JSON.stringify(spec.decisions)}. supported=true only if the implementation survives your attack. ${NO_INVENT} Return {supported, reason, evidence}`, schema: VOTE, label: `verify:r${round}:${i}:artifact`, effort: "xhigh" }),
+						() => ctx.agent({ prompt: `SPEC-FIDELITY. Real diff for ${item.file}: ${diff.output}. Instructions were: ${item.instructions}. Refute that the diff does ONLY what the instructions require — flag anything extra, missing, or unlicensed. ${NO_INVENT} Return {supported, reason, evidence}`, schema: VOTE, label: `verify:r${round}:${i}:spec-fidelity`, effort: "xhigh" }),
+						() => ctx.agent({ prompt: `Adversarial reviewer: prove the change to ${item.file} BREAKS one of its callers or an edge case. Find callers with grep and read them. ${NO_INVENT} Return {supported, reason, evidence}`, schema: VOTE, label: `verify:r${round}:${i}:adversarial`, effort: "xhigh" }),
+					])
+					const vs = votes.filter(Boolean).map(v => v.data)
+					return { item, votes: vs, ok: vs.filter(v => v.supported).length >= 2 }
+				})
+			)).filter(Boolean)
+			const failing = lastChecks.filter(c => !c.ok)
+			if (type.exitCode === 0 && failing.length === 0) { dry++; continue } // dry round
+			dry = 0
+			// Fix round: driven by CONCRETE failures (compiler output + objections), still isolated.
+			const fixes = (await ctx.parallel(
+				failing.map(c => () => ctx.agent({
+					prompt: `Fix ${c.item.file}. Typecheck output: ${type.output}. Verifier objections: ${JSON.stringify(c.votes.filter(v => !v.supported))}. Original instructions: ${c.item.instructions}. Conventions: ${JSON.stringify(spec.decisions)}. Decide nothing; if the spec is ambiguous, return the ambiguity in your output instead of choosing. Return {file, edits: [{line, before, after}], surprises: string[], blockers: string[]}`,
+					schema: implSchema, label: `fix:r${round}:${c.item.file}`, effort: "xhigh", isolation: "worktree", onError: "null",
+				}))
+			)).filter(Boolean)
+			if (type.exitCode !== 0 && failing.length === 0) {
+				const tfix = await ctx.agent({ prompt: `The typecheck fails after this migration. Output: ${type.output}. Conventions: ${JSON.stringify(spec.decisions)}. Fix ONLY what the errors require. Return {file, edits: [{line, before, after}], surprises: string[], blockers: string[]}`, schema: implSchema, label: `fix:r${round}:typecheck`, effort: "xhigh", isolation: "worktree", onError: "null" })
+				if (tfix) fixes.push(tfix)
+			}
+			for (const r of fixes) await ctx.mergeWorktree(r, { onConflict: "agent" })
+		}
+
+		// ---- report: critic first, then HONEST accounting. NOT DONE is said out loud.
+		ctx.setPhase("report", { rounds: round, dry: dry >= 2, failedTwice, blockers })
+		const critic = await ctx.agent({
+			prompt: `Completeness critic. Planned files: ${JSON.stringify(spec.filesToModify.map(x => x.file))}. Field guide: ${JSON.stringify(ctx.guide.lines())}. Failed twice: ${JSON.stringify(failedTwice)}. Blockers: ${JSON.stringify(blockers)}. What is MISSING — files the plan overlooked, callers not migrated, tests or docs not updated?`,
+			label: "completeness-critic", effort: "xhigh",
+		})
+		const report = await ctx.agent({
+			prompt: `Write the final migration report. Verified rounds: ${round}, converged: ${dry >= 2}. Surviving verifications: ${JSON.stringify(lastChecks.map(c => ({ file: c.item.file, ok: c.ok })))}. NOT DONE — state these plainly, never imply completion: ${JSON.stringify({ failedTwice, blockers, converged: dry >= 2 })}. Critic gaps: ${critic.text}. Cite files and evidence.`,
+			label: "report", effort: "xhigh",
+		})
+		return { report: report.text, migrated: done.length, notDone: failedTwice, blockers, converged: dry >= 2 }
+	},
 }
 
+# WHAT EXAMPLE 2 DEMONSTRATES (find each in the code before writing your own)
+- Plan drives fan-out: `spec.filesToModify.map(...)` — worker agents are DATA, not hardcoded code.
+- Split-brain: planner decides once; workers get decisions VERBATIM + "Decide nothing" line.
+- Ambiguity gate: planner ambiguities -> ctx.question(HUMAN), worker ambiguities -> blockers, never guessed.
+- Worktree isolation on every parallel writer (impl, retry, fix) + SEQUENTIAL mergeWorktree with onConflict:"agent".
+- Ground truth: ctx.shell typecheck gates every round — verification of self-reports is FORBIDDEN; lenses read merged files and real `git diff`.
+- Second-chance sweep (impl-retry), loop-until-dry (2 clean rounds), guide curation, licensed breakage, completeness critic, honest NOT DONE in the report and return value.
+
 # HARD RULES
-- meta is statically analyzable: literal values only (strings, numbers, booleans, arrays, objects).
-  Computed values in meta fail parsing.
-- meta.phases must exactly match every setPhase() call. An unknown phase title THROWS
-  InvalidPhaseError at runtime (strict default; set meta.phaseValidation: "warn" to relax).
-- Determinism: Date.now(), Math.random(), and no-arg new Date() are REJECTED by the source lint —
-  they break resume caching. Pass seeds/timestamps via args or compute them inside an agent.
+- meta is statically analyzable: literal values only. Computed values in meta fail parsing.
+- meta.phases must exactly match every setPhase() call; unknown titles THROW InvalidPhaseError
+  (set meta.phaseValidation: "warn" to relax).
+- setPhase() ALWAYS carries a payload — the data contract for the next phase. Never empty.
+- Later phases read earlier data with ctx.getPhase()/getAllPhases() and inject it verbatim into
+  prompts. Never "based on previous findings" without the findings.
+- Determinism: Date.now(), Math.random(), no-arg new Date() are REJECTED by the source lint —
+  they break resume caching. Pass seeds/timestamps via args or compute inside an agent.
   Escape hatch: meta.allowNondeterminism: true.
-- The script itself cannot touch fs/network/process (lint-banned: fs, child_process, net, http,
-  fetch, Bun.spawn, process.env, ...). Agents, ctx.shell, and ctx.tool do that work.
-- Global style (bare top-level `await agent({...})`, `parallel`, ...) is supported with identical
-  signatures, but prefer the `ctx.*` style for anything nontrivial.
+- The script cannot touch fs/network/process (lint-banned). Agents, ctx.shell, ctx.tool do that.
+- Prefer ctx.* style; bare global style exists with identical signatures.
 
 # CONTEXT API
-- ctx.setPhase(name, data?): advance the phase. `data` is persisted (phase_data) and shown in the
-  dashboard. Returns the previous phase's data. Payloads are frozen — treat them as immutable.
-- ctx.getPhase(name) / ctx.getAllPhases(): read any phase's stored payload.
-- ctx.state: persisted key-value store for cross-phase counters and accumulation.
+- ctx.setPhase(name, data?): advance phase; data persisted + frozen; returns previous phase data.
+- ctx.getPhase(name) / ctx.getAllPhases(): frozen copies of stored payloads; survive resume.
+- ctx.state: persisted key-value store (set/get/toObject) for cross-agent accumulation.
 - ctx.agent({prompt, label, schema?, model?, effort?, agentType?, phase?, isolation?, onError?})
-  → {text, data}. `schema` is standard JSON Schema; output is extracted, validated with ajv, and
-  automatically repaired via a follow-up message before StructuredOutputError is thrown.
-  effort: "low"|"medium"|"high"|"xhigh"|"max" — default to "max" for thinking work, "high" minimum.
-  onError: "null" returns null instead of throwing.
+  -> {text, data}. schema is JSON Schema; output validated with ajv and auto-repaired once before
+  StructuredOutputError. onError: "null" returns null instead of throwing.
   ALWAYS give a unique, stable label (e.g. `verify:${id}`) — it drives caching and skip.
-- ctx.parallel(tasks, {concurrencyLimit?}) → (T|null)[]: fan-out with barrier; failed tasks yield
-  null — always .filter(Boolean). Max 4096 items per batch. Omit concurrencyLimit to let the
-  engine run as wide as the machine allows.
-- ctx.pipeline(items, ...stages, {concurrencyLimit?}): chained stages, each stage is
-  (prevResult, originalItem, index) => Promise<next>.
-- ctx.workflow(name, args?): run a child workflow inline; child agents/logs are attributed to the
-  child structurally in the dashboard.
-- ctx.shell(cmd, {timeout = 60000, cwd?}) → {output, exitCode}.
-- ctx.tool(name, args) → real tool execution (read, grep, glob, ...) through the same registry as
-  normal sessions, with subagent permissions. Optionally restrict via meta.tools: string[].
-- ctx.question({question, options?, timeout = 600000}) → {answer}: pauses the run for a human
-  answer (⏳ in dashboard; answered via the answer action).
-- ctx.log(msg): narrator line in the dashboard, interleaved chronologically with agents.
-- ctx.budget: {total, spent(), remaining(), tokensTotal, tokensSpent(), tokensRemaining()} —
-  informational tracking. total/tokensTotal are Infinity unless the user explicitly set a cap.
-- isolation: "worktree" on an agent runs it in its own git worktree/branch (wf/<run>/<label>);
-  the result reports {branch, changedFiles}; the main tree is untouched. Merge explicitly with
-  ctx.mergeWorktree(result) — it throws a structured error on conflict. Use it whenever parallel
-  agents edit files; correctness over disk cost.
+- ctx.parallel(tasks, {concurrencyLimit?}) -> (T|null)[]: fan-out with barrier; failed tasks are
+  null — always .filter(Boolean). Max 4096 per batch. Omit concurrencyLimit to run full width.
+- ctx.pipeline(items, ...stages): chained stages (prevResult, originalItem, index) => Promise.
+- ctx.workflow(name, args?): child workflow inline; attributed structurally in the dashboard.
+- ctx.shell(cmd, {timeout = 60000, cwd?}) -> {output, exitCode}.
+- ctx.tool(name, args): real tool execution (read, grep, glob, ...) with subagent permissions;
+  restrict via meta.tools: string[].
+- ctx.question({question, options?, timeout = 600000}) -> {answer}: pause for a human answer.
+- ctx.log(msg): narrator line in the dashboard.
+- ctx.guide: run-scoped field guide, auto-injected into every later agent prompt (not part of
+  the cache key). append(line) (throws GuideFullError past meta.guide.maxLines, default 50),
+  lines(), set(lines) for curation. Workers return surprises; script appends them; run a
+  curation agent to compact when near the cap.
+- ctx.budget: informational; total/tokensTotal are Infinity unless the user set a cap.
+- isolation: "worktree": agent runs on its own branch wf/<run>/<label>; result reports
+  {branch, changedFiles}; main tree untouched. Merge explicitly with ctx.mergeWorktree(result)
+  — throws structured conflict error; opts { onConflict: "agent" } spawns a neutral merge agent
+  that preserves BOTH intents (still errors if unresolvable, never silently picks a side).
+  Use worktrees whenever parallel agents edit files.
 
 # TOOL ACTIONS
-- list: all discovered workflows (builtins + project + global) with name, description, valid, error.
-  Always call first.
-- read: get a workflow's source by name. Use before writing a similar one.
+- list: all workflows (builtins + project + global) with name, description, valid, error. Call first.
+- read: a workflow's source by name. Use before writing a similar one.
 - start: run by name with {args?, resume_of?, invalidate_agents?, budget?}. Returns run ID
-  immediately. Also accepts inline `source` for ephemeral runs. Args are coerced per
-  meta.arguments. Do NOT pass budget unless the user explicitly requested a cap.
-- inspect: full run JSON — status, current_phase, phase_data, logs, agents (label, status, cost,
-  cached, output...), result, pending_question.
-- wait: block until the run finishes or timeout. Use sparingly; prefer inspect polling.
+  immediately. Inline `source` for ephemeral runs. No budget unless the user asked for a cap.
+- inspect: full run JSON — status, current_phase, phase_data, logs, agents, result, pending_question.
+- wait: block until finish/timeout. Use sparingly; prefer inspect polling.
 - cancel: cancel a running run.
-- create: save source to disk. scope "project" → .opencode/workflows/<name>.ts, "global" →
+- create: save to disk. scope "project" -> .opencode/workflows/<name>.ts, "global" ->
   <global-config>/workflows/<name>.ts. Never overwrites.
 
 # RESUME
-- Resume: start with resume_of: "<runId>". Completed agents replay instantly from cache when their
-  key (prompt + label + agent + model + effort + schema + phase) is unchanged — reordering or
-  inserting calls is safe; only genuinely new/changed agents re-run. Cached nodes show cached:true
-  and cost 0. Force re-runs with invalidate_agents (labels or keys) or ctx.invalidatePhase(name).
+- start with resume_of: "<runId>". Completed agents replay instantly from cache when their key
+  (prompt + label + agent + model + effort + schema + phase) is unchanged — reordering/inserting
+  is safe; only new/changed agents re-run (cached:true, cost 0).
+- Force re-runs with invalidate_agents (labels or keys) or ctx.invalidatePhase(name).
 - Resumable statuses: paused, interrupted, failed, completed.
-- If the user explicitly set a budget and BudgetExceededError fires, resume with resume_of after
-  raising/removing the cap — all completed work replays free from cache.
+- If a user-set budget fired BudgetExceededError: resume after raising the cap; completed work
+  replays free.
 
-# TEMPLATE-LITERAL TRAP (the #1 cause of syntax errors — READ THIS)
-Prompts are backtick strings. Every ${...} inside them is evaluated when the FILE loads, not sent
-to the subagent.
-1. Interpolate ONLY variables that exist in run() scope: `${args.dir}`, `${file}`, `${c.issue}`.
+# TEMPLATE-LITERAL TRAP (the #1 cause of syntax errors)
+Prompts are backtick strings. Every ${...} inside them is evaluated when the FILE loads.
+1. Interpolate ONLY variables that exist in run() scope: ${args.dir}, ${file}, ${c.issue}.
 2. Example code inside a prompt must be escaped: write \${notARealVariable} so the subagent
-   receives the literal ${...}. Or put generated-code samples in single-quoted strings.
-3. `${x or y}` is not JavaScript. Write `${x} or y`, or `${x || "y"}`.
-4. Validate before starting: `bun --check <file>.ts` must exit 0. The engine refuses to run files
-   with syntax errors and reports line:col plus an escaping hint.
+   receives the literal text. Or put generated-code samples in single-quoted strings.
+3. ${x or y} is not JavaScript. Write ${x} followed by the word, or ${x || "y"}.
+4. Validate before starting: `bun --check <file>.ts` must exit 0. The engine refuses files with
+   syntax errors and reports line:col plus an escaping hint.
 
-# QUALITY PATTERNS (use these by default, not as extras)
-- Adversarial verify: ≥3 independent agents try to REFUTE each finding; survive on ≥2 support.
-- Perspective-diverse verify: each verifier gets a distinct lens (correctness, security, perf,
-  reproducibility).
-- Judge panel: N independent solutions from different angles (MVP-first, risk-first, perf-first),
-  then a judge agent scores and synthesizes the best of all.
-- Loop-until-dry: keep discovering/fixing until 2 consecutive rounds find nothing new.
-- Multi-modal sweep: parallel agents search the same target by-file, by-content, by-entity,
-  by-history simultaneously.
-- Completeness critic: final agent asks "what's missing?" before every report.
-Data flows via closure variables and setPhase payloads — chain them explicitly, as in the example.
+# QUALITY PATTERNS (defaults, not extras — full runnable code in docs/workflows-patterns.md)
+Read docs/workflows-patterns.md before writing a nontrivial workflow. Apply by default:
+- DECORRELATED REVIEW LENSES: >=3 verifiers differing in INPUT (artifact / output-only /
+  adversarial persona or different model); survive on >=2. Demonstrated in the example above.
+- SPLIT-BRAIN RULE: one planner decides all shared conventions once; workers receive them
+  verbatim and decide nothing.
+- SPEC-COLLAPSE: planner at max effort emits an ambiguity-free spec + worked example; workers
+  get only their slice + the example.
+- FIELD GUIDE: workers return surprises; script appends to ctx.guide; curation agent near cap.
+- SECOND-CHANCE SWEEP: onError:"null" + collect nulls + one retry pass (cache makes it cheap);
+  report what failed twice.
+- LOOP-UNTIL-DRY: repeat discover/fix rounds until 2 consecutive rounds find nothing new.
+- MULTI-MODAL SWEEP: parallel agents search the same target by different methods (name, content,
+  entity, history).
+- MEGAFILE GUARD + LICENSED BREAKAGE: workers flag bloated files for a decomposition agent;
+  out-of-scope fixes only with a "// LICENSED BREAKAGE: <reason>" comment at the site.
+- COMPLETENESS CRITIC / JUDGE PANEL: always before the final report.
 
-# TROUBLESHOOTING (auto-fix, in order)
-1. "Workflow syntax error <file> line:col": almost always an unescaped ${} in a prompt. Read the
-   file, apply the trap rules above, `bun --check`, retry start.
-2. "Cannot find module '.cache-*.ts'": temp-import issue. First run `bun --check` (hidden syntax
-   error is the usual real cause). If it passes, it's a transient file lock (Windows AV): the
-   engine retries automatically; if it persists, delete `.opencode/workflows/.cache-*` orphans
-   and retry.
-3. "Missing meta export" / "missing run function": file must export default {meta, run} (or
-   `export const meta` + `export default {run}`), and meta must be literal-only.
-4. InvalidPhaseError: a setPhase() title doesn't match meta.phases — fix the typo or add the phase.
-5. Determinism lint error: remove Date.now()/Math.random()/new Date(), pass values via args, or
-   set meta.allowNondeterminism: true if truly needed.
+# TROUBLESHOOTING (in order)
+1. "Workflow syntax error <file> line:col": almost always an unescaped ${} in a prompt. Apply
+   the trap rules, bun --check, retry.
+2. "Cannot find module '.cache-*.ts'": run bun --check first (hidden syntax error is usual);
+   if it passes, transient Windows AV lock — the engine retries automatically; if it persists, delete .opencode/workflows/.cache-* orphans. The import logic has built-in retries for cache lock.
+3. "Missing meta export" / "missing run function": file must export default {meta, run}; meta
+   literal-only.
+4. InvalidPhaseError: a setPhase() title doesn't match meta.phases — fix the typo or add it.
+5. Determinism lint error: remove Date.now()/Math.random()/new Date(), pass via args, or set
+   meta.allowNondeterminism: true.
 
 # CHECKLIST BEFORE create/start
-- [ ] `bun --check <file>.ts` exits 0
-- [ ] meta.phases exactly matches every setPhase() call
+- [ ] Design pass done: atomic unit chosen, phase data contracts written, parallel vs sequential
+      justified, verify phase designed with the work phase, done-condition defined
+- [ ] bun --check <file>.ts exits 0
+- [ ] meta.phases exactly matches every setPhase() call; every setPhase has a payload
+- [ ] Every later phase injects getPhase(prev) data verbatim into its prompts
 - [ ] Only run()-scope variables are unescaped ${} in prompts
 - [ ] Every agent has a unique, stable label
-- [ ] parallel/pipeline results are .filter(Boolean)'d
-- [ ] No Date.now()/Math.random() in the script
-- [ ] Every finding passes through ≥3 adversarial verifiers
-- [ ] effort is "max" on all reasoning/verification/synthesis agents
-- [ ] A completeness critic or judge panel runs before the final report
-- [ ] No budget passed (unless the user explicitly asked for a cap)
+- [ ] parallel/pipeline results are .filter(Boolean)'d; second-chance sweep for nulls
+- [ ] No Date.now()/Math.random()/no-arg new Date() in the script
+- [ ] Every finding passes >=3 decorrelated verifiers with the no-invented-problems line
+- [ ] Workers return evidence (line + quote) and surprises; guide wired for >2-phase workflows
+- [ ] All parallel worker prompts contain "Decide nothing; if the spec is ambiguous, return the
+      ambiguity in your output instead of choosing."
+- [ ] Effort is the maximum your model supports on all reasoning/verification/synthesis agents
+- [ ] Completeness critic or judge panel before the final report
+- [ ] No budget passed unless the user explicitly asked for a cap
+- [ ] Worktree isolation on any parallel agents that edit files
+- [ ] AFTER start: stop, poll inspect, do not do the workflow's job yourself

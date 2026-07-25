@@ -74,14 +74,16 @@ export type ToolPermissionInfo = {
 }
 
 export type ToolProps<T = Tool.Info> = {
-  input: Partial<Tool.InferParameters<T>>
-  metadata: Partial<Tool.InferMetadata<T>>
+  // Display-only: input comes from LLM (dynamic). Using Record<string, any> avoids
+  // fragile conditional type inference for Effect & {id} intersection.
+  input: Record<string, any>
+  metadata: Record<string, any>
   frame: ToolFrame
 }
 
 type ToolPermissionProps<T = Tool.Info> = {
-  input: Partial<Tool.InferParameters<T>>
-  metadata: Partial<Tool.InferMetadata<T>>
+  input: Record<string, any>
+  metadata: Record<string, any>
   patterns: string[]
 }
 

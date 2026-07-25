@@ -9,6 +9,7 @@ import { MCP } from "../mcp"
 import { Skill } from "../skill"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_GOAL from "./template/goal.txt"
+import PROMPT_GOALR from "./template/goalr.txt"
 import PROMPT_LOOP from "./template/loop.txt"
 import PROMPT_REVIEW from "./template/review.txt"
 import { LegacyEvent } from "@opencode-ai/schema/legacy-event"
@@ -48,6 +49,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   GOAL: "goal",
+  GOALR: "goalr",
   LOOP: "loop",
   REVIEW: "review",
 } as const
@@ -96,6 +98,15 @@ const layer = Layer.effect(
         source: "command",
         get template() {
           return PROMPT_GOAL
+        },
+        hints: ["$ARGUMENTS"],
+      }
+      commands[Default.GOALR] = {
+        name: Default.GOALR,
+        description: "set or update the session goal with reviewer loop",
+        source: "command",
+        get template() {
+          return PROMPT_GOALR
         },
         hints: ["$ARGUMENTS"],
       }

@@ -58,6 +58,10 @@ export const restorePromptModel = (local: ModelSelection, prompt: PromptState) =
   )
     return true
   local.model.set({ providerID: model.providerID, modelID: model.modelID })
-  local.model.variant.set(model.variant ?? undefined)
+  // Only set variant when explicitly present - don't clear global per-model variant
+  // when entering a subagent/workflow that has no variant
+  if (model.variant) {
+    local.model.variant.set(model.variant ?? undefined)
+  }
   return true
 }

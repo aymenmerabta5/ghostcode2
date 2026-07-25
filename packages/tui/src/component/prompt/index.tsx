@@ -333,7 +333,11 @@ export function Prompt(props: PromptProps) {
         if (!args.agent) local.agent.set(msg.agent)
         if (msg.model) {
           local.model.set(msg.model)
-          local.model.variant.set(msg.model.variant)
+          // Only set variant when explicitly present - don't clear global per-model variant
+          // when entering a subagent/workflow that has no variant, otherwise parent loses effort
+          if (msg.model.variant) {
+            local.model.variant.set(msg.model.variant)
+          }
         }
       }
     }
@@ -439,7 +443,7 @@ export function Prompt(props: PromptProps) {
               }
             } else {
               // Main view: abort main only, keep children alive (promote to background)
-              // Invariant: interrupting main NEVER stops subagents unless Shift+A
+              // Invariant: interrupting main NEVER stops subagents unless Alt+A
               void sdk.client.session.abort({
                 sessionID: props.sessionID,
               })
@@ -527,7 +531,32 @@ export function Prompt(props: PromptProps) {
             void sdk.client.session.abort({ sessionID: id }).catch(() => {})
           }
 
-          // Also cancel shell background jobs (dev servers, etc.)
+          toast.show({
+            message: `Interrupted all: ${toAbort.size} session(s)`,
+            variant: "info",
+            duration: 3000,
+          })
+
+          setStore("interruptAll", 0)
+          setStore("interrupt", 0)
+
+          // If viewing child, return to root after kill-all
+          if (props.sessionID !== rootID) {
+            route.navigate({ type: "session", sessionID: rootID })
+          }
+
+          dialog.clear()
+        },
+      },
+      {
+        title: "Interrupt background jobs",
+        name: "session.interrupt.background",
+        category: "Session",
+        hidden: true,
+        run: () => {
+          if (auto()?.visible) return
+          if (!input.focused) return
+
           void (async () => {
             try {
               const sdkAny = sdk.client as any
@@ -547,19 +576,10 @@ export function Prompt(props: PromptProps) {
           })()
 
           toast.show({
-            message: `Interrupted all: ${toAbort.size} session(s) + background jobs`,
+            message: "Interrupted background jobs",
             variant: "info",
             duration: 3000,
           })
-
-          setStore("interruptAll", 0)
-          setStore("interrupt", 0)
-
-          // If viewing child, return to root after kill-all
-          if (props.sessionID !== rootID) {
-            route.navigate({ type: "session", sessionID: rootID })
-          }
-
           dialog.clear()
         },
       },
@@ -718,6 +738,7 @@ export function Prompt(props: PromptProps) {
       "prompt.skills",
       "session.interrupt",
       "session.interrupt.all",
+      "session.interrupt.background",
       "workspace.set",
       "session.move",
     ]),
@@ -1856,10 +1877,13 @@ export function Prompt(props: PromptProps) {
                 </text>
                 <text fg={store.interruptAll > 0 ? theme.primary : theme.text}>
                   {" "}
-                  shift+a{" "}
+                  alt+a{" "}
                   <span style={{ fg: store.interruptAll > 0 ? theme.primary : theme.textMuted }}>
-                    {store.interruptAll > 0 ? "again to kill all" : "kill all"}
+                    {store.interruptAll > 0 ? "again to interrupt sessions" : "interrupt sessions"}
                   </span>
+                </text>
+                <text fg={theme.text}>
+                  {" "}alt+b <span style={{ fg: theme.textMuted }}>interrupt background</span>
                 </text>
               </box>
             </Match>

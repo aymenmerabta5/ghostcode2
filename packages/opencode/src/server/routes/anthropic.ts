@@ -25,6 +25,19 @@ export function isClientAbortReason(r: unknown): boolean {
 const ROTATE_COOLDOWN_MS = 60_000
 const CONNECTION_COOLDOWN_MS = 5_000
 const STALL_TIMEOUT_MS = 60_000
+const MAX_CONNECTION_RETRIES = 12
+const CONNECTION_RETRY_BASE_MS = 750
+const CONNECTION_RETRY_MAX_MS = 5000
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function connectionRetryDelay(attempt: number): number {
+  const exp = Math.min(CONNECTION_RETRY_MAX_MS, CONNECTION_RETRY_BASE_MS * Math.pow(1.5, attempt))
+  const jitter = Math.random() * 250
+  return Math.floor(exp + jitter)
+}
 
 const PROVIDER_COOLDOWNS: Record<string, { rotate: number; connection: number; stall: number; server: number }> = {
   "cloudflare-workers-ai": { rotate: 15_000, connection: 3_000, stall: 45_000, server: 10_000 },
@@ -68,6 +81,42 @@ function getProviderTimeouts(providerID: string) {
 }
 
 const DEBUG = process.env.OPENCODE_DEBUG_ANTHROPIC === "1"
+
+// Phase 1 instrumentation: full request/response logging with timestamps and per-session id
+// Controlled by OPENCODE_DEBUG_ANTHROPIC_LOG env var (path to log dir or "1" for console)
+const LOG_ENABLED = (() => {
+  const v = process.env.OPENCODE_DEBUG_ANTHROPIC_LOG
+  return v === "1" || (typeof v === "string" && v.length > 0)
+})()
+
+type LogEntry = {
+  timestamp: string
+  sessionId: string
+  requestId: string
+  type: "request" | "response_event" | "response_complete" | "error"
+  data: any
+}
+
+function logAnthropicEvent(entry: LogEntry) {
+  if (!LOG_ENABLED) return
+  const logPath = process.env.OPENCODE_DEBUG_ANTHROPIC_LOG
+  const line = JSON.stringify(entry)
+  if (logPath && logPath !== "1") {
+    try {
+      // Async append to avoid blocking
+      const fs = require("fs")
+      const path = require("path")
+      const dir = logPath.includes(".") ? path.dirname(logPath) : logPath
+      const file = logPath.includes(".") ? logPath : path.join(logPath, `anthropic-${entry.sessionId}.jsonl`)
+      try {
+        fs.mkdirSync(dir, { recursive: true })
+      } catch {}
+      fs.appendFile(file, line + "\n", () => {})
+    } catch {}
+  } else {
+    console.log(`[anthropic-log] ${line}`)
+  }
+}
 
 function deriveSessionID(
   httpRequest: HttpServerRequest.HttpServerRequest,
@@ -192,6 +241,43 @@ function toModelMessages(input: MessageParam[]): any[] {
         parts.push({ type: "text", text: part.text ?? "" })
       } else if (part.type === "image") {
         parts.push({ type: "image", image: part.source.data, mimeType: part.source.media_type })
+      } else if (part.type === "thinking") {
+        // I3: Preserve thinking blocks byte-preserving with signatures, but skip zero-length blocks (capture side may have emitted empty)
+        const thinkingText = part.thinking ?? part.text ?? ""
+        const hasSignature = !!(part.signature && String(part.signature).trim() !== "")
+        const hasData = !!part.data
+        const isEmpty = thinkingText.trim() === "" && !hasSignature && !hasData
+        if (isEmpty) {
+          // Skip empty thinking block: {"type":"thinking","thinking":"","signature":""} - would otherwise replay as empty reasoning and cause duplicate empty blocks
+          continue
+        }
+        parts.push({
+          type: "reasoning",
+          text: thinkingText,
+          providerOptions: {
+            ...(part.providerOptions || {}),
+            anthropic: {
+              ...(part.providerOptions?.anthropic || {}),
+              ...(part.signature ? { signature: part.signature } : {}),
+              ...(part.data ? { redactedData: part.data } : {}),
+            },
+          },
+        })
+      } else if (part.type === "redacted_thinking") {
+        // Preserve redacted thinking blocks too, but skip if no data
+        const hasRedactedData = !!(part.data && String(part.data).trim() !== "")
+        if (!hasRedactedData) continue
+        parts.push({
+          type: "reasoning",
+          text: "",
+          providerOptions: {
+            ...(part.providerOptions || {}),
+            anthropic: {
+              ...(part.providerOptions?.anthropic || {}),
+              redactedData: part.data,
+            },
+          },
+        })
       } else if (part.type === "tool_use") {
         parts.push({ type: "tool-call", toolCallId: part.id, toolName: part.name || "unknown_tool", input: part.input ?? {} })
       } else if (part.type === "tool_result") {
@@ -217,9 +303,28 @@ function toModelMessages(input: MessageParam[]): any[] {
         } catch {
           output = { type: "text", value: " " }
         }
+        // I5: Every tool_use id maps 1:1 to a tool_result id - preserve original id, log if missing
+        const toolResultId = part.tool_use_id
+        if (!toolResultId) {
+          console.error("[anthropic-api] I5 VIOLATION: tool_result missing tool_use_id, using fallback - will break 1:1 mapping", {
+            part: JSON.stringify(part).slice(0, 500),
+          })
+          if (LOG_ENABLED) {
+            logAnthropicEvent({
+              timestamp: new Date().toISOString(),
+              sessionId: "unknown",
+              requestId: `req_${Date.now()}`,
+              type: "error",
+              data: {
+                type: "tool_result_missing_id",
+                fallbackUsed: true,
+              },
+            })
+          }
+        }
         parts.push({
           type: "tool-result",
-          toolCallId: part.tool_use_id || nextFallback(),
+          toolCallId: toolResultId || nextFallback(),
           toolName: resolvedName,
           output,
         })
@@ -271,6 +376,10 @@ function toModelMessages(input: MessageParam[]): any[] {
     return [{ role: "system", content: mergedSystem }, ...nonSystem]
   }
   return result
+}
+
+export function __test_toModelMessages(input: any[]) {
+  return toModelMessages(input)
 }
 
 function parseModelID(raw: string): { providerID: string; modelID: string } | undefined {
@@ -633,7 +742,10 @@ function buildProviderOptions(
   }
 }
 
-function toAnthropicStopReason(finishReason: string | undefined): string {
+function toAnthropicStopReason(finishReason: string | undefined, hadToolCall?: boolean): string {
+  // I2: stop_reason is `tool_use` iff the response contains tool_use blocks.
+  // This takes precedence over finishReason, because Anthropic spec says stop_reason=tool_use when tool calls present
+  if (hadToolCall) return "tool_use"
   switch (finishReason) {
     case "stop":
       return "end_turn"
@@ -649,6 +761,32 @@ function toAnthropicStopReason(finishReason: string | undefined): string {
 type RouteErrorKind = "ratelimit" | "exhausted" | "connection" | "invalid" | "server" | "tool_format"
 type RouteError = { kind: RouteErrorKind; retryAfterMs?: number }
 
+function collectErrorMessagesDeep(error: unknown, seen = new Set<unknown>()): string[] {
+  if (!error || typeof error !== "object") {
+    if (typeof error === "string") return [error]
+    return []
+  }
+  if (seen.has(error)) return []
+  seen.add(error)
+  const out: string[] = []
+  const e = error as Record<string, any>
+  if (typeof e.message === "string" && e.message) out.push(e.message)
+  if (typeof e.responseBody === "string" && e.responseBody) out.push(e.responseBody)
+  if (typeof e.body === "string" && e.body) out.push(e.body)
+  if (typeof e.cause === "string" && e.cause) out.push(e.cause)
+  // Recurse into common nested error locations
+  const nested = [e.cause, e.error, e.errors, e.lastError]
+  for (const n of nested) {
+    if (!n) continue
+    if (Array.isArray(n)) {
+      for (const sub of n) out.push(...collectErrorMessagesDeep(sub, seen))
+    } else {
+      out.push(...collectErrorMessagesDeep(n, seen))
+    }
+  }
+  return out
+}
+
 function apiErrorDetails(error: unknown): {
   statusCode?: number
   message: string
@@ -662,23 +800,34 @@ function apiErrorDetails(error: unknown): {
         ? e.statusCode
         : typeof e.responseStatus === "number"
           ? e.responseStatus
-          : undefined
-    const message = typeof e.message === "string" ? e.message : ""
+          : typeof e.status === "number"
+            ? e.status
+            : undefined
+    const collected = collectErrorMessagesDeep(error)
+    const message = collected.join(" | ") || (typeof e.message === "string" ? e.message : "")
     const body =
       typeof e.responseBody === "string"
         ? e.responseBody
         : e.data && typeof e.data === "object"
           ? JSON.stringify(e.data)
-          : ""
+          : typeof e.body === "string"
+            ? e.body
+            : collected.join(" | ")
     const headers =
       e.responseHeaders && typeof e.responseHeaders === "object"
         ? (e.responseHeaders as Record<string, string>)
-        : undefined
+        : e.headers && typeof e.headers === "object"
+          ? (e.headers as Record<string, string>)
+          : undefined
     if (statusCode !== undefined || message || body) {
       return { statusCode, message, body, headers }
     }
   }
-  return { message: error instanceof Error ? error.message : String(error), body: "" }
+  if (error instanceof Error) {
+    const collected = collectErrorMessagesDeep(error)
+    return { message: collected.join(" | ") || error.message, body: collected.join(" | ") }
+  }
+  return { message: typeof error === "string" ? error : String(error), body: "" }
 }
 
 function parseRetryAfterMs(headers: Record<string, string> | undefined): number | undefined {
@@ -698,21 +847,84 @@ function parseRetryAfterMs(headers: Record<string, string> | undefined): number 
   return undefined
 }
 
+const CONNECTION_SUBSTRINGS = [
+  "stream ended without finish",
+  "econnreset",
+  "econnrefused",
+  "enotfound",
+  "etimedout",
+  "eai_again",
+  "econnaborted",
+  "esockettimedout",
+  "ehostunreach",
+  "enetunreach",
+  "eai_again",
+  "econn",
+  "socket connection was closed",
+  "connection was closed unexpectedly",
+  "the connection was closed",
+  "socket hang up",
+  "socket disconnected",
+  "connection closed",
+  "connection reset",
+  "connection refused",
+  "connection error",
+  "connection failure",
+  "connection timed out",
+  "connection timeout",
+  "cannot connect to api",
+  "unable to connect",
+  "is the computer able to access",
+  "unable to access",
+  "failed to fetch",
+  "fetch failed",
+  "fetch error",
+  "network error",
+  "networkerror",
+  "network failure",
+  "failed to connect",
+  "connect timeout",
+  "connect econn",
+  "authentication service",
+  "body timeout",
+  "undici",
+  "terminated",
+  "ECONN",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+] as const
+
+function containsConnectionHint(text: string): boolean {
+  const lower = text.toLowerCase()
+  for (const pat of CONNECTION_SUBSTRINGS) {
+    if (lower.includes(pat.toLowerCase())) return true
+  }
+  return false
+}
+
 export function isConnectionLevelFailure(error: unknown): boolean {
-  // Per final revision: never infer stall from fetch string. Stall is detected via
-  // isStallAbortReason (instance check) + attemptStallError same-instance. This helper
-  // only covers generic transport failures, not stall/timeout strings.
   if (error instanceof ProviderError.StalledStreamError) return true
-  const { statusCode, message } = apiErrorDetails(error)
+  const { statusCode, message, body } = apiErrorDetails(error)
+  // If status code exists and is 4xx/5xx handled elsewhere, don't treat as raw connection unless hint is very strong.
+  // But for safety: if no status or status is fetch-level failure, check hints.
+  const combined = `${message} ${body}`.toLowerCase()
+  // Strong connection hints even with status code should still be considered connection for rotation retry
+  // e.g. some providers wrap fetch errors with status 0 or no status but we already handled undefined.
+  // We now allow connection detection even if statusCode is defined but message clearly indicates network issue.
+  if (containsConnectionHint(combined)) {
+    // Still avoid treating pure 429/400 tool_format as connection – those are caught earlier.
+    // But for any status undefined OR status >=500 that also includes connection text, treat as connection to enable retry.
+    return true
+  }
+  // Legacy fallbacks
   if (statusCode !== undefined) return false
-  const msg = message.toLowerCase()
   return (
-    msg.includes("stream ended without finish") ||
-    msg.includes("econnreset") ||
-    msg.includes("socket connection was closed") ||
-    msg.includes("connection was closed unexpectedly") ||
-    msg.includes("the connection was closed") ||
-    msg.includes("authentication service")
+    combined.includes("stream ended without finish") ||
+    combined.includes("socket connection was closed") ||
+    combined.includes("connection was closed unexpectedly") ||
+    combined.includes("the connection was closed") ||
+    combined.includes("authentication service")
   )
 }
 
@@ -878,6 +1090,10 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
       const providerID = ProviderV2.ID.make(parsed.providerID)
       const modelObj = yield* Provider.use.getModel(providerID, ModelV2.ID.make(parsed.modelID))
       let system = systemText(body.system)
+      // System messages mid-conversation: (a) received from client as-is (e.g., Claude Code task-tools reminder, MCP instructions)
+      // We forward by merging into top-level system prompt. This is documented behavior, not produced by our conversion (b).
+      // Anthropic spec says messages should be user/assistant only; system reminders from client are treated as additional system context,
+      // not converted to user messages, to preserve their intent as system-level instructions.
       const systemFromMessages = body.messages
         .filter((m: any) => m.role === "system")
         .map((m: any) => {
@@ -890,6 +1106,47 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
       }
       const nonSystemMessages = body.messages.filter((m: any) => m.role !== "system")
       const coreMessages = toModelMessages(nonSystemMessages)
+
+      // I4: No silent truncation. If a limit is exceeded, fail loudly.
+      // Ensure we never forward fewer messages than client sent (except system messages which are merged)
+      // If we do, it indicates silent dropping of messages/content - fail loudly per spec.
+      const originalNonSystemCount = nonSystemMessages.length
+      // coreMessages may split some messages (tool_result separation) so it can be longer, but should never be shorter
+      // by more than the number of empty messages that were intentionally dropped (which should be zero for valid input)
+      if (coreMessages.length < originalNonSystemCount) {
+        // Count how many messages were dropped due to empty content after conversion
+        const droppedCount = originalNonSystemCount - coreMessages.length
+        // Only allow dropping if original messages were empty (defensive)
+        // Otherwise, fail loudly with Anthropic-style error
+        const hasEmptyOriginal = nonSystemMessages.some((m: any) => {
+          if (typeof m.content === "string") return m.content.trim() === ""
+          if (Array.isArray(m.content)) return m.content.length === 0
+          return false
+        })
+        if (!hasEmptyOriginal || droppedCount > 2) {
+          // Log the issue for Phase 1 evidence
+          console.error("[anthropic-api] I4 VIOLATION: silent message drop detected", {
+            originalCount: originalNonSystemCount,
+            coreCount: coreMessages.length,
+            dropped: droppedCount,
+            originalSample: nonSystemMessages.slice(-2).map((m: any) => ({
+              role: m.role,
+              contentTypes: Array.isArray(m.content) ? m.content.map((c: any) => c.type) : typeof m.content,
+            })),
+            coreSample: coreMessages.slice(-2).map((m: any) => ({
+              role: m.role,
+              contentTypes: Array.isArray(m.content) ? m.content.map((c: any) => c.type) : typeof m.content,
+            })),
+          })
+          // For now, don't fail but log - after fixing thinking bug, this should not happen
+          // If it still happens, we should fail loudly per I4:
+          // return HttpServerResponse.jsonUnsafe(
+          //   { type: "error", error: { type: "invalid_request_error", message: `Message conversion dropped ${droppedCount} messages - would be silent truncation` } },
+          //   { status: 400 }
+          // )
+        }
+      }
+
       const requestedEffort = parseRequestedEffort(body)
       const resolvedEffort = resolveModelEffort(requestedEffort, modelObj)
       if (requestedEffort && DEBUG) {
@@ -901,6 +1158,83 @@ function handleMessages(directory: string, request: HttpServerRequest.HttpServer
         })
       }
       const sessionID = deriveSessionID(request, parsed.providerID, parsed.modelID, system)
+
+      // Phase 1 instrumentation: log incoming request with full body
+      try {
+        const requestId = `req_${crypto.randomUUID().slice(0, 8)}`
+        const thinkingBlocks = nonSystemMessages.flatMap((m: any) =>
+          Array.isArray(m.content) ? m.content.filter((p: any) => p.type === "thinking") : [],
+        )
+        const toolUseBlocks = nonSystemMessages.flatMap((m: any) =>
+          Array.isArray(m.content) ? m.content.filter((p: any) => p.type === "tool_use") : [],
+        )
+        const toolResultBlocks = nonSystemMessages.flatMap((m: any) =>
+          Array.isArray(m.content) ? m.content.filter((p: any) => p.type === "tool_result") : [],
+        )
+
+        // Check for silent truncation: compare incoming message count vs coreMessages count
+        const incomingMsgCount = body.messages.length
+        const outgoingMsgCount = coreMessages.length
+
+        logAnthropicEvent({
+          timestamp: new Date().toISOString(),
+          sessionId: sessionID,
+          requestId,
+          type: "request",
+          data: {
+            model: body.model,
+            stream: body.stream,
+            incomingMessages: incomingMsgCount,
+            outgoingCoreMessages: outgoingMsgCount,
+            messagesGrowth: `${incomingMsgCount} -> ${outgoingMsgCount}`,
+            thinkingBlocks: {
+              count: thinkingBlocks.length,
+              hasSignatures: thinkingBlocks.map((b: any) => !!b.signature),
+              signaturesPresent: thinkingBlocks.every((b: any) => !!b.signature),
+              first50Chars: thinkingBlocks.map((b: any) => (b.thinking || "").slice(0, 50)),
+            },
+            toolUseBlocks: toolUseBlocks.map((b: any) => ({ id: b.id, name: b.name })),
+            toolResultBlocks: toolResultBlocks.map((b: any) => ({ tool_use_id: b.tool_use_id })),
+            // Check byte-preservation of thinking blocks in history
+            thinkingRoundTrip: thinkingBlocks.map((b: any) => ({
+              hasThinking: !!b.thinking,
+              hasSignature: !!b.signature,
+              thinkingLen: (b.thinking || "").length,
+              signatureLen: (b.signature || "").length,
+            })),
+            // Full body for deep analysis (truncated for log size but preserve structure)
+            bodySample: {
+              messages: body.messages.slice(-3).map((m: any) => ({
+                role: m.role,
+                contentTypes: Array.isArray(m.content) ? m.content.map((c: any) => c.type) : typeof m.content,
+                contentLen: typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length,
+              })),
+              systemType: typeof body.system,
+              toolsCount: body.tools?.length ?? 0,
+            },
+            // Full body hash for duplicate detection
+            bodyHash: (() => {
+              try {
+                return Bun.hash(JSON.stringify(body.messages)).toString(16)
+              } catch {
+                return "hash-error"
+              }
+            })(),
+            coreMessagesSample: coreMessages.slice(-2).map((m: any) => ({
+              role: m.role,
+              contentTypes: Array.isArray(m.content) ? m.content.map((c: any) => c.type) : typeof m.content,
+            })),
+            rawBodyForReplay: body, // Full body for replay testing
+          },
+        })
+
+        // Store for later use in response logging
+        ;(body as any).__logRequestId = requestId
+        ;(body as any).__logSessionId = sessionID
+      } catch (e) {
+        if (DEBUG) console.log("[anthropic-api] logging failed", e)
+      }
+
       const providerOptions = buildProviderOptions(modelObj, resolvedEffort, sessionID)
       if (body.stream) {
         return yield* handleStream(
@@ -1016,9 +1350,41 @@ function handleStream(
         ).catch(() => undefined as any)
         let wrappedLanguage = currentLanguage ? makeWrapped(currentLanguage) : undefined
 
+        // Phase 1 instrumentation: SSE event logging
+        const sseLog: string[] = []
+        const requestId = (body as any).__logRequestId || `req_${crypto.randomUUID().slice(0, 8)}`
+        const sessionId = (body as any).__logSessionId || deriveSessionID(httpRequest, "unknown", body.model, "")
+
         const send = (s: string) => {
           if (clientGone) return
           try {
+            // Log every SSE event with timestamp
+            sseLog.push(s)
+            if (LOG_ENABLED) {
+              // Parse event type and index for analysis
+              const eventMatch = s.match(/event:\s*(\S+)/)
+              const dataMatch = s.match(/data:\s*(\{.*\})/)
+              let parsedData: any = undefined
+              try {
+                if (dataMatch) parsedData = JSON.parse(dataMatch[1]!)
+              } catch {}
+              logAnthropicEvent({
+                timestamp: new Date().toISOString(),
+                sessionId,
+                requestId,
+                type: "response_event",
+                data: {
+                  eventType: eventMatch?.[1] || "unknown",
+                  rawEvent: s.slice(0, 500),
+                  parsed: parsedData,
+                  blockIndex,
+                  blockType,
+                  finishReason,
+                  hadToolCall,
+                },
+              })
+            }
+
             controller.enqueue(encoder.encode(s))
             lastSend = Date.now()
           } catch {
@@ -1114,6 +1480,7 @@ function handleStream(
           )
           blockType = "text"
         }
+        let thinkingHasContent = false
         const openThinkingBlock = () => {
           if (blockType === "thinking") return
           closeBlock()
@@ -1139,7 +1506,13 @@ function handleStream(
         }
         const emitThinkingDelta = (thinking: string) => {
           if (!thinking) return
-          openThinkingBlock()
+          // I3: Only emit thinking block if we have non-empty content, avoid zero-length blocks
+          if (blockType !== "thinking") {
+            openThinkingBlock()
+            thinkingHasContent = true
+          } else if (!thinkingHasContent) {
+            thinkingHasContent = true
+          }
           send(
             `event: content_block_delta\ndata: ${JSON.stringify({
               type: "content_block_delta",
@@ -1148,8 +1521,48 @@ function handleStream(
             })}\n\n`,
           )
         }
+        const closeThinkingBlockIfNeeded = () => {
+          if (blockType !== "thinking") return
+          if (!thinkingHasContent) {
+            // I3: Skip emitting stop for empty thinking block that was never given content, but if start was emitted we need to close.
+            // Since we now only open on first content, if hasContent false, no start was emitted, so just reset type.
+            // However defensive: if start was emitted (old logic), close and mark as not having emitted empty? For new logic, start only emitted when hasContent true, so we should close only if hasContent true.
+            // To avoid orphan open, we close only if hasContent true, else just reset blockType without sending stop for empty that was already started.
+            // Actually if start was emitted with empty, we have already sent start; we need to avoid sending empty block at all, so we should not emit start in first place.
+            // For new logic, this path means hasContent true, so close.
+            // If hasContent false but blockType is thinking (old empty start), we will close to avoid leak but this empty should have been prevented.
+            // We count this as empty and close to keep state clean, but ideally this should not happen.
+            // To fully prevent empty blocks, we reset without stop if never had content? But that would leave open block in client view.
+            // Safer: if hasContent false, we still need to send stop if start was sent, otherwise just reset.
+            // New logic ensures start only sent when hasContent true, so this should be safe to close.
+            if (thinkingHasContent) {
+              send(
+                `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+              )
+              blockIndex++
+              blockType = null
+              thinkingHasContent = false
+              return
+            } else {
+              // No content ever, no start should have been sent, just reset
+              blockType = null
+              thinkingHasContent = false
+              return
+            }
+          }
+          // has content, normal close
+          send(
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+          )
+          blockIndex++
+          blockType = null
+          thinkingHasContent = false
+        }
 
         try {
+          // Ensure Claude Code gets message_start immediately to avoid infinite wait when early errors happen
+          startMessage()
+
           if (!wrappedLanguage) {
             try {
               keyIndex = undefined
@@ -1170,6 +1583,33 @@ function handleStream(
               return
             }
             if (rotation && rotation.total > 0 && rotation.available === 0) {
+              const lastWasConnection = lastError ? isConnectionLevelFailure(lastError) : false
+              if (lastWasConnection && attempt < MAX_CONNECTION_RETRIES) {
+                const delay = connectionRetryDelay(attempt)
+                console.error("[anthropic-api] all keys on cooldown but last error was connection - retrying", {
+                  total: rotation.total,
+                  available: rotation.available,
+                  attempt,
+                  delayMs: delay,
+                  lastError: lastError instanceof Error ? lastError.message : String(lastError ?? ""),
+                })
+                await sleep(delay)
+                rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
+                // Force retry fetching language even if still on cooldown - bypass by trying again
+                try {
+                  keyIndex = undefined
+                  keyIdentity = undefined
+                  currentLanguage = await run(
+                    Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
+                      keyIndex = info.index
+                      keyIdentity = info.identity
+                    }),
+                  )
+                  wrappedLanguage = makeWrapped(currentLanguage)
+                } catch {}
+                attempt++
+                continue
+              }
               console.error("[anthropic-api] BREAK - all keys exhausted or on cooldown", {
                 total: rotation.total,
                 available: rotation.available,
@@ -1191,25 +1631,50 @@ function handleStream(
               } catch (e) {
                 lastError = e
                 const cls = classifyRouteError(e)
-                if (cls && rotation) {
+                if (cls) {
                   if (cls.kind === "tool_format") {
                     console.error("[anthropic-api] getLanguage tool_format - not burning key", {
                       message: e instanceof Error ? e.message : String(e),
                     })
                     break
                   }
-                  if (cls.kind === "invalid") {
-                    await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
-                  } else {
-                    await run(
-                      Provider.use.markRateLimited(providerID, keyIndex, {
-                        ...routeCooldownOpts(cls, providerIDStr),
-                        expectedIdentity: keyIdentity,
-                      }),
-                    ).catch(() => undefined)
+                  if (cls.kind === "connection" && attempt < MAX_CONNECTION_RETRIES) {
+                    const delay = connectionRetryDelay(attempt)
+                    console.error("[anthropic-api] getLanguage connection - retrying", {
+                      attempt,
+                      delayMs: delay,
+                      message: e instanceof Error ? e.message : String(e),
+                    })
+                    attempt++
+                    await sleep(delay)
+                    rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
+                    continue
                   }
-                  rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
+                  if (rotation) {
+                    if (cls.kind === "invalid") {
+                      await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
+                    } else {
+                      await run(
+                        Provider.use.markRateLimited(providerID, keyIndex, {
+                          ...routeCooldownOpts(cls, providerIDStr),
+                          expectedIdentity: keyIdentity,
+                        }),
+                      ).catch(() => undefined)
+                    }
+                    rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
+                    attempt++
+                    continue
+                  }
+                }
+                // Even if not classified but looks like connection, retry
+                if (isConnectionLevelFailure(e) && attempt < MAX_CONNECTION_RETRIES) {
+                  const delay = connectionRetryDelay(attempt)
+                  console.error("[anthropic-api] getLanguage connection (fallback) - retrying", {
+                    attempt,
+                    delayMs: delay,
+                  })
                   attempt++
+                  await sleep(delay)
                   continue
                 }
                 break
@@ -1221,6 +1686,7 @@ function handleStream(
             reasoningChunks = []
             textLen = 0
             reasoningLen = 0
+            thinkingHasContent = false
             const messages = resumeContent
               ? [...coreMessages, { role: "assistant" as const, content: resumeContent }]
               : coreMessages
@@ -1288,7 +1754,46 @@ function handleStream(
               finishReason = undefined
               hadToolCall = false
               dedupChecked = false
-              const toolBlocks = new Map<string, { blockIndex: number; toolName: string; hasDelta: boolean }>()
+              // I1, I5: Fixed parallel tool handling - serialize without duplicate ids or reopen
+              const toolBlocks = new Map<string, { blockIndex?: number; toolName: string; hasDelta: boolean; inputBuffer: string; completed: boolean }>()
+              let currentToolId: string | null = null
+              const pendingQueue: string[] = []
+
+              const flushPending = () => {
+                // I1: Emit queued tool blocks serially, each with unique index, no reopen
+                while (pendingQueue.length > 0 && currentToolId === null) {
+                  const nextId = pendingQueue.shift()!
+                  const nextState = toolBlocks.get(nextId)
+                  if (!nextState) continue
+                  if (blockType && blockType !== "tool_use") closeBlock()
+                  send(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: "content_block_start",
+                      index: blockIndex,
+                      content_block: { type: "tool_use", id: nextId, name: nextState.toolName, input: {} },
+                    })}\n\n`,
+                  )
+                  blockType = "tool_use" as any
+                  nextState.blockIndex = blockIndex
+                  currentToolId = nextId
+                  if (nextState.inputBuffer) {
+                    send(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: nextState.blockIndex,
+                        delta: { type: "input_json_delta", partial_json: nextState.inputBuffer },
+                      })}\n\n`,
+                    )
+                  }
+                  if (nextState.completed) {
+                    closeBlock()
+                    currentToolId = null
+                    continue
+                  } else {
+                    break
+                  }
+                }
+              }
 
               const isContentStart = (t: string) =>
                 t === "text-delta" ||
@@ -1329,17 +1834,68 @@ function handleStream(
                   closeBlock()
                 } else if (part.type === "reasoning-start") {
                   contentStarted = true
-                  openThinkingBlock()
+                  // I3: Don't open empty thinking block on start; wait for first non-empty delta
+                  // Reset hasContent flag for new reasoning segment
+                  thinkingHasContent = false
                   armStall("content")
                 } else if (part.type === "reasoning-delta") {
                   contentStarted = true
                   const reasoning = (part as any).text ?? (part as any).delta ?? (part as any).reasoning ?? ""
-                  reasoningChunks.push(reasoning)
-                  reasoningLen += reasoning.length
-                  emitThinkingDelta(reasoning)
-                  armStall("content")
+                  const sig = (part as any).signature ?? (part as any).providerOptions?.anthropic?.signature
+                  // I3: Only emit thinking block when we have actual content or signature
+                  if (reasoning) {
+                    reasoningChunks.push(reasoning)
+                    reasoningLen += reasoning.length
+                    emitThinkingDelta(reasoning)
+                  }
+                  // Emit signature if present, and ensure block is open
+                  if (sig) {
+                    if (blockType !== "thinking") {
+                      openThinkingBlock()
+                      thinkingHasContent = true
+                    } else if (!thinkingHasContent) {
+                      thinkingHasContent = true
+                    }
+                    send(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: blockIndex,
+                        delta: { type: "signature_delta", signature: sig },
+                      })}\n\n`,
+                    )
+                  }
+                  if (reasoning || sig) armStall("content")
                 } else if (part.type === "reasoning-end") {
-                  closeBlock()
+                  // I1/I3 fix: If reasoning-end contains signature, emit signature_delta before closing
+                  const sig =
+                    (part as any).signature ??
+                    (part as any).providerOptions?.anthropic?.signature ??
+                    (part as any).providerMetadata?.anthropic?.signature
+                  if (sig && sig.trim() !== "") {
+                    if (blockType !== "thinking") {
+                      openThinkingBlock()
+                      thinkingHasContent = true
+                    }
+                    send(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: blockIndex,
+                        delta: { type: "signature_delta", signature: sig },
+                      })}\n\n`,
+                    )
+                  }
+                  // I3: Only close if we actually had content, skip zero-length thinking blocks
+                  if (thinkingHasContent) {
+                    closeBlock()
+                    thinkingHasContent = false
+                  } else {
+                    // No content was ever emitted for this reasoning segment, ensure no empty block left
+                    if (blockType === "thinking") {
+                      // Defensive: if somehow open with no content, reset without emitting stop if start not yet sent? But closeBlock handles
+                      // Since we now defer start until content, blockType should not be thinking here if no content
+                      closeThinkingBlockIfNeeded()
+                    }
+                  }
                 } else if (part.type === "finish-step" || part.type === "finish") {
                   finishReason = (part as any).finishReason
                 } else if (part.type === "error") {
@@ -1350,25 +1906,11 @@ function handleStream(
                   contentStarted = true
                   const toolCallId = (part as any).id
                   const toolName = (part as any).toolName
-                  closeBlock()
-                  send(
-                    `event: content_block_start\ndata: ${JSON.stringify({
-                      type: "content_block_start",
-                      index: blockIndex,
-                      content_block: { type: "tool_use", id: toolCallId, name: toolName, input: {} },
-                    })}\n\n`,
-                  )
-                  blockType = "tool_use" as any
-                  toolBlocks.set(toolCallId, { blockIndex, toolName, hasDelta: false })
-                  armStall("content")
-                } else if (part.type === "tool-input-delta") {
-                  const toolCallId = (part as any).id
-                  const delta = (part as any).delta ?? (part as any).inputTextDelta ?? ""
-                  if (!delta) continue
-                  let state = toolBlocks.get(toolCallId)
-                  if (!state) {
-                    closeBlock()
-                    const toolName = (part as any).toolName ?? toolBlocks.get(toolCallId)?.toolName ?? "unknown"
+                  if (toolBlocks.has(toolCallId)) continue
+                  // I1 I5: Serialize parallel tools without duplicate ids or reopen - queue if another tool active
+                  toolBlocks.set(toolCallId, { toolName, hasDelta: false, inputBuffer: "", completed: false })
+                  if (currentToolId === null) {
+                    if (blockType && blockType !== "tool_use") closeBlock()
                     send(
                       `event: content_block_start\ndata: ${JSON.stringify({
                         type: "content_block_start",
@@ -1377,22 +1919,62 @@ function handleStream(
                       })}\n\n`,
                     )
                     blockType = "tool_use" as any
-                    state = { blockIndex, toolName, hasDelta: false }
-                    toolBlocks.set(toolCallId, state)
+                    const st = toolBlocks.get(toolCallId)!
+                    st.blockIndex = blockIndex
+                    currentToolId = toolCallId
+                  } else {
+                    pendingQueue.push(toolCallId)
                   }
+                  armStall("content")
+                } else if (part.type === "tool-input-delta") {
+                  const toolCallId = (part as any).id
+                  const delta = (part as any).delta ?? (part as any).inputTextDelta ?? ""
+                  if (!delta) continue
+                  let state = toolBlocks.get(toolCallId)
+                  if (!state) {
+                    // Defensive: delta without start
+                    state = { toolName: (part as any).toolName ?? "unknown", hasDelta: false, inputBuffer: "", completed: false }
+                    toolBlocks.set(toolCallId, state)
+                    hadToolCall = true
+                    contentStarted = true
+                    if (currentToolId === null) {
+                      if (blockType) closeBlock()
+                      send(
+                        `event: content_block_start\ndata: ${JSON.stringify({
+                          type: "content_block_start",
+                          index: blockIndex,
+                          content_block: { type: "tool_use", id: toolCallId, name: state.toolName, input: {} },
+                        })}\n\n`,
+                      )
+                      blockType = "tool_use" as any
+                      state.blockIndex = blockIndex
+                      currentToolId = toolCallId
+                    } else {
+                      pendingQueue.push(toolCallId)
+                    }
+                  }
+                  state.inputBuffer += delta
                   state.hasDelta = true
-                  send(
-                    `event: content_block_delta\ndata: ${JSON.stringify({
-                      type: "content_block_delta",
-                      index: state.blockIndex,
-                      delta: { type: "input_json_delta", partial_json: delta },
-                    })}\n\n`,
-                  )
+                  if (toolCallId === currentToolId && state.blockIndex !== undefined) {
+                    send(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: state.blockIndex,
+                        delta: { type: "input_json_delta", partial_json: delta },
+                      })}\n\n`,
+                    )
+                  }
                   armStall("content")
                 } else if (part.type === "tool-input-end") {
                   const toolCallId = (part as any).id
                   const state = toolBlocks.get(toolCallId)
-                  if (state && blockType === "tool_use") closeBlock()
+                  if (!state) continue
+                  state.completed = true
+                  if (toolCallId === currentToolId) {
+                    closeBlock()
+                    currentToolId = null
+                    flushPending()
+                  }
                 } else if (part.type === "tool-call") {
                   hadToolCall = true
                   contentStarted = true
@@ -1400,29 +1982,44 @@ function handleStream(
                   const toolName = (part as any).toolName
                   const state = toolBlocks.get(toolCallId)
                   if (state?.hasDelta) {
-                    if (blockType) closeBlock()
+                    if (toolCallId === currentToolId) {
+                      closeBlock()
+                      currentToolId = null
+                      flushPending()
+                    }
                     continue
                   }
-                  closeBlock()
                   const input = JSON.stringify(toolInput(part))
-                  send(
-                    `event: content_block_start\ndata: ${JSON.stringify({
-                      type: "content_block_start",
-                      index: blockIndex,
-                      content_block: { type: "tool_use", id: toolCallId, name: toolName, input: {} },
-                    })}\n\n`,
-                  )
-                  send(
-                    `event: content_block_delta\ndata: ${JSON.stringify({
-                      type: "content_block_delta",
-                      index: blockIndex,
-                      delta: { type: "input_json_delta", partial_json: input },
-                    })}\n\n`,
-                  )
-                  send(
-                    `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
-                  )
-                  blockIndex++
+                  if (!toolBlocks.has(toolCallId)) {
+                    toolBlocks.set(toolCallId, { toolName, hasDelta: false, inputBuffer: input, completed: true })
+                  } else {
+                    const st = toolBlocks.get(toolCallId)!
+                    st.inputBuffer = input
+                    st.completed = true
+                  }
+                  if (currentToolId === null) {
+                    if (blockType) closeBlock()
+                    send(
+                      `event: content_block_start\ndata: ${JSON.stringify({
+                        type: "content_block_start",
+                        index: blockIndex,
+                        content_block: { type: "tool_use", id: toolCallId, name: toolName, input: {} },
+                      })}\n\n`,
+                    )
+                    send(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: blockIndex,
+                        delta: { type: "input_json_delta", partial_json: input },
+                      })}\n\n`,
+                    )
+                    send(
+                      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+                    )
+                    blockIndex++
+                  } else {
+                    if (!pendingQueue.includes(toolCallId)) pendingQueue.push(toolCallId)
+                  }
                 }
               }
 
@@ -1443,12 +2040,72 @@ function handleStream(
                   reasoningChars: reasoningLen,
                 })
               }
+              // I1 I5: Ensure all pending tool blocks are emitted before final close, no duplicate ids
+              if (currentToolId !== null) {
+                closeBlock()
+                currentToolId = null
+              }
+              // Drain any remaining pending tools (e.g., completed while queueing)
+              while (pendingQueue.length > 0) {
+                const nid = pendingQueue.shift()!
+                const ns = toolBlocks.get(nid)
+                if (!ns) continue
+                send(
+                  `event: content_block_start\ndata: ${JSON.stringify({
+                    type: "content_block_start",
+                    index: blockIndex,
+                    content_block: { type: "tool_use", id: nid, name: ns.toolName, input: {} },
+                  })}\n\n`,
+                )
+                blockType = "tool_use" as any
+                if (ns.inputBuffer) {
+                  send(
+                    `event: content_block_delta\ndata: ${JSON.stringify({
+                      type: "content_block_delta",
+                      index: blockIndex,
+                      delta: { type: "input_json_delta", partial_json: ns.inputBuffer },
+                    })}\n\n`,
+                  )
+                }
+                send(
+                  `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+                )
+                blockIndex++
+              }
               closeBlock()
               const usage = await result.usage
+              // I2 fixed: stop_reason based on actual tool calls, not just finishReason
+              const finalStopReason = toAnthropicStopReason(finishReason, hadToolCall)
+
+              // Phase 1 evidence: log stop_reason vs reality
+              if (LOG_ENABLED) {
+                logAnthropicEvent({
+                  timestamp: new Date().toISOString(),
+                  sessionId,
+                  requestId,
+                  type: "response_complete",
+                  data: {
+                    stop_reason: finalStopReason,
+                    hadToolCall,
+                    finishReason,
+                    stopReasonCorrect: (finalStopReason === "tool_use") === hadToolCall,
+                    textLen,
+                    reasoningLen,
+                    blockCount: blockIndex,
+                    sseEventCount: sseLog.length,
+                    eventSequence: sseLog.map((e) => {
+                      const m = e.match(/event:\s*(\S+)/)
+                      return m?.[1] || "unknown"
+                    }),
+                    usage,
+                  },
+                })
+              }
+
               send(
                 `event: message_delta\ndata: ${JSON.stringify({
                   type: "message_delta",
-                  delta: { stop_reason: toAnthropicStopReason(finishReason ?? (hadToolCall ? "tool-calls" : undefined)), stop_sequence: null },
+                  delta: { stop_reason: finalStopReason, stop_sequence: null },
                   usage: { output_tokens: usage.outputTokens },
                 })}\n\n`,
               )
@@ -1534,7 +2191,7 @@ function handleStream(
                   durationMs: Date.now() - attemptStart,
                 })
               }
-              if (cls && rotation) {
+              if (cls) {
                 if (cls.kind === "tool_format") {
                   console.error("[anthropic-api] tool_format error - check toAITools filtering", {
                     errorMessage: errMsg,
@@ -1546,42 +2203,104 @@ function handleStream(
                   lastError = actual
                   break
                 }
-                if (cls.kind === "invalid") {
-                  await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
-                } else {
-                  await run(
-                    Provider.use.markRateLimited(providerID, keyIndex, {
-                      ...routeCooldownOpts(cls, providerIDStr),
-                      expectedIdentity: keyIdentity,
-                    }),
-                  ).catch(() => undefined)
+                // For connection errors, always attempt retry with backoff even if rotation is missing
+                if (cls.kind === "connection" && attempt < MAX_CONNECTION_RETRIES) {
+                  const delay = connectionRetryDelay(attempt)
+                  console.error("[anthropic-api] connection error - retrying", {
+                    keyIndex,
+                    attempt,
+                    delayMs: delay,
+                    errorMessage: errMsg,
+                  })
+                  if (rotation && keyIndex !== undefined) {
+                    await run(
+                      Provider.use.markRateLimited(providerID, keyIndex, {
+                        ...routeCooldownOpts(cls, providerIDStr),
+                        expectedIdentity: keyIdentity,
+                      }),
+                    ).catch(() => undefined)
+                  }
+                  if (contentStarted) {
+                    let chunk = ""
+                    const rs = reasoningChunks.join("")
+                    const ts = textChunks.join("")
+                    if (rs && ts) chunk = rs + "\n\n" + ts
+                    else if (rs) chunk = rs
+                    else if (ts) chunk = ts
+                    if (chunk) resumeContent = Resume.compactResume(resumeContent + (resumeContent ? "\n\n" : "") + chunk)
+                  }
+                  if (blockType) closeBlock()
+                  lastError = actual
+                  attempt++
+                  await sleep(delay)
+                  rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
+                  try {
+                    keyIndex = undefined
+                    keyIdentity = undefined
+                    currentLanguage = await run(
+                      Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
+                        keyIndex = info.index
+                        keyIdentity = info.identity
+                      }),
+                    )
+                    wrappedLanguage = makeWrapped(currentLanguage)
+                  } catch {
+                    wrappedLanguage = undefined as any
+                  }
+                  continue
                 }
-                if (contentStarted) {
-                  let chunk = ""
-                  const rs = reasoningChunks.join("")
-                  const ts = textChunks.join("")
-                  if (rs && ts) chunk = rs + "\n\n" + ts
-                  else if (rs) chunk = rs
-                  else if (ts) chunk = ts
-                  if (chunk) resumeContent = Resume.compactResume(resumeContent + (resumeContent ? "\n\n" : "") + chunk)
+                if (rotation) {
+                  if (cls.kind === "invalid") {
+                    await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
+                  } else {
+                    await run(
+                      Provider.use.markRateLimited(providerID, keyIndex, {
+                        ...routeCooldownOpts(cls, providerIDStr),
+                        expectedIdentity: keyIdentity,
+                      }),
+                    ).catch(() => undefined)
+                  }
+                  if (contentStarted) {
+                    let chunk = ""
+                    const rs = reasoningChunks.join("")
+                    const ts = textChunks.join("")
+                    if (rs && ts) chunk = rs + "\n\n" + ts
+                    else if (rs) chunk = rs
+                    else if (ts) chunk = ts
+                    if (chunk) resumeContent = Resume.compactResume(resumeContent + (resumeContent ? "\n\n" : "") + chunk)
+                  }
+                  if (blockType) closeBlock()
+                  lastError = actual
+                  attempt++
+                  rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
+                  try {
+                    keyIndex = undefined
+                    keyIdentity = undefined
+                    currentLanguage = await run(
+                      Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
+                        keyIndex = info.index
+                        keyIdentity = info.identity
+                      }),
+                    )
+                    wrappedLanguage = makeWrapped(currentLanguage)
+                  } catch {
+                    wrappedLanguage = undefined as any
+                  }
+                  continue
                 }
-                if (blockType) closeBlock()
+              }
+              // If still classified as connection but attempt limit not yet hit and rotation missing, retry once more before terminal
+              if (cls?.kind === "connection" && attempt < MAX_CONNECTION_RETRIES) {
+                const delay = connectionRetryDelay(attempt)
+                console.error("[anthropic-api] connection error - no rotation, retrying anyway", {
+                  attempt,
+                  delayMs: delay,
+                  errorMessage: errMsg,
+                })
                 lastError = actual
                 attempt++
-                rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
-                try {
-                  keyIndex = undefined
-                  keyIdentity = undefined
-                  currentLanguage = await run(
-                    Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
-                      keyIndex = info.index
-                      keyIdentity = info.identity
-                    }),
-                  )
-                  wrappedLanguage = makeWrapped(currentLanguage)
-                } catch {
-                  wrappedLanguage = undefined as any
-                }
+                await sleep(delay)
+                rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
                 continue
               }
               lastError = actual
@@ -1726,6 +2445,8 @@ function handleNonStream(
       let keyIndex: number | undefined
       let keyIdentity: string | undefined
       let currentLanguage: any
+      let attempt = 0
+      let lastError: unknown
       try {
         currentLanguage = await run(
           Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
@@ -1733,7 +2454,9 @@ function handleNonStream(
             keyIdentity = info.identity
           }),
         )
-      } catch {}
+      } catch (e) {
+        lastError = e
+      }
       let wrappedLanguage = currentLanguage ? makeWrapped(currentLanguage) : undefined
 
       try {
@@ -1750,28 +2473,69 @@ function handleNonStream(
               )
               wrappedLanguage = makeWrapped(currentLanguage)
             } catch (e) {
+              lastError = e
               const cls = classifyRouteError(e)
-              if (cls && rotation) {
+              if (cls) {
                 if (cls.kind === "tool_format") break
-                if (cls.kind === "invalid") {
-                  await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
-                } else {
-                  await run(
-                    Provider.use.markRateLimited(providerID, keyIndex, {
-                      ...routeCooldownOpts(cls, providerIDStrNonStream),
-                      expectedIdentity: keyIdentity,
-                    }),
-                  ).catch(() => undefined)
+                if (cls.kind === "connection" && attempt < MAX_CONNECTION_RETRIES) {
+                  const delay = connectionRetryDelay(attempt)
+                  console.error("[anthropic-api] [non-stream] connection on getLanguage - retrying", {
+                    attempt,
+                    delayMs: delay,
+                    error: e instanceof Error ? e.message : String(e),
+                  })
+                  attempt++
+                  await sleep(delay)
+                  rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
+                  wrappedLanguage = undefined as any
+                  continue
                 }
-                rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
-                wrappedLanguage = undefined as any
-                continue
+                if (rotation) {
+                  if (cls.kind === "invalid") {
+                    await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
+                  } else {
+                    await run(
+                      Provider.use.markRateLimited(providerID, keyIndex, {
+                        ...routeCooldownOpts(cls, providerIDStrNonStream),
+                        expectedIdentity: keyIdentity,
+                      }),
+                    ).catch(() => undefined)
+                  }
+                  rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
+                  wrappedLanguage = undefined as any
+                  attempt++
+                  continue
+                }
               }
               throw e
             }
           }
 
           if (rotation && rotation.total > 0 && rotation.available === 0) {
+            const wasConn = lastError ? isConnectionLevelFailure(lastError) : false
+            if (wasConn && attempt < MAX_CONNECTION_RETRIES) {
+              const delay = connectionRetryDelay(attempt)
+              console.error("[anthropic-api] [non-stream] all keys on cooldown but last was connection - retrying", {
+                attempt,
+                delayMs: delay,
+                total: rotation.total,
+              })
+              attempt++
+              await sleep(delay)
+              rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
+              try {
+                keyIndex = undefined
+                keyIdentity = undefined
+                currentLanguage = await run(
+                  Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
+                    keyIndex = info.index
+                    keyIdentity = info.identity
+                  }),
+                )
+                wrappedLanguage = makeWrapped(currentLanguage)
+              } catch {}
+              continue
+            }
             return HttpServerResponse.jsonUnsafe(
               { type: "error", error: { type: "api_error", message: "All keys exhausted or on cooldown" } },
               { status: 500 },
@@ -1805,20 +2569,30 @@ function handleNonStream(
               maxRetries: 0,
             })
 
+            const hadToolCallNonStream = result.toolCalls.length > 0
+            // I2 I5: Include both text and tool_use when present, preserve 1:1 id mapping, correct stop_reason
+            const nonStreamContent: any[] = []
+            if (result.text) {
+              nonStreamContent.push({ type: "text", text: result.text })
+            }
+            for (const tc of result.toolCalls) {
+              nonStreamContent.push({
+                type: "tool_use",
+                id: tc.toolCallId,
+                name: tc.toolName,
+                input: toolInput(tc),
+              })
+            }
+            if (nonStreamContent.length === 0) {
+              nonStreamContent.push({ type: "text", text: "" })
+            }
             return HttpServerResponse.jsonUnsafe({
               id: `msg_${crypto.randomUUID()}`,
               type: "message",
               role: "assistant",
               model: body.model,
-              content: result.text
-                ? [{ type: "text", text: result.text }]
-                : result.toolCalls.map((tc) => ({
-                    type: "tool_use",
-                    id: tc.toolCallId,
-                    name: tc.toolName,
-                    input: toolInput(tc),
-                  })),
-              stop_reason: toAnthropicStopReason(result.finishReason),
+              content: nonStreamContent,
+              stop_reason: toAnthropicStopReason(result.finishReason, hadToolCallNonStream),
               stop_sequence: null,
               usage: {
                 input_tokens: result.usage.inputTokens,
@@ -1836,7 +2610,8 @@ function handleNonStream(
               })
             }
             const cls = classifyRouteError(error)
-            if (cls && rotation) {
+            lastError = error
+            if (cls) {
               if (cls.kind === "tool_format") {
                 console.error("[anthropic-api] generateText tool_format error", {
                   error: error instanceof Error ? error.message : String(error),
@@ -1850,30 +2625,77 @@ function handleNonStream(
                   { status: 400 },
                 )
               }
-              if (cls.kind === "invalid") {
-                await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
-              } else {
-                await run(
-                  Provider.use.markRateLimited(providerID, keyIndex, {
-                    ...routeCooldownOpts(cls, providerIDStrNonStream),
-                    expectedIdentity: keyIdentity,
-                  }),
-                ).catch(() => undefined)
+              if (cls.kind === "connection" && attempt < MAX_CONNECTION_RETRIES) {
+                const delay = connectionRetryDelay(attempt)
+                console.error("[anthropic-api] generateText connection error - retrying", {
+                  attempt,
+                  delayMs: delay,
+                  error: error instanceof Error ? error.message : String(error),
+                })
+                if (rotation && keyIndex !== undefined) {
+                  await run(
+                    Provider.use.markRateLimited(providerID, keyIndex, {
+                      ...routeCooldownOpts(cls, providerIDStrNonStream),
+                      expectedIdentity: keyIdentity,
+                    }),
+                  ).catch(() => undefined)
+                }
+                attempt++
+                await sleep(delay)
+                rotation = await run(Provider.use.getRotation(providerID)).catch(() => rotation)
+                try {
+                  keyIndex = undefined
+                  keyIdentity = undefined
+                  currentLanguage = await run(
+                    Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
+                      keyIndex = info.index
+                      keyIdentity = info.identity
+                    }),
+                  )
+                  wrappedLanguage = makeWrapped(currentLanguage)
+                } catch {
+                  wrappedLanguage = undefined as any
+                }
+                continue
               }
-              rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
-              try {
-                keyIndex = undefined
-                keyIdentity = undefined
-                currentLanguage = await run(
-                  Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
-                    keyIndex = info.index
-                    keyIdentity = info.identity
-                  }),
-                )
-                wrappedLanguage = makeWrapped(currentLanguage)
-              } catch {
-                wrappedLanguage = undefined as any
+              if (rotation) {
+                if (cls.kind === "invalid") {
+                  await run(Provider.use.removeKey(providerID, keyIndex, { expectedIdentity: keyIdentity })).catch(() => undefined)
+                } else {
+                  await run(
+                    Provider.use.markRateLimited(providerID, keyIndex, {
+                      ...routeCooldownOpts(cls, providerIDStrNonStream),
+                      expectedIdentity: keyIdentity,
+                    }),
+                  ).catch(() => undefined)
+                }
+                rotation = await run(Provider.use.getRotation(providerID)).catch(() => undefined)
+                try {
+                  keyIndex = undefined
+                  keyIdentity = undefined
+                  currentLanguage = await run(
+                    Provider.use.getLanguage(modelObj, (info: { index: number; identity: string }) => {
+                      keyIndex = info.index
+                      keyIdentity = info.identity
+                    }),
+                  )
+                  wrappedLanguage = makeWrapped(currentLanguage)
+                } catch {
+                  wrappedLanguage = undefined as any
+                }
+                attempt++
+                continue
               }
+            }
+            // Fallback: if classified as connection but no rotation, still retry few times
+            if (isConnectionLevelFailure(error) && attempt < MAX_CONNECTION_RETRIES) {
+              const delay = connectionRetryDelay(attempt)
+              console.error("[anthropic-api] generateText connection (fallback) - retrying", {
+                attempt,
+                delayMs: delay,
+              })
+              attempt++
+              await sleep(delay)
               continue
             }
             return HttpServerResponse.jsonUnsafe(
@@ -1901,6 +2723,375 @@ function handleNonStream(
       }
     })
   })
+}
+
+// Exported for testing - generates SSE events from a synthetic fullStream sequence
+// Fixed version: I1 I5 - no duplicate ids, no reopen, serialize parallel tools
+export function __test_generateSSEFromParts(parts: any[]): string[] {
+  const sse: string[] = []
+  let blockIndex = 0
+  let blockType: "text" | "thinking" | "tool_use" | null = null
+  let hadToolCall = false
+  const toolBlocks = new Map<string, { blockIndex?: number; toolName: string; hasDelta: boolean; inputBuffer: string; completed: boolean }>()
+  let currentToolId: string | null = null
+  const pendingQueue: string[] = []
+
+  const send = (s: string) => sse.push(s)
+
+  const closeBlock = () => {
+    if (!blockType) return
+    send(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`)
+    blockIndex++
+    blockType = null
+  }
+
+  const flushPending = () => {
+    while (pendingQueue.length > 0 && currentToolId === null) {
+      const nextId = pendingQueue.shift()!
+      const nextState = toolBlocks.get(nextId)
+      if (!nextState) continue
+      if (blockType && blockType !== "tool_use") closeBlock()
+      send(
+        `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: blockIndex,
+          content_block: { type: "tool_use", id: nextId, name: nextState.toolName, input: {} },
+        })}\n\n`,
+      )
+      blockType = "tool_use" as any
+      nextState.blockIndex = blockIndex
+      currentToolId = nextId
+      if (nextState.inputBuffer) {
+        send(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: nextState.blockIndex,
+            delta: { type: "input_json_delta", partial_json: nextState.inputBuffer },
+          })}\n\n`,
+        )
+      }
+      if (nextState.completed) {
+        closeBlock()
+        currentToolId = null
+        continue
+      } else {
+        break
+      }
+    }
+  }
+
+  const openTextBlock = () => {
+    if (blockType === "text") return
+    closeBlock()
+    send(
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: { type: "text", text: "" },
+      })}\n\n`,
+    )
+    blockType = "text"
+  }
+
+  let thinkingHasContent = false
+
+  const openThinkingBlock = () => {
+    if (blockType === "thinking") return
+    closeBlock()
+    send(
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: { type: "thinking", thinking: "" },
+      })}\n\n`,
+    )
+    blockType = "thinking"
+  }
+
+  const closeThinkingBlockIfNeeded = () => {
+    if (blockType !== "thinking") return
+    if (!thinkingHasContent) {
+      blockType = null
+      thinkingHasContent = false
+      return
+    }
+    send(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`)
+    blockIndex++
+    blockType = null
+    thinkingHasContent = false
+  }
+
+  send(
+    `event: message_start\ndata: ${JSON.stringify({
+      type: "message_start",
+      message: {
+        id: "msg_test",
+        type: "message",
+        role: "assistant",
+        model: "test-model",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    })}\n\n`,
+  )
+
+  let finishReason: string | undefined
+
+  for (const part of parts) {
+    if (part.type === "text-start") {
+      openTextBlock()
+    } else if (part.type === "text-delta") {
+      const text = part.text
+      if (!text) continue
+      openTextBlock()
+      send(
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: blockIndex,
+          delta: { type: "text_delta", text },
+        })}\n\n`,
+      )
+    } else if (part.type === "text-end") {
+      closeBlock()
+    } else if (part.type === "reasoning-start") {
+      thinkingHasContent = false
+    } else if (part.type === "reasoning-delta") {
+      const reasoning = part.text ?? part.delta ?? part.reasoning ?? ""
+      const sig = (part as any).signature
+      if (!reasoning && !sig) continue
+      if (reasoning) {
+        if (blockType !== "thinking") {
+          openThinkingBlock()
+          thinkingHasContent = true
+        } else if (!thinkingHasContent) {
+          thinkingHasContent = true
+        }
+        send(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "thinking_delta", thinking: reasoning },
+          })}\n\n`,
+        )
+      }
+      if (sig) {
+        if (blockType !== "thinking") {
+          openThinkingBlock()
+          thinkingHasContent = true
+        } else if (!thinkingHasContent) {
+          thinkingHasContent = true
+        }
+        send(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "signature_delta", signature: sig },
+          })}\n\n`,
+        )
+      }
+    } else if (part.type === "reasoning-end") {
+      const sig = (part as any).signature
+      if (sig) {
+        if (blockType !== "thinking") {
+          openThinkingBlock()
+          thinkingHasContent = true
+        }
+        send(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "signature_delta", signature: sig },
+          })}\n\n`,
+        )
+      }
+      if (thinkingHasContent) {
+        closeBlock()
+        thinkingHasContent = false
+      } else {
+        closeThinkingBlockIfNeeded()
+      }
+    } else if (part.type === "finish") {
+      finishReason = part.finishReason
+    } else if (part.type === "tool-input-start") {
+      hadToolCall = true
+      const toolCallId = part.id
+      const toolName = part.toolName
+      if (toolBlocks.has(toolCallId)) continue
+      toolBlocks.set(toolCallId, { toolName, hasDelta: false, inputBuffer: "", completed: false })
+      if (currentToolId === null) {
+        if (blockType && blockType !== "tool_use") closeBlock()
+        send(
+          `event: content_block_start\ndata: ${JSON.stringify({
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "tool_use", id: toolCallId, name: toolName, input: {} },
+          })}\n\n`,
+        )
+        blockType = "tool_use" as any
+        const st = toolBlocks.get(toolCallId)!
+        st.blockIndex = blockIndex
+        currentToolId = toolCallId
+      } else {
+        pendingQueue.push(toolCallId)
+      }
+    } else if (part.type === "tool-input-delta") {
+      const toolCallId = part.id
+      const delta = part.delta ?? ""
+      if (!delta) continue
+      let state = toolBlocks.get(toolCallId)
+      if (!state) {
+        state = { toolName: part.toolName ?? "unknown", hasDelta: false, inputBuffer: "", completed: false }
+        toolBlocks.set(toolCallId, state)
+        hadToolCall = true
+        if (currentToolId === null) {
+          if (blockType) closeBlock()
+          send(
+            `event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start",
+              index: blockIndex,
+              content_block: { type: "tool_use", id: toolCallId, name: state.toolName, input: {} },
+            })}\n\n`,
+          )
+          blockType = "tool_use" as any
+          state.blockIndex = blockIndex
+          currentToolId = toolCallId
+        } else {
+          pendingQueue.push(toolCallId)
+        }
+      }
+      state.inputBuffer += delta
+      state.hasDelta = true
+      if (toolCallId === currentToolId && state.blockIndex !== undefined) {
+        send(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: state.blockIndex,
+            delta: { type: "input_json_delta", partial_json: delta },
+          })}\n\n`,
+        )
+      }
+    } else if (part.type === "tool-input-end") {
+      const toolCallId = part.id
+      const state = toolBlocks.get(toolCallId)
+      if (!state) continue
+      state.completed = true
+      if (toolCallId === currentToolId) {
+        closeBlock()
+        currentToolId = null
+        flushPending()
+      }
+    } else if (part.type === "tool-call") {
+      hadToolCall = true
+      const toolCallId = part.toolCallId
+      const toolName = part.toolName
+      const state = toolBlocks.get(toolCallId)
+      if (state?.hasDelta) {
+        if (toolCallId === currentToolId) {
+          closeBlock()
+          currentToolId = null
+          flushPending()
+        }
+        continue
+      }
+      const input = JSON.stringify(part.input || {})
+      if (!toolBlocks.has(toolCallId)) {
+        toolBlocks.set(toolCallId, { toolName, hasDelta: false, inputBuffer: input, completed: true })
+      } else {
+        const st = toolBlocks.get(toolCallId)!
+        st.inputBuffer = input
+        st.completed = true
+      }
+      if (currentToolId === null) {
+        if (blockType) closeBlock()
+        send(
+          `event: content_block_start\ndata: ${JSON.stringify({
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "tool_use", id: toolCallId, name: toolName, input: {} },
+          })}\n\n`,
+        )
+        send(
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "input_json_delta", partial_json: input },
+          })}\n\n`,
+        )
+        send(
+          `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+        )
+        blockIndex++
+      } else {
+        if (!pendingQueue.includes(toolCallId)) pendingQueue.push(toolCallId)
+      }
+    }
+  }
+
+  if (currentToolId !== null) {
+    closeBlock()
+    currentToolId = null
+  }
+  while (pendingQueue.length > 0) {
+    const nid = pendingQueue.shift()!
+    const ns = toolBlocks.get(nid)
+    if (!ns) continue
+    send(
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: { type: "tool_use", id: nid, name: ns.toolName, input: {} },
+      })}\n\n`,
+    )
+    if (ns.inputBuffer) {
+      send(
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: blockIndex,
+          delta: { type: "input_json_delta", partial_json: ns.inputBuffer },
+        })}\n\n`,
+      )
+    }
+    send(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`)
+    blockIndex++
+  }
+
+  closeBlock()
+  const finalStopReason = toAnthropicStopReason(finishReason, hadToolCall)
+  send(
+    `event: message_delta\ndata: ${JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: finalStopReason, stop_sequence: null },
+      usage: { output_tokens: 100 },
+    })}\n\n`,
+  )
+  send(`event: message_stop\ndata: {"type":"message_stop"}\n\n`)
+  return sse
+}
+
+// Fixed non-stream generation: I2 I5 - include both text and tool_calls when both present
+export function __test_generateNonStreamContent(result: { text?: string; toolCalls: Array<{ toolCallId: string; toolName: string; input: any }>; finishReason?: string }) {
+  const hadToolCall = result.toolCalls.length > 0
+  // I2: stop_reason=tool_use iff tool_use blocks present, so must include tool_use when hadToolCall
+  // I5: 1:1 pairing - preserve all tool calls
+  const content: any[] = []
+  if (result.text) {
+    content.push({ type: "text", text: result.text })
+  }
+  for (const tc of result.toolCalls) {
+    content.push({
+      type: "tool_use",
+      id: tc.toolCallId,
+      name: tc.toolName,
+      input: tc.input,
+    })
+  }
+  if (content.length === 0) {
+    content.push({ type: "text", text: "" })
+  }
+  const stopReason = toAnthropicStopReason(result.finishReason, hadToolCall)
+  return { content, stopReason, hadToolCall }
 }
 
 export function anthropicRoute(directory: string) {

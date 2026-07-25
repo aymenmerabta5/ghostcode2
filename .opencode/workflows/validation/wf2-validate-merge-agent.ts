@@ -20,7 +20,6 @@ export default {
       return res
     }
 
-    // Use a neutral file in the package root, outside any workflow metadata directory.
     const testFile = "merge-agent-test-file.txt"
     const branches = {
       a: "wf/merge-agent-test-a",
@@ -29,25 +28,22 @@ export default {
       failB: "wf/should-fail-b",
     }
 
-    // Clean up any leftover state from prior runs
     await ctx.shell("git merge --abort").catch(() => {})
     await sh("git checkout dev")
     for (const br of Object.values(branches)) {
       await ctx.shell(`git branch -D ${br}`).catch(() => {})
     }
 
-    // Reset test file on dev
     await sh(`echo initial content > ${testFile}`)
     await sh(`git add ${testFile}`)
     await sh(`git commit -m reset-merge-agent-test-file --allow-empty`)
 
     ctx.setPhase("parallel-edit", { file: testFile })
 
-    // These agents only exercise worktree creation; the real merge is scripted below.
     const agents = await ctx.parallel([
       () =>
         ctx.agent({
-          prompt: `Return exactly: {"branch": "wf/test-a", "changedFiles": ["${testFile}"], "intent": "A"}`,
+          prompt: `You are worktree agent A. Provide detailed reasoning about worktree isolation, then return JSON with branch, changedFiles, intent A.`,
           schema: {
             type: "object",
             required: ["branch", "changedFiles", "intent"],
@@ -63,7 +59,7 @@ export default {
         }),
       () =>
         ctx.agent({
-          prompt: `Return exactly: {"branch": "wf/test-b", "changedFiles": ["${testFile}"], "intent": "B"}`,
+          prompt: `You are worktree agent B. Provide detailed analysis of isolation, then return JSON with branch, changedFiles, intent B.`,
           schema: {
             type: "object",
             required: ["branch", "changedFiles", "intent"],
@@ -86,7 +82,6 @@ export default {
 
     ctx.setPhase("merge", { branches: results.length })
 
-    // Create two diverging branches that conflict on the same line.
     await sh("git checkout dev")
     await ctx.shell(`git branch -D ${branches.a}`).catch(() => {})
     await sh(`git checkout -b ${branches.a}`)
@@ -103,7 +98,6 @@ export default {
 
     await sh("git checkout dev")
 
-    // Merge A first (clean fast-forward from dev)
     await sh(`git merge --ff-only ${branches.a}`)
 
     let afterFirst: any
@@ -112,31 +106,15 @@ export default {
       ctx.log(`After first merge: ${String(afterFirst.output).slice(0, 200)}`)
     } catch {}
 
-    // Merge B with neutral agent. In an LLM-less environment the agent cannot edit files, so it
-    // will throw MergeConflictError and the fixture's fallback below proves the merge path ran.
     let secondMergeSuccess = false
+    let mergeAgentRow: any = null
     try {
       const res = await ctx.mergeWorktree({ branch: branches.b }, { onConflict: "agent" })
       secondMergeSuccess = true
       ctx.log(`Second merge with agent succeeded: ${JSON.stringify(res)}`)
     } catch (e: any) {
       ctx.log(`Second merge threw: ${(e.message ?? String(e)).slice(0, 500)}`)
-      // Fallback for validation environments without a real LLM: manually resolve both intents.
-      try {
-        const cat = await ctx.tool("read", { path: testFile })
-        const content = String(cat.output)
-        if (content.includes("Intent A") && content.includes("Intent B")) {
-          secondMergeSuccess = true
-        } else {
-          await sh(`echo Intent A - alpha change > ${testFile}`)
-          await sh(`echo Intent B - beta change >> ${testFile}`)
-          await sh(`git add ${testFile}`)
-          await sh(`git commit -m merge-b-both-validation-fallback --allow-empty`)
-          secondMergeSuccess = true
-        }
-      } catch (fallbackErr: any) {
-        ctx.log(`Manual fallback failed: ${fallbackErr.message ?? String(fallbackErr)}`)
-      }
+      throw new Error(`Merge with agent should succeed but threw: ${e.message}`)
     }
 
     ctx.setPhase("verify", { secondMergeSuccess })
@@ -153,11 +131,23 @@ export default {
       throw new Error(`Final file does not contain BOTH intents: got "${finalContent.slice(0, 500)}"`)
     }
 
+    // Check no conflict markers
+    if (finalContent.includes("<<<<<<<") || finalContent.includes(">>>>>>>") || finalContent.includes("=======")) {
+      throw new Error(`Final file still contains conflict markers: ${finalContent.slice(0, 500)}`)
+    }
+
+    // Check no back-to-back duplicated blocks (simple heuristic: same line repeated twice consecutively)
+    const lines = finalContent.split("\n").map((l: string) => l.trim()).filter(Boolean)
+    for (let i = 0; i < lines.length - 1; i++) {
+      if (lines[i] && lines[i] === lines[i + 1] && lines[i].includes("Intent")) {
+        throw new Error(`Found back-to-back duplicated block: ${lines[i]} at line ${i}`)
+      }
+    }
+
     ctx.log(`Verify: final content contains both, length ${finalContent.length}`)
 
     ctx.setPhase("unresolvable", { test: "impossible conflict should still error" })
 
-    // Second part: create a new conflict and ensure MergeConflictError still fires with onConflict error.
     await sh("git checkout dev")
     await sh(`echo initial content > ${testFile}`)
     await sh(`git add ${testFile}`)
@@ -181,7 +171,7 @@ export default {
       await ctx.mergeWorktree({ branch: branches.failB }, { onConflict: "error" })
     } catch (e: any) {
       const msg = e.message ?? String(e)
-      if (e._tag === "WorkflowMergeConflictError" || msg.includes("Merge conflict") || e.conflict || msg.includes("conflict")) {
+      if (e._tag === "WorkflowMergeConflictError" || msg.includes("Merge conflict") || (e as any).conflict || msg.includes("conflict")) {
         impossibleThrew = true
         ctx.log(`Impossible conflict correctly threw MergeConflictError: ${msg.slice(0, 200)}`)
       }
@@ -191,13 +181,13 @@ export default {
       throw new Error("Expected MergeConflictError for impossible conflict but none thrown")
     }
 
-    // Cleanup: reset dev and remove test branches/file
     await ctx.shell("git merge --abort").catch(() => {})
     await sh("git checkout dev")
     await ctx.shell(`git branch -D ${branches.a} ${branches.b} ${branches.failA} ${branches.failB}`).catch(() => {})
     await ctx.shell("git worktree prune").catch(() => {})
     await sh(`echo initial content > ${testFile} && git add ${testFile} && git commit -m cleanup-merge-agent-test --allow-empty`)
 
+    // Verify merge:<label> agent row exists with real token usage (checked in harness)
     return {
       success: true,
       finalContent: finalContent.slice(0, 500),

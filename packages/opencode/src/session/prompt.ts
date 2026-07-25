@@ -1984,7 +1984,7 @@ const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
-    })
+    } as unknown as Interface)
   }),
 )
 

@@ -4,10 +4,15 @@ import { SessionCompaction } from "@opencode-ai/core/session/compaction"
 test("compaction prompt preserves detailed work state and relevant files", () => {
   const prompt = SessionCompaction.buildPrompt({ context: ["conversation history"] })
 
-  expect(prompt).toContain("## Work State\n### Completed")
-  expect(prompt).toContain("### Active")
-  expect(prompt).toContain("### Blocked")
-  expect(prompt).toContain("## Relevant Files")
+  // Updated to match improved 9-section template (aligned with Claude Code)
+  expect(prompt).toContain("Primary Request and Intent")
+  expect(prompt).toContain("Key Technical Concepts")
+  expect(prompt).toContain("Files and Code Sections")
+  expect(prompt).toContain("Errors and fixes")
+  expect(prompt).toContain("Current Work")
+  expect(prompt).toContain("Pending Tasks")
+  // Ensure full snippets emphasis preserved
+  expect(prompt).toContain("full code snippets")
 })
 
 test("compaction describes tool media without embedding base64", () => {

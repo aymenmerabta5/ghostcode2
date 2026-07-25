@@ -9,10 +9,9 @@ export default {
     
     const testFile = "worktree-test.txt"
     
-    // Two parallel agents with worktree isolation writing same file
     const results = await ctx.parallel([
       () => ctx.agent({
-        prompt: `Write file ${testFile} with content "content from agent A" - Reply with exactly: {"branch":"wf/test/A","changedFiles":["${testFile}"]}`,
+        prompt: `You are worktree agent A. Write file ${testFile} with content "content from agent A" in your isolated worktree. Provide detailed reasoning about isolation, then return JSON with branch and changedFiles.`,
         label: "worktree-agent-A",
         isolation: "worktree",
         schema: {
@@ -25,7 +24,7 @@ export default {
         }
       }),
       () => ctx.agent({
-        prompt: `Write file ${testFile} with content "content from agent B" - Reply with exactly: {"branch":"wf/test/B","changedFiles":["${testFile}"]}`,
+        prompt: `You are worktree agent B. Write file ${testFile} with content "content from agent B" in your isolated worktree. Provide detailed analysis of worktree isolation, then return JSON.`,
         label: "worktree-agent-B",
         isolation: "worktree",
         schema: {
@@ -44,19 +43,14 @@ export default {
       throw new Error(`Expected 2 worktree agents, got ${filtered.length}`)
     }
     
-    // Check that both report branches
     for (const r of filtered) {
       const data = r.data as any
       if (!data.branch) throw new Error(`Agent result missing branch: ${JSON.stringify(data)}`)
       if (!data.branch.includes("wf/")) throw new Error(`Branch should contain wf/: ${data.branch}`)
     }
     
-    // Check that main tree is untouched (worktree-test.txt should not exist in main or have original content)
-    // For direct runner, we can check via shell that file doesn't exist in main
     try {
       const check = await ctx.shell(`cat ${testFile} 2>&1 || echo "not exists"`)
-      // If file exists in main, it would have content, but we want it untouched
-      // For this validation, we just ensure agents reported branches
     } catch {}
     
     ctx.setPhase("verify", { branches: filtered.map((r: any) => r.data.branch) })

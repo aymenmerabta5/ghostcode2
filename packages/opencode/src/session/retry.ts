@@ -53,12 +53,27 @@ export function retryable(error: Err): Retryable | undefined {
   }
   if (SessionV1.APIError.isInstance(error)) {
     const data = error.data as any
+    if ((data.metadata as any)?.code === "StalledStreamError") {
+      return { message: data.message ?? (data.metadata as any).code, isRateLimit: false }
+    }
     const status = data.statusCode as number | undefined
     const body = (data.responseBody ?? "") as string
     const msg = (data.message ?? "") as string
     const lowerBody = body.toLowerCase()
     const lowerMsg = msg.toLowerCase()
     const retryAfterMs = parseRetryAfter(data.responseHeaders as Record<string, string> | undefined)
+
+    if (
+      iife(() => {
+        try {
+          return JSON.parse(body)?.error?.code === "invalid_api_key"
+        } catch {
+          return false
+        }
+      })
+    ) {
+      return { message: msg || "Invalid API key", isRateLimit: false, isInvalid: true, retryAfterMs }
+    }
 
     if (isBillingVerificationFailed(body) || isBillingVerificationFailed(msg)) {
       return { message: msg || body || "Billing verification failed", isRateLimit: false, isInvalid: true, retryAfterMs }
@@ -99,6 +114,13 @@ export function retryable(error: Err): Retryable | undefined {
 
     if ((json as any).type === "error" && (json as any).error?.type === "too_many_requests") {
       return { message: "Too Many Requests", isRateLimit: true }
+    }
+    if ((json as any).error?.code === "invalid_api_key") {
+      return {
+        message: typeof (json as any).error.message === "string" ? (json as any).error.message : "Invalid API key",
+        isRateLimit: false,
+        isInvalid: true,
+      }
     }
     if (code.includes("exhausted") || code.includes("unavailable")) {
       return { message: "Provider is overloaded", isRateLimit: false }

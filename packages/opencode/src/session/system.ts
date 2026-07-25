@@ -56,12 +56,30 @@ const layer = Layer.effect(
     const mcp = yield* MCP.Service
     const locations = yield* LocationServiceMap.Service
 
-    return Service.of({
+      return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
         const ctx = yield* InstanceState.context
         const references = yield* Effect.gen(function* () {
           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
         }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+        // --- Programmatic effort mapping: expose ONLY current model's supported reasoning efforts (flexible) ---
+        const workflowEfforts = ["low", "medium", "high", "xhigh", "max"] as const
+        const variantKeys = Object.keys(model.variants ?? {})
+        const supportedEfforts = variantKeys.filter((k) => (workflowEfforts as readonly string[]).includes(k))
+        const effortOrder: Record<string, number> = { none: -2, minimal: -1, low: 0, medium: 1, high: 2, xhigh: 3, max: 4 }
+        const sortedEfforts = [...supportedEfforts].sort((a, b) => (effortOrder[a] ?? 0) - (effortOrder[b] ?? 0))
+        const maxEffort = sortedEfforts.length > 0 ? sortedEfforts[sortedEfforts.length - 1] : undefined
+        let effortInfo: string
+        if (sortedEfforts.length > 0) {
+          // Model supports explicit effort levels — only give his efforts
+          effortInfo = `  Your supported workflow efforts: ${sortedEfforts.join(", ")}. Your max is ${maxEffort}. When you write workflows, ONLY use these values. Use ${maxEffort} for maximum thinking. effort is optional but if you set it, must be from this list.`
+        } else if (model.capabilities?.reasoning) {
+          // Reasoning model but no variant list (e.g. kimi-k2-thinking, etc) — flexible, no hardcoded effort
+          effortInfo = `  Your model ${model.api.id} supports reasoning but has no explicit effort variants exposed. When you write workflows, effort is OPTIONAL — you may omit it or use high as safe default. Do not assume max/xhigh exists unless you see it in supported list. Be flexible.`
+        } else {
+          // No reasoning support at all (e.g. kimi-k2.7-code, some non-reasoning models)
+          effortInfo = `  Your model ${model.api.id} does NOT support reasoning effort / thinking levels. When you write workflows, do NOT set effort parameter (omit it) — or if required, use high as fallback. Valid workflow effort values in general are low|medium|high|xhigh|max, but they are model-dependent and optional.`
+        }
         return [
           [
             `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
@@ -72,6 +90,7 @@ const layer = Layer.effect(
             `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
             `  Platform: ${process.platform}`,
             `  Today's date: ${new Date().toDateString()}`,
+            `  ${effortInfo}`,
             `</env>`,
           ].join("\n"),
           references.length === 0

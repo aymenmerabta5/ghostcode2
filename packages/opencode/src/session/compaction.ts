@@ -28,11 +28,70 @@ export const Event = SessionCompactionEvent
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
+const TOOL_OUTPUT_MAX_CHARS = 5_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const DEFAULT_TAIL_TURNS = 2
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
-const MAX_PRESERVE_RECENT_TOKENS = 8_000
+const MAX_PRESERVE_RECENT_TOKENS = 10_000
+// Import single source of truth from core (aligned with Claude Code thresholds)
+import {
+  AUTOCOMPACT_BUFFER_TOKENS as CORE_AUTOCOMPACT_BUFFER,
+  WARNING_THRESHOLD_BUFFER_TOKENS as CORE_WARNING_BUFFER,
+  MANUAL_COMPACT_BUFFER_TOKENS as CORE_MANUAL_BUFFER,
+  MAX_CONSECUTIVE_COMPACTION_FAILURES as CORE_MAX_FAILURES,
+  COMPACT_MAX_OUTPUT_TOKENS as CORE_COMPACT_MAX,
+} from "@opencode-ai/core/session/compaction"
+
+export const AUTOCOMPACT_BUFFER_TOKENS = CORE_AUTOCOMPACT_BUFFER
+export const WARNING_THRESHOLD_BUFFER_TOKENS = CORE_WARNING_BUFFER
+export const MANUAL_COMPACT_BUFFER_TOKENS = CORE_MANUAL_BUFFER
+export const MAX_CONSECUTIVE_COMPACTION_FAILURES = CORE_MAX_FAILURES
+const SUMMARY_MAX_OUTPUT_TOKENS = CORE_COMPACT_MAX
+
+// Circuit breaker for V1 compaction failures (mirrors V2 and Claude's 3-failure breaker)
+const FAILURE_TRACKER_V1_TTL_MS = 10 * 60 * 1000
+const FAILURE_TRACKER_V1_MAX_SIZE = 1000
+const failureTrackerV1 = new Map<string, { count: number; lastFailure: number }>()
+
+const pruneFailureTrackerV1 = () => {
+  if (failureTrackerV1.size <= FAILURE_TRACKER_V1_MAX_SIZE) return
+  const now = Date.now()
+  for (const [key, value] of failureTrackerV1) {
+    if (now - value.lastFailure > FAILURE_TRACKER_V1_TTL_MS) failureTrackerV1.delete(key)
+    if (failureTrackerV1.size <= FAILURE_TRACKER_V1_MAX_SIZE * 0.8) break
+  }
+  if (failureTrackerV1.size > FAILURE_TRACKER_V1_MAX_SIZE) {
+    const entries = Array.from(failureTrackerV1.entries()).sort((a, b) => a[1].lastFailure - b[1].lastFailure)
+    for (let i = 0; i < entries.length - FAILURE_TRACKER_V1_MAX_SIZE; i++) {
+      failureTrackerV1.delete(entries[i]![0])
+    }
+  }
+}
+
+const getFailureCountV1 = (sessionID: string) => {
+  const entry = failureTrackerV1.get(sessionID)
+  if (!entry) return 0
+  if (Date.now() - entry.lastFailure > FAILURE_TRACKER_V1_TTL_MS) {
+    failureTrackerV1.delete(sessionID)
+    return 0
+  }
+  return entry.count
+}
+
+const recordFailureV1 = (sessionID: string) => {
+  pruneFailureTrackerV1()
+  const existing = failureTrackerV1.get(sessionID)
+  const now = Date.now()
+  if (existing) {
+    if (now - existing.lastFailure > FAILURE_TRACKER_V1_TTL_MS) {
+      failureTrackerV1.set(sessionID, { count: 1, lastFailure: now })
+    } else {
+      failureTrackerV1.set(sessionID, { count: existing.count + 1, lastFailure: now })
+    }
+  } else {
+    failureTrackerV1.set(sessionID, { count: 1, lastFailure: now })
+  }
+}
 type Turn = {
   start: number
   end: number
@@ -113,19 +172,86 @@ function splitTurn(input: {
   return Effect.gen(function* () {
     if (input.budget <= 0) return undefined
     if (input.turn.end - input.turn.start <= 1) return undefined
+    // Start at turn.start+1 to allow splitting within a turn's assistant messages
+    // The user message at turn.start is preserved in head (summarized) when we split to keep only suffix assistant
     for (let start = input.turn.start + 1; start < input.turn.end; start++) {
+      let adjustedStart = start
+      // Preserve tool_use/result pairing: if suffix starts with text-only assistant that follows a tool-containing assistant,
+      // include the tool assistant to avoid orphaned dependency (mirrors Claude's adjustIndexToPreserveAPIInvariants)
+      const candidateFirst = input.messages[adjustedStart]
+      if (candidateFirst && candidateFirst.info.role === "assistant") {
+        const prev = input.messages[adjustedStart - 1]
+        if (
+          prev &&
+          prev.info.role === "assistant" &&
+          prev.parts.some((p) => p.type === "tool") &&
+          !candidateFirst.parts.some((p) => p.type === "tool")
+        ) {
+          // Walk back to include all consecutive tool-containing assistants
+          let walk = adjustedStart - 1
+          while (
+            walk > input.turn.start &&
+            input.messages[walk - 1]?.info.role === "assistant" &&
+            input.messages[walk - 1]?.parts.some((p) => p.type === "tool")
+          ) {
+            walk--
+          }
+          adjustedStart = walk
+        }
+      }
+
       const size = yield* input.estimate({
-        messages: input.messages.slice(start, input.turn.end),
+        messages: input.messages.slice(adjustedStart, input.turn.end),
         model: input.model,
       })
       if (size > input.budget) continue
       return {
-        start,
-        id: input.messages[start]!.info.id,
+        start: adjustedStart,
+        id: input.messages[adjustedStart]!.info.id,
       } satisfies Tail
     }
     return undefined
   })
+}
+
+function truncateHeadForPTLRetryV1(messages: SessionV1.WithParts[], requiredReduction: number, estimator: (msgs: SessionV1.WithParts[]) => number) {
+  // Group by turns, drop oldest turns until reduction met or 20% dropped (like Claude's PTL retry)
+  if (messages.length <= 1) return null
+  const turnStarts: number[] = []
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]!.info.role === "user" && !messages[i]!.parts.some((p) => p.type === "compaction")) {
+      turnStarts.push(i)
+    }
+  }
+  if (turnStarts.length <= 1) {
+    // Fallback when no turns detected: drop oldest 20% but preserve tool invariants
+    // Ensure we don't cut inside an assistant tool sequence - walk to next assistant boundary without tool
+    let dropCount = Math.max(1, Math.floor(messages.length * 0.2))
+    // Adjust dropCount to not split inside tool-containing assistant chain
+    while (
+      dropCount < messages.length &&
+      messages[dropCount]!.info.role === "assistant" &&
+      messages[dropCount - 1]?.info.role === "assistant" &&
+      messages[dropCount - 1]?.parts.some((p) => p.type === "tool")
+    ) {
+      dropCount++
+    }
+    return messages.slice(dropCount)
+  }
+  let droppedTokens = 0
+  let dropTurns = 0
+  for (let t = 0; t < turnStarts.length - 1; t++) {
+    const start = turnStarts[t]!
+    const end = turnStarts[t + 1]!
+    const slice = messages.slice(start, end)
+    droppedTokens += estimator(slice)
+    dropTurns = t + 1
+    if (droppedTokens >= requiredReduction) break
+  }
+  if (dropTurns === 0) dropTurns = Math.max(1, Math.floor(turnStarts.length * 0.2))
+  const cutoff = turnStarts[dropTurns]
+  if (cutoff === undefined || cutoff >= messages.length) return null
+  return messages.slice(cutoff)
 }
 
 export interface Interface {
@@ -295,6 +421,16 @@ const layer = Layer.effect(
       auto: boolean
       overflow?: boolean
     }) {
+      // Circuit breaker: avoid repeated failures (Claude's 250k wasted calls/day protection)
+      const failureCount = getFailureCountV1(input.sessionID)
+      if (failureCount >= MAX_CONSECUTIVE_COMPACTION_FAILURES) {
+        yield* Effect.logWarning("V1 Compaction circuit breaker triggered", {
+          sessionID: input.sessionID,
+          failures: failureCount,
+        })
+        return "stop" as const
+      }
+
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
@@ -352,14 +488,42 @@ const layer = Layer.effect(
       const goalContext = goal
         ? [`Active session goal (preserve in summary): ${goal.text.slice(0, 1000)}${goal.text.length > 1000 ? "…" : ""}`]
         : []
-      const nextPrompt =
+      const nextPromptBase =
         compacting.prompt ?? buildPrompt({ previousSummary, context: [...compacting.context, ...goalContext] })
-      const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
-        stripMedia: true,
-        toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
-      })
+
+      // PTL retry: if head too large for context, truncate oldest turns (Claude's truncateHeadForPTLRetry)
+      let headForPrompt = selected.head
+      let currentPrompt = nextPromptBase
+
+      const transformForEstimation = (source: SessionV1.WithParts[]) =>
+        Effect.gen(function* () {
+          const cloned = structuredClone(source)
+          yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: cloned })
+          return yield* MessageV2.toModelMessagesEffect(cloned, model, {
+            stripMedia: true,
+            toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+          })
+        })
+
+      let modelMessages = yield* transformForEstimation(headForPrompt)
+
+      const estimatePrompt = (p: typeof modelMessages) =>
+        Token.estimate(JSON.stringify([...p, { role: "user", content: [{ type: "text", text: currentPrompt }] }]))
+
+      let ptlRetries = 0
+      while (estimatePrompt(modelMessages) > model.limit.context - SUMMARY_MAX_OUTPUT_TOKENS && ptlRetries < 3) {
+        const required = estimatePrompt(modelMessages) - (model.limit.context - SUMMARY_MAX_OUTPUT_TOKENS)
+        const truncated = truncateHeadForPTLRetryV1(headForPrompt, required, (slice) =>
+          Token.estimate(JSON.stringify(slice)),
+        )
+        if (!truncated) break
+        headForPrompt = truncated
+        modelMessages = yield* transformForEstimation(headForPrompt)
+        ptlRetries++
+        yield* Effect.logInfo("V1 Compaction PTL retry", { retry: ptlRetries, required, newLength: headForPrompt.length })
+      }
+
+      const nextPrompt = currentPrompt
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -417,10 +581,11 @@ const layer = Layer.effect(
         }).toObject()
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
+        recordFailureV1(input.sessionID)
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
+      if (compactionPart && compactionPart.tail_start_id !== selected.tail_start_id) {
         yield* session.updatePart({
           ...compactionPart,
           tail_start_id: selected.tail_start_id,
@@ -511,8 +676,12 @@ const layer = Layer.effect(
         }
       }
 
-      if (processor.message.error) return "stop"
+      if (processor.message.error) {
+        recordFailureV1(input.sessionID)
+        return "stop"
+      }
       if (result === "continue") {
+        failureTrackerV1.delete(input.sessionID)
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }
       return result

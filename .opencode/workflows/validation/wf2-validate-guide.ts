@@ -8,21 +8,18 @@ export default {
   async run(args: any, ctx: any) {
     ctx.setPhase("first", { start: true })
 
-    // Test append, dedupe, split
     ctx.guide.append("SENTINEL_123")
     let lines = ctx.guide.lines() as string[]
     if (lines.length !== 1 || lines[0] !== "SENTINEL_123") {
       throw new Error(`append failed: ${JSON.stringify(lines)}`)
     }
 
-    // Dedupe exact duplicates silently
     ctx.guide.append("SENTINEL_123")
     lines = ctx.guide.lines() as string[]
     if (lines.length !== 1) {
       throw new Error(`dedupe failed, expected 1 got ${lines.length}: ${JSON.stringify(lines)}`)
     }
 
-    // Multi-line split
     ctx.guide.set([])
     ctx.guide.append("a\nb")
     lines = ctx.guide.lines() as string[]
@@ -30,26 +27,20 @@ export default {
       throw new Error(`split failed: ${JSON.stringify(lines)}`)
     }
 
-    // Reset and test set replacement
     ctx.guide.set(["x", "y", "z"])
     lines = ctx.guide.lines() as string[]
     if (lines.length !== 3 || lines[0] !== "x") {
       throw new Error(`set failed: ${JSON.stringify(lines)}`)
     }
 
-    // Test frozen lines
     try {
-      // @ts-ignore
       ;(lines as any).push("should fail")
       const check = ctx.guide.lines()
       if ((check as any).length !== 3) {
         throw new Error("lines() should be frozen copy, mutation affected stored guide")
       }
-    } catch (e: any) {
-      // If frozen throws, that's okay
-    }
+    } catch (e: any) {}
 
-    // Test GuideFullError past maxLines (max 3)
     let caught = false
     try {
       ctx.guide.append("overflow")
@@ -68,7 +59,6 @@ export default {
       throw new Error("Expected GuideFullError when exceeding maxLines")
     }
 
-    // Test set over budget throws
     caught = false
     try {
       ctx.guide.set(["1", "2", "3", "4"])
@@ -79,14 +69,12 @@ export default {
       throw new Error("Expected GuideFullError on set over budget")
     }
 
-    // Reset to sentinel for injection test
     ctx.guide.set(["SENTINEL_123"])
 
     ctx.setPhase("second", { guide: ctx.guide.lines() })
 
-    // Agent 2's task is to echo field guide back — assert sentinel appears in output (proves injection)
     const agent2 = await ctx.agent({
-      prompt: `Echo the field guide you received in preamble. Return JSON {guide: string} containing the sentinel you see. Exactly: {"guide": "SENTINEL_123 found in field guide"}`,
+      prompt: `You have a field guide in your preamble. Echo it back with detailed analysis proving injection works, then return JSON with guide field containing sentinel. Provide thorough reasoning about guide functionality.`,
       schema: {
         type: "object",
         required: ["guide"],
@@ -103,7 +91,6 @@ export default {
 
     ctx.setPhase("third", { secondDone: true })
 
-    // Test trim and empty rejection
     ctx.guide.set([])
     ctx.guide.append("  trimmed  ")
     lines = ctx.guide.lines() as string[]
@@ -116,7 +103,6 @@ export default {
       throw new Error(`empty rejection failed: ${JSON.stringify(lines)}`)
     }
 
-    // Final set to contain sentinel for export check
     ctx.guide.set(["SENTINEL_123", "final-line"])
 
     return { success: true, guide: ctx.guide.lines(), message: "wf2-validate-guide passed" }

@@ -80,21 +80,76 @@ type Init<Parameters extends Schema.Decoder<unknown>, M extends Metadata> =
   | DefWithoutID<Parameters, M>
   | (() => Effect.Effect<DefWithoutID<Parameters, M>>)
 
-export type InferParameters<T> =
-  T extends Info<infer P, any>
-    ? Schema.Schema.Type<P>
-    : T extends Effect.Effect<Info<infer P, any>, any, any>
-      ? Schema.Schema.Type<P>
+type WithoutId<T> = T extends { id: any } ? Omit<T, "id"> : T
+
+type UnwrapInfo<T> = T extends Info<infer P, any> ? P : never
+type UnwrapInfoDeep<T> = T extends Effect.Effect<infer I, any, any>
+  ? I extends Info<infer P, any>
+    ? P
+    : I extends Def<infer P, any>
+      ? P
       : never
+  : never
+
+type UnwrapMetadata<T> = T extends Info<any, infer M> ? M : never
+type UnwrapMetadataDeep<T> = T extends Effect.Effect<infer I, any, any>
+  ? I extends Info<any, infer M>
+    ? M
+    : I extends Def<any, infer M>
+      ? M
+      : never
+  : never
+
+type UnwrapDefP<T> = T extends Info<infer P, any> ? P : never
+type UnwrapDefM<T> = T extends Info<any, infer M> ? M : never
+type UnwrapDefPDeep<T> = T extends Effect.Effect<infer I, any, any>
+  ? I extends Info<infer P, any>
+    ? P
+    : I extends Def<infer P, any>
+      ? P
+      : never
+  : never
+type UnwrapDefMDeep<T> = T extends Effect.Effect<infer I, any, any>
+  ? I extends Info<any, infer M>
+    ? M
+    : I extends Def<any, infer M>
+      ? M
+      : never
+  : never
+
+// Fallback to any when inference fails — ensures Partial<any> is any and allows property access.
+export type InferParameters<T> =
+  UnwrapInfo<T> extends never
+    ? UnwrapInfoDeep<T> extends never
+      ? UnwrapInfo<WithoutId<T>> extends never
+        ? UnwrapInfoDeep<WithoutId<T>> extends never
+          ? any
+          : Schema.Schema.Type<UnwrapInfoDeep<WithoutId<T>>>
+        : Schema.Schema.Type<UnwrapInfo<WithoutId<T>>>
+      : Schema.Schema.Type<UnwrapInfoDeep<T>>
+    : Schema.Schema.Type<UnwrapInfo<T>>
+
 export type InferMetadata<T> =
-  T extends Info<any, infer M> ? M : T extends Effect.Effect<Info<any, infer M>, any, any> ? M : never
+  UnwrapMetadata<T> extends never
+    ? UnwrapMetadataDeep<T> extends never
+      ? UnwrapMetadata<WithoutId<T>> extends never
+        ? UnwrapMetadataDeep<WithoutId<T>> extends never
+          ? any
+          : UnwrapMetadataDeep<WithoutId<T>>
+        : UnwrapMetadata<WithoutId<T>>
+      : UnwrapMetadataDeep<T>
+    : UnwrapMetadata<T>
 
 export type InferDef<T> =
-  T extends Info<infer P, infer M>
-    ? Def<P, M>
-    : T extends Effect.Effect<Info<infer P, infer M>, any, any>
-      ? Def<P, M>
-      : never
+  UnwrapDefP<T> extends never
+    ? UnwrapDefPDeep<T> extends never
+      ? UnwrapDefP<WithoutId<T>> extends never
+        ? UnwrapDefPDeep<WithoutId<T>> extends never
+          ? Def<any, any>
+          : Def<UnwrapDefPDeep<WithoutId<T>>, UnwrapDefMDeep<WithoutId<T>>>
+        : Def<UnwrapDefP<WithoutId<T>>, UnwrapDefM<WithoutId<T>>>
+      : Def<UnwrapDefPDeep<T>, UnwrapDefMDeep<T>>
+    : Def<UnwrapDefP<T>, UnwrapDefM<T>>
 
 function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadata>(
   id: string,
